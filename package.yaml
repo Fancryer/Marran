@@ -1,8 +1,8 @@
-name:                numl
+name:                Marran
 version:             0.1.0.0
-github:              "githubuser/numl"
+github:              "Fancryer/Marran"
 license:             BSD-3-Clause
-author:              "Author name here"
+author:              "Alice Eve Liddell"
 maintainer:          "example@example.com"
 copyright:           "2025 Author name here"
 
@@ -17,7 +17,7 @@ extra-source-files:
 # To avoid duplicated efforts in documentation and dealing with the
 # complications of embedding Haddock markup inside cabal files, it is
 # common to point users to the README.md file.
-description:         Please see the README on GitHub at <https://github.com/githubuser/numl#readme>
+description:         Please see the README on GitHub at <https://github.com/Fancryer/Marran#readme>
 
 dependencies:
 - base >= 4.7 && < 5
@@ -32,6 +32,13 @@ dependencies:
 - os-string
 - numeric-limits
 - scientific
+- comonad
+- lens
+- aeson
+- filepath
+- directory
+- bytestring
+- optparse-applicative
 
 ghc-options:
 - -Wall
@@ -48,7 +55,7 @@ library:
   source-dirs: src
 
 executables:
-  numl-exe:
+  marran-exe:
     main:                Main.hs
     source-dirs:         app
     ghc-options:
@@ -56,10 +63,10 @@ executables:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
-    - numl
+    - Marran
 
 tests:
-  numl-test:
+  marran-test:
     main:                Main.hs
     source-dirs:         test
     ghc-options:
@@ -67,7 +74,7 @@ tests:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
-    - numl
+    - Marran
     - hspec
     - QuickCheck
     - containers
@@ -79,3 +86,7 @@ tests:
     - os-string
     - numeric-limits
     - scientific
+    - comonad
+    - lens
+    - aeson
+    - optparse-applicative

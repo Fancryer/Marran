@@ -3,15 +3,35 @@
 {-# LANGUAGE OrPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ExplicitForAll #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 module Parser(
   Parser,
+  chunk,
   parseTokens,
+  parseTokensUnposed,
+  parseTok,
+  parseFromText,
   Parser.exp,
+  letExp,
   number,
-  tupleExp,
+  floatLiteral,
+  intLiteral,
+  stringLiteral,
+  bool,
+  tupleOrExp,
   block,
-  blockStat
+  blockStat,
+  lambda,
+  parens,
+  effCons,
+  effRow,
+  typ,
+  typAtom,
+  typeDef
 )
 where
 import Data.Void
@@ -22,53 +42,94 @@ import Text.Megaparsec(
     errorBundlePretty,
     runParser,
     many,
-    MonadParsec (eof, try, notFollowedBy),
+    MonadParsec (eof, try, lookAhead, notFollowedBy),
     choice,
     optional,
-    some, sepBy1, sepBy, (<|>), satisfy, ParseErrorBundle, lookAhead, between
+    some,
+    sepBy1,
+    sepBy,
+    (<|>),
+    satisfy,
+    between,
+    VisualStream (showTokens),
+    TraversableStream (reachOffset),
+    manyTill,
+    anySingle, PosState (pstateInput, pstateSourcePos, pstateOffset)
   )
 import Lexer (
-    Token (
-      TKW,
-      TName,
-      TInt,
-      TAssign,
-      TSquareL,
-      TSquareR,
-      TBraceL,
-      TBraceR,
-      TColon,
-      TParenL,
-      TParenR, TComma, TArrow, TTVar, TSemi, THRPArrow, TEllipsis, TPipe, TRebind, TAt, TSharpBraceL, TString, THexInt, TFloat, THexFloat, TUnderscore, TDollar, TMatchArrow, TInfixName
-    ),
+    Token (..),
     tokens,
-    Keyword (..)
+    Keyword (..), LToken (..)
   )
 import Data.Scientific (Scientific)
 import Data.Maybe (fromMaybe, isJust, fromJust)
 import Control.Monad.Combinators.Expr (makeExprParser, Operator (InfixR, Postfix, Prefix, InfixL))
-import Data.Functor (($>))
+import Data.Functor (($>), void)
 import Ast
+import Control.Monad (MonadPlus)
+import Text.Megaparsec.Stream (VisualStream(tokensLength))
+import qualified Data.Text as T
+import Utils (Pretty(pretty))
+import Data.Foldable (toList)
+import Debug.Trace (trace)
 
-type Parser = Parsec Void [Token]
+type Parser = Parsec Void [LToken]
 
-parseTokens :: Text -> Either String [Token]
+instance VisualStream [LToken] where
+  showTokens _ = T.unpack . mconcat . map (pretty . ltToken) . toList
+  tokensLength _ = sum . map (T.length . pretty . ltToken) . toList
+
+instance TraversableStream [LToken] where
+  reachOffset o posState =
+    let input = pstateInput posState
+        newPos = case drop o input of
+          (LToken pos _:_) -> pos
+          [] -> pstateSourcePos posState
+        posState' = posState {
+          pstateOffset = o,
+          pstateInput = drop o input,
+          pstateSourcePos = newPos
+        }
+    in (Nothing, posState')
+
+parseTokens :: Text -> Either String [LToken]
 parseTokens input = case runParser tokens "<test>" input of
   Left err -> Left $ errorBundlePretty err
   Right ts -> Right ts
 
-parseExp :: [Token] -> Either (ParseErrorBundle [Token] Void) Exp
+parseTokensUnposed :: Text -> Either String [Token]
+parseTokensUnposed input = case runParser tokens "<test>" input of
+  Left err -> Left $ errorBundlePretty err
+  Right ts -> Right $ map ltToken ts
+
+parseExp :: [LToken] -> Either String Exp
 parseExp input = case runParser Parser.exp "<exp>" input of
-  Left err -> Left err
+  Left err -> Left $ errorBundlePretty err
   Right e -> Right e
 
+parseTok :: Parser a -> [LToken] -> Either String a
+parseTok p toks =
+  case runParser (p <* eof) "" toks of
+    Left err -> Left $ errorBundlePretty err
+    Right e -> Right e
+
+parseFromText :: Parser a -> Text -> Either String a
+parseFromText parser txt = do
+  case parseTokens txt of
+    Left err -> Left err
+    Right ts -> do parseTok parser ts
+
 tok :: (Token -> Maybe a) -> Parser a
-tok = satisfyMap
-  where
-    satisfyMap :: (Token -> Maybe a) -> Parser a
-    satisfyMap f = do
-      t <- satisfy (isJust . f)
-      pure $ fromJust $ f t
+tok f = do
+  LToken _ t <- satisfy (isJust . f . ltToken)
+  pure $ fromJust $ f t
+  -- satisfyMap
+  -- where
+
+    -- satisfyMap :: (Token -> Maybe a) -> Parser a
+    -- satisfyMap f = do
+    --   t <- satisfy (\p -> isJust (f $ ltToken p))
+    --   pure $ fromJust $ f t
 
 keyword :: Keyword -> Parser ()
 keyword kw = tok test
@@ -160,31 +221,84 @@ typeDef = do
   keyword KWType
   n <- name
   ts <- fromMaybe mempty <$> optional typeParams
-  es <- fromMaybe mempty <$> optional effParams
+  -- es <- fromMaybe mempty <$> optional effParams
   symbol TAssign
-  TypeDef n ts es <$> typ
+  TypeDef n ts <$> typ
 
 typeParams :: Parser TypeParams
-typeParams = TParams . Params <$> brackets (some name)
+typeParams = TypeParams <$> brackets (some name)
 
 effParams :: Parser EffParams
-effParams = EParams . Params <$> braces (some name)
+effParams = do
+  symbol TBraceL
+  es <- fromMaybe [] <$> optional (some name)
+  rs <- fromMaybe [] <$> optional (pipesym *> some name)
+  symbol TBraceR
+  pure $ EffParams es rs
 
 typ :: Parser Typ
-typ = makeExprParser typAtom table
+typ = functType
+-- typ = makeExprParser typAtom table
+--   where
+--     table = [[InfixR $ TPair <$ commasym], [InfixR functionOp]]
+--     functionOp = do
+--       symbol TArrow
+--       eff <- optional effRow
+--       pure $ \from to -> TFunct from to eff
+
+functType :: Parser Typ
+functType = do
+  from <- pairType
+  m <- optional $ try $ do
+    symbol TArrow
+    choice [
+        try $ do
+          row <- arrowEffRow
+          to <- functType
+          pure (Just row, to),
+        do
+          to <- functType
+          pure (Nothing, to)
+      ]
+  pure $ case m of
+    Nothing -> from
+    Just (fx, to) -> TFunct $ Funct from to (fromMaybe (ERSugar [] Nothing) fx)
+
+pairType :: Parser Typ
+pairType = do
+  l <- typAtom
+  r <- optional (commasym *> pairType)
+  pure $ maybe l (TPair l) r
+
+arrowEffRow :: Parser EffRow
+arrowEffRow =
+  try (braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> meta))
+  <|> try (do
+    n <- name
+    _ <- lookAhead typeAtomStart
+    pure $ ERAlias n)
+  <|> try (do
+    n <- meta
+    _ <- lookAhead typeAtomStart
+    pure $ ERVar n)
   where
-    table = [[InfixR $ TPair <$ commasym], [InfixR functionOp]]
-    functionOp = do
-      symbol TArrow
-      eff <- optional effRow
-      pure $ \from to -> TFunct from to eff
+    typeAtomStart :: Parser ()
+    typeAtomStart =
+      choice [
+        void $ lookAhead name,
+        void $ lookAhead meta,
+        void $ lookAhead (symbol TParenL),
+        void $ lookAhead (symbol TSquareL),
+        void $ lookAhead (symbol TSharpBraceL),
+        void $ lookAhead (keyword KWForall)
+      ]
 
 typAtom :: Parser Typ
 typAtom =
   choice [
     try $ TGenericAlias <$> name <*> typeApps,
     TFlat <$> name,
-    TNil <$ nil,
+    Ast.TNil <$ nil,
     TArray <$> brackets typ,
     try $ TParen <$> parens typ,
     TVar <$> meta,
@@ -228,21 +342,33 @@ effDef = do
   keyword KWEffect
   n <- name
   ts <- fromMaybe mempty <$> optional typeParams
-  es <- fromMaybe mempty <$> optional effParams
-  ops <- many effectOp
+  ops <- sepBy effectOp semisym
   keyword KWEnd
-  pure $ EffectDef n ts es ops
+  pure $ EffectDef n ts ops
 
 effectOp :: Parser EffectOp
-effectOp = EffectOp <$> name <* colonsym <*> typ
+effectOp = EffectOp <$> name <* colonsym <*> effectOpType
+
+effectOpType :: Parser Funct
+effectOpType = do
+  from <- pairType
+  symbol TArrow
+  choice [
+      try $ do
+        row <- arrowEffRow
+        to <- functType
+        pure $ Funct from to row,
+      do
+        to <- functType
+        pure $ Funct from to $ ERSugar [] Nothing
+    ]
 
 rowDef :: Parser TopLevelStat
 rowDef = do
   keyword KWRow
   n <- name
-  ts <- fromMaybe mempty <$> optional typeParams
   symbol TAssign
-  RowDef n ts <$> effRow
+  RowDef n <$> effRow
 
 functDef :: Parser TopLevelStat
 functDef = do
@@ -252,10 +378,19 @@ functDef = do
   es <- fromMaybe mempty <$> optional effParams
   args <- functArgs
   colonsym
-  fx <- optional effRow
-  out <- typ
-  symbol TAssign
-  FunctDef n ts es args fx out <$> block
+  try $ do
+    fx <- optional effRow
+    case fx of
+      Just (ERAlias a) -> do
+        out <- optional typ
+        symbol TAssign
+        case out of
+          Just t -> FunctDef n ts es args fx t <$> block
+          Nothing -> FunctDef n ts es args Nothing (TFlat a) <$> block
+      _ -> do
+        out <- typ
+        symbol TAssign
+        FunctDef n ts es args fx out <$> block
 
 functArgs :: Parser [FunctArg]
 functArgs = some functArg
@@ -263,9 +398,9 @@ functArgs = some functArg
 effRow :: Parser EffRow
 effRow =
   choice [
-    EREvar <$> meta,
+    ERVar <$> meta,
     ERAlias <$> name,
-    braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> name)
+    braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> meta)
   ]
 
 effRowEntry :: Parser EffRowEntry
@@ -275,20 +410,17 @@ effRowEntry =
     EREEffRow <$> (symbol TEllipsis *> effRow)
   ]
 
-
 effCons :: Parser EffCons
-effCons = EffCons <$> name <*> optional typeParams
+effCons = (EVar <$> meta) <|> (EffCons <$> eCons)
+
+eCons :: Parser ECons
+eCons = ECons <$> name <*> optional typeApps
 
 block :: Parser Block
-block = choice [
-    try (Block [] <$> Parser.exp <* notFollowedBy semisym),
-    Block <$> some (try $ blockStat <* semisym) <*> Parser.exp
-  ]
-  -- bs <- choice [
-  --     try (many (blockStat <* semisym)),
-  --     pure []
-  --   ]
-  -- Block bs <$> Parser.exp
+block = do
+  Block <$> many (try $ blockStat <* semisym) <*> Parser.exp
+  -- try (Block [] <$> (Parser.exp <* lookAhead semisym))
+  -- <|> try (Block <$> some (blockStat <* semisym) <*> Parser.exp)
 
 blockStat :: Parser BlockStat
 blockStat =
@@ -313,21 +445,22 @@ lambdaParam = do
 assign :: Parser Assign
 assign = Assign <$> name <* symbol TRebind <*> Parser.exp
 
-{-pathExp :: Parser PathExp
-pathExp = do
-  e <- Parser.exp
-  symbol TAt
-  PathExp e <$> choice [(: []) <$> name, parens $ some name]-}
-
 letPattern :: Parser LetPattern
-letPattern = choice [LPATom <$> atomLetPattern, LPParam <$> lambdaParam]
+--letPattern = choice [LPATom <$> atomLetPattern, LPParam <$> lambdaParam]
+letPattern = do
+  first <- atom'
+  rest <- many $ commasym *> atom'
+  pure $ foldr1 pair (first : rest)
+  where
+    pair l r = LPATom $ ALPPair l r
+    atom' = LPATom <$> atomLetPattern <|> LPParam <$> lambdaParam
 
 atomLetPattern :: Parser AtomLetPattern
 atomLetPattern = choice [
     ALPNil <$ nil,
     ALPUnderscore <$ symbol TUnderscore,
     ALPParen <$> parens letPattern,
-    ALPPair <$> letPattern <* commasym <*> letPattern,
+    -- ALPPair <$> letPattern <* commasym <*> letPattern,
     recordLetPattern
   ]
 
@@ -339,8 +472,10 @@ atomLetPatternRecordProp :: Parser AtomLetPatternRecordProp
 atomLetPatternRecordProp = do
   cq <- constantQualifier
   lp <- lambdaParam
-  symbol TAssign
-  AtomLetPatternRecordProp cq lp <$> atomLetPattern
+  alp <- optional $ do
+    symbol TAssign
+    atomLetPattern
+  pure $ AtomLetPatternRecordProp cq lp alp
 
 functArg :: Parser FunctArg
 functArg = parens $ do
@@ -383,89 +518,232 @@ recordTypeArgProp = do
   RecordTypeArgProp q n <$> typeArg
 
 effApps :: Parser EffApps
-effApps = EffApps <$> braces (sepBy effArg semisym <* optional semisym)
+effApps = do
+  symbol TBraceL
+  es <- sepBy effArg semisym
+  rs <- fromMaybe [] <$> optional (pipesym *> some effRow)
+  symbol TBraceR
+  pure $ EffApps es rs
 
 effArg :: Parser EffArg
 effArg = choice [EACons <$> effCons, EARow <$> (symbol TEllipsis *> effRow)]
 
 exp :: Parser Exp
-exp = choice [
-    try ifExp,
-    try letExp,
-    try under,
-    makeExprParser term operatorTable
-  ]
-  where
-    operatorTable :: [[Operator Parser Exp]]
-    operatorTable = [
-        [postfixProp, postfixWith],
-        [backtickOp],
-        [dollarOp],
-        [resumeOp]
+exp = resumeExp --do
+  -- e <- applyExp
+  -- e' <- parsePostfixOps e
+  -- e'' <- parseBackticks e'
+  -- parseDollar e''
+  -- e <- prefixExp >>= parsePostfix
+  -- es <- many $ prefixExp >>= parsePostfix
+  -- pure $ foldl EApply e es
+resumeExp :: Parser Exp
+resumeExp = try (EResume <$> (keyword KWResume *> resumeExp)) <|> dollarExp
+
+
+dollarExp :: Parser Exp
+dollarExp = do
+  e <- backtickExp
+  m <- optional (symbol TDollar *> (EDollar e <$> dollarExp))
+  pure $ fromMaybe e m
+
+backtickExp :: Parser Exp
+backtickExp = do
+  e <- withExp
+  rest <- many ((,) <$> infixName <*> withExp)
+  pure $ foldl (\acc (op, r) -> EBacktick op acc r) e rest
+
+withExp :: Parser Exp
+withExp = do
+  e <- applyExp
+  parseWithOps e
+
+applyExp :: Parser Exp
+applyExp = do
+  f <- accessExp
+  args <- many accessExp
+  pure $ foldl EApply f args
+
+accessExp :: Parser Exp
+accessExp = do
+  e <- prefixExp
+  parseAccessOps e
+
+parseAccessOps :: Exp -> Parser Exp
+parseAccessOps e = do
+  m <- optional (symbol TAt *> (EPropAccess e <$> name))
+  case m of
+    Just e' -> parseAccessOps e'
+    Nothing -> pure e
+
+parseWithOps :: Exp -> Parser Exp
+parseWithOps e = do
+  m <- optional $ keyword KWWith *> do
+    (ts, es) <- choice [
+        try $ (,) <$> typeApps <*> effApps,
+        (, EffApps [] []) <$> typeApps,
+        (TypeApps [], ) <$> effApps
       ]
+    pure $ EWith e ts es
+  case m of
+    Just e' -> parseWithOps e'
+    Nothing -> pure e
 
-term :: Parser Exp
-term = foldl EApply <$> simpleTerm <*> many simpleTerm
+-- applyExp :: Parser Exp
+-- applyExp = foldl1 EApply <$> some prefixExp
+  -- do
+  -- f <- simpleTerm
+  -- args <- many simpleTerm
+  -- pure $ foldl EApply f args
 
--- simpleTerm :: Parser Exp
--- simpleTerm = choice [
---     ELiteral <$> literal,
---     try tupleExp,
---     try (EParen <$> parens block),
---     EName <$> name
---   ]
+-- Начало выражения
+prefixExp :: Parser Exp
+prefixExp =
+      try ifExp
+  <|> try letExp
+  <|> try under
+  <|> try (ELiteral <$> literal)
+  <|> try parensThing
+  <|> (EName <$> name)
 
-simpleTerm :: Parser Exp
-simpleTerm = choice [
-    ELiteral <$> literal,
-    -- Специальная обработка скобок
-    parens $ choice [
-      try tupleContent,  -- пробуем как кортеж
-      EParen <$> block   -- иначе как выражение в скобках
-    ],
-    EName <$> name
-  ]
-  where
-    tupleContent = do
-      e1 <- Parser.exp
-      commasym  
-      es <- sepBy1 Parser.exp commasym <* optional commasym
-      pure $ foldr1 EPair (e1 : es)
+-- Постфикс и инфикс операторы
+parsePostfix :: Exp -> Parser Exp
+parsePostfix e = do
+  -- backtick-инфикс
+  e' <- parseBackticks e
+  -- $-оператор
+  e'' <- parseDollar e'
+  -- postfixOps: @ и with
+  parsePostfixOps e'' <|> pure e''
 
+-- backtick инфикс
+parseBackticks :: Exp -> Parser Exp
+parseBackticks e = do
+  rest <- many $ (,) <$> infixName <*> prefixExp
+  pure $ foldl (\acc (op, r) -> EBacktick op acc r) e rest
 
-ifExp, letExp, tupleExp :: Parser Exp
+-- $-инфикс
+parseDollar :: Exp -> Parser Exp
+parseDollar e = do
+  m <- optional (symbol TDollar *> (EDollar e <$> prefixExp))
+  case m of
+    Just e' -> parseDollar e'
+    Nothing -> pure e
+
+-- postfix опкоды: @Name и with
+parsePostfixOps :: Exp -> Parser Exp
+parsePostfixOps e = do
+  f <- optional (postfixOp e)
+  case f of
+    Just e' -> parsePostfixOps e'
+    Nothing -> pure e
+
+postfixOp :: Exp -> Parser Exp
+postfixOp e =
+      try (symbol TAt *> (EPropAccess e <$> name))
+  <|> (keyword KWWith *> do
+        (ts, es) <- choice [
+            try $ (,) <$> typeApps <*> effApps,
+            (, EffApps [] []) <$> typeApps,
+            (TypeApps [], ) <$> effApps
+          ]
+        pure $ EWith e ts es
+      )
+
+-- if-expression
+ifExp :: Parser Exp
 ifExp = do
   keyword KWIf
-  p <- Parser.exp
+  cond <- Parser.exp
   keyword KWThen
-  t <- Parser.exp
+  th <- Parser.exp
   keyword KWElse
-  EIfThenElse p t <$> Parser.exp
+  EIfThenElse cond th <$> Parser.exp
 
+-- let-expression
+letExp :: Parser Exp
 letExp = do
   keyword KWLet
   lp <- letPattern
   symbol TAssign
-  e <- Parser.exp
+  what <- Parser.exp
   keyword KWIn
-  ELet lp e <$> Parser.exp
+  ELet lp what <$> Parser.exp
 
+-- under-expression
 under :: Parser Exp
 under = do
   keyword KWUnder
-  ec <- effCons
+  ec <- eCons
   keyword KWTo
   b <- block
   keyword KWHandle
-  f <- optional handlerClause
-  cs <- many handlerClause
+  f <- optional $ try handlerClause
+  cs <- many $ try handlerClause
   EUnder <$> case f of
     Just f' -> do
-      t <- optional $ pipesym *> keyword KWThen *> symbol TMatchArrow *> block
-      pure $ UFull ec b f' cs t
+      nt <- optional $ do
+        _ <- pipesym *> keyword KWThen
+        n <- name
+        t <- symbol TMatchArrow *> block
+        pure (n, t)
+      let (n, t) = fromMaybe (".", Block [] $ EName ".") nt
+      pure $ Under ec b (f' : cs) n t
     Nothing -> do
-      t <- pipesym *> keyword KWThen *> symbol TMatchArrow *> block
-      pure $ UThen ec b cs t
+      n <- pipesym *> keyword KWThen *> name
+      t <- symbol TMatchArrow *> block
+      pure $ Under ec b cs n t
+
+parensThing :: Parser Exp
+parensThing = do
+  symbol TParenL
+  e <- try tupleInParens <|> (EParen <$> block)
+  symbol TParenR
+  pure e
+
+tupleInParens :: Parser Exp
+tupleInParens = do
+  first <- Parser.exp
+  _ <- commasym
+  second <- Parser.exp
+  rest <- many (try $ commasym *> Parser.exp)
+  _ <- optional commasym
+  pure $ foldr1 EPair (first : second : rest)
+
+-- blockInParens :: Parser Exp
+-- blockInParens =
+--   try (EParen . Block [] <$> (Parser.exp <* lookAhead semisym))
+--   <|> try (do
+--     sts <- some $ blockStat <* semisym
+--     EParen . Block sts <$> Parser.exp)
+
+expNoComma :: Parser Exp
+expNoComma = do
+  e <- prefixExp >>= parsePostfix
+  es <- many $ try $ notFollowedBy (commasym <|> symbol TParenR) *> (prefixExp >>= parsePostfix)
+  pure $ foldl EApply e es
+
+tupleOrExp :: Parser Exp
+-- tupleOrExp = do
+--   first <- expNoComma
+--   cs <- optional commasym
+--   case cs of
+--     Nothing -> pure first
+--     Just _ -> do
+--       rest <- try $ sepBy1 expNoComma commasym <* optional commasym
+--       pure $ foldr1 EPair (first:rest)
+tupleOrExp = do
+  first <- expNoComma
+  rest <- many (commasym *> expNoComma)
+  pure $ case rest of
+    [] -> first
+    xs -> foldr1 EPair (first:xs)
+
+simpleTerm :: Parser Exp
+simpleTerm =
+    ELiteral <$> literal
+    <|> parensThing
+    <|> EName <$> name
 
 handlerClause :: Parser HandlerClause
 handlerClause = do
@@ -475,11 +753,13 @@ handlerClause = do
   symbol TMatchArrow
   HandlerClause n args <$> block
 
-tupleExp = parens $ do
-  e1 <- Parser.exp
-  commasym
-  es <- sepBy1 (try Parser.exp) commasym <* optional commasym
-  pure $ foldr1 EPair (e1 : es)
+sepBy2 :: MonadPlus m => m a -> m sep -> m [a]
+sepBy2 p sep = do
+  a <- p
+  _ <- sep
+  b <- p
+  rest <- many (sep *> p)
+  pure $ a : b : rest
 
 resumeOp :: Operator Parser Exp
 resumeOp = Prefix $ keyword KWResume $> EResume
@@ -532,19 +812,28 @@ arrayEntry :: Parser ArrayEntry
 arrayEntry = try (AEBlock <$> block <* semisym) <|> (AEExp <$> Parser.exp)
 
 lambda :: Parser LambdaLiteral
-lambda = braces $ do
+lambda = do
+  symbol TBraceL
   ts <- optional typeParams
   es <- optional effParams
-  lh <- optional lambdaHead
-  LambdaLiteral ts es lh <$> block
-
+  lh <- optional $ try lambdaHead
+  b <- block
+  symbol TBraceR
+  pure $ LambdaLiteral ts es lh b
 
 lambdaHead :: Parser LambdaHead
 lambdaHead = do
+  lookAhead lambdaHeadStart
   ps <- lambdaParams
   out <- optional $ colonsym *> typ
   symbol TAssign
   pure $ LambdaHead ps out
+  where
+    lambdaHeadStart :: Parser ()
+    lambdaHeadStart = do
+      -- пытаемся найти '=' вперёд, не съедая ввод
+      _ <- trace "ts" $ try (manyTill anySingle $ lookAhead $ symbol TAssign)
+      pure ()
 
 lambdaParams :: Parser [LambdaParam]
 lambdaParams =

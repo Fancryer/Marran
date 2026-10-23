@@ -1,48 +1,91 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OrPatterns #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Types (
   Taste(..),
   Typ(..),
-  Func,
   EffRow(..),
-  EffCons,
-  TypConstraint(..),
-  EffDecl(..),
+  EffCons(..),
+  ECons(..),
+  EffDef(..),
   Expr(..),
-  Scope(..),
+  -- Scope(..),
   Block,
-  NativeBlock,
+  -- NativeBlock,
   Stat(..),
   Lambda(..),
-  NativeLambda(..),
+  -- NativeLambda(..),
   TopLevelStat(..),
   FunctDecl(..),
   Handler(..),
   HandlerSig(..),
   Chunk,
   Mutability(..),
-  NativeLambdaSign(NativeLambdaSign),
+  -- NativeHandlerClause,
+  NativeLambdaSign(..),
+  AtomLetPattern(..),
   TRecordProp(..),
   ERecordProp(..),
   Scheme(..),
   TypeScheme,
   EffScheme,
+  TypeArg(..),
+  TARecordProp(..),
+  Funct(..),
+  RowDef(..),
+  LambdaParam(..),
+  LetPattern(..),
+  LetPatternRecordProp(..),
+  HandlerClause,
   tasteName,
+  metaLevel,
   isSkolem,
   tfunc,
+  pureFunct,
   pureTFunc,
-  handlerCons
+  handlerCons,
+  effName,
+  countArgs
 ) where
-import Data.Map (Map)
 import Data.List (intercalate)
-import Text.Printf (printf)
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.Scientific (Scientific)
+import Utils (Pretty (..))
+import GHC.Generics (Generic)
+import Sexp (Sexp (..))
+import Text.Printf (PrintfArg (formatArg))
 
 data Taste =
-  Meta String Int
-  | Skolem String
-  | Bound String
-  deriving (Show, Ord, Eq)
+  Meta Text Int Int     -- name id lvl
+  | Skolem Text Int Int -- name id lvl
+  | Bound Text Int      -- name id
+  deriving (Show, Generic)
+instance Sexp Taste
+
+instance Pretty Taste where
+  pretty = \case
+    Meta m _ _ -> "`" <> m
+    Skolem s _ _ -> "`" <> s
+    Bound b _ -> "`" <> b
+
+instance Eq Taste where
+  Meta _ lid _ == Meta _ rid _ = lid == rid
+  Skolem _ lid _ == Skolem _ rid _ = lid == rid
+  Bound _ lid == Bound _ rid = lid == rid
+  _ == _ = False
+
+instance Ord Taste where
+  Meta _ lid _ `compare` Meta _ rid _ = lid `compare` rid
+  Skolem _ lid _ `compare` Skolem _ rid _ = lid `compare` rid
+  Bound _ lid `compare` Bound _ rid = lid `compare` rid
+  Meta {} `compare` _ = GT
+  Skolem {} `compare` Meta {} = LT
+  Skolem {} `compare` Bound {} = GT
+  Bound {} `compare` _ = LT
 
 data Typ =
   TInt
@@ -51,187 +94,367 @@ data Typ =
   | TString
   | TNil
   | TNothing
-  | TFlat String
-  | TList Typ
+  | TFlat Text
+  | TArray Typ
   | TPair Typ Typ
-  | TFunc Func                  -- arg -> row ret
+  | TFunct Funct                -- arg -> row ret
   | TRecord [TRecordProp]
-  | TForall [Taste] [Taste] Typ -- forall [a1, ..., an] {e1, ..., en} ==> type
+  | TForall [Taste] [Taste] [Taste] Typ -- forall [a1, ..., an] {e1, ..., en} ==> type
   | TVar Taste
   deriving (Show, Ord, Eq)
 
-type Func = (Typ, Typ, EffRow)
+instance Pretty Typ where
+  pretty = \case
+    TInt -> "Int"
+    TFloat -> "Float"
+    TBoolean -> "Boolean"
+    TString -> "String"
+    TNil -> "()"
+    TNothing -> "Nothing"
+    TFlat n -> n
+    TArray t -> "[" <> pretty t <> "]"
+    TPair l r -> "(" <> pretty l <> ", " <> pretty r <> ")"
+    TFunct f -> pretty f
+    TRecord props -> "#{" <> T.intercalate "; " (map pretty props) <>  "}"
+    TForall ts es rs t -> T.concat [
+        "forall ",
+        "[", T.unwords $ map tasteName ts, "]",
+        "{", T.unwords $ map tasteName es, if null rs then "" else " | " <> T.unwords (map tasteName rs), "}",
+         " ==> ",
+          pretty t
+      ]
+    TVar n -> "`" <> tasteName n
 
-data Scheme a = Scheme [Taste] [Taste] a
+data Funct = Funct Typ Typ EffRow deriving (Show, Ord, Eq)
+
+instance Pretty Funct where
+  pretty (Funct i o fxs) = pretty i <> " -> " <> pretty fxs <> " " <> pretty o
+
+data Scheme a = Scheme {_ts :: [Taste], _es :: [Taste], _rs :: [Taste], _a :: a} deriving Show
+
 type TypeScheme = Scheme Typ
+-- unused, but potentitally could be implemented for row aliases
 type EffScheme = Scheme EffRow
 
-data TRecordProp = TRecordProp Mutability String Typ deriving (Show, Eq, Ord)
+data TRecordProp = TRecordProp {
+    tMut :: Mutability,
+    tName :: Text,
+    tTyp :: Typ
+  }
+  deriving (Show, Eq, Ord)
+
+instance Pretty TRecordProp where pretty = T.pack . show
 
 data EffRow =
-  EClosed [EffCons]       -- Закрытый ряд: {Console; File}
-  | EOpen [EffCons] Taste -- Открытый ряд: {console; file | `e}
-  | EVar Taste            -- Переменная ряда: `e
-  deriving (Show, Ord, Eq)
+  RClosed [EffCons]       -- Закрытый ряд: {Console; File}
+  | ROpen [EffCons] Taste -- Открытый ряд: {console; file | `e}
+  | RVar Taste            -- Переменная ряда: `e
+  deriving (Show, Ord, Eq, Generic)
 
-type EffCons = (String, [Typ])
+instance Sexp EffRow
 
-data TypConstraint =
-  CInt
-  | CFloat
-  | CBoolean
-  | CString
-  | CNil
-  | CNothing
-  | CFlat String
-  | CList TypConstraint
-  | CPair TypConstraint TypConstraint
-  | CFunc TypConstraint TypConstraint  -- arg -> ret, NO effects
-  | CVar Taste
+instance Pretty EffRow where
+  pretty = \case
+    RClosed cons -> "{" <> T.intercalate "; " (map pretty cons) <> "}"
+    ROpen cons t -> "{" <> T.intercalate "; " (map pretty cons) <> " | `" <> tasteName t <> "}"
+    RVar n -> "`" <> tasteName n
 
-data EffDecl =
-  -- name params ops
-  EffDecl String [TypConstraint] [(String, Func)]
-  | EffAlias String EffRow
+data EffCons = EffCons ECons | EVar Taste deriving (Ord, Eq, Generic)
+
+data ECons = ECons Text [TypeArg] deriving (Ord, Eq, Generic)
+
+instance Show ECons where
+  show (ECons n []) = T.unpack n
+  show (ECons n tas) = T.unpack n <> " " <> show tas
+
+instance Pretty ECons where
+  pretty (ECons n args) = case args of
+    [] -> n
+    _ -> n <> "[" <> T.intercalate "; " (map pretty args) <> "]"
+
+instance Sexp ECons
+instance Sexp EffCons
+
+instance Show EffCons where
+  show = \case
+    EffCons (ECons n []) -> "EffCons " <> T.unpack n
+    EffCons (ECons n tas) -> "EffCons " <> T.unpack n <> " " <> show tas
+    EVar n -> "EVar " <> show n
+
+instance Pretty EffCons where
+  pretty = \case
+    EffCons e -> pretty e
+    EVar n -> "`" <> tasteName n
+
+data EffDef = EffDef Text [Text] [(Text, Funct)] deriving Show
+
+effName :: EffDef -> Text
+effName (EffDef n _ _) = n
+
+instance Pretty EffDef where
+  pretty (EffDef n ts ops) =
+    T.concat [
+      "effect ",
+      n,
+      if null ts then " " else "[" <> T.intercalate "; " ts <> "] ",
+      T.intercalate "; " $ map (\(n', f) -> n' <> " : " <> pretty f) ops,
+      " end"
+    ]
+
+data RowDef = RowDef Text EffRow deriving (Show, Generic)
+
+instance Pretty RowDef where
+  pretty (RowDef n row) = "row " <> n <> " = " <> pretty row
 
 data Expr =
-  Int Int
-  | Float Float
+  Int Integer
+  | Float Scientific
   | Boolean Bool
-  | String String
+  | String Text
   | Nil
-  | XVar String
-  | List [Expr]
+  | XVar Text
+  | Array [Expr]
   | Pair Expr Expr
   | XLambda Lambda
-  | NLambda NativeLambda
+  | NLambda NativeLambdaSign
   | Apply Expr Expr
-  | Record [ERecordProp]
-  | With Expr [Typ] [EffRow] -- expr with [ts] {fxs}
+  | Record (Maybe Expr) [ERecordProp]
+  | With Expr [TypeArg] [EffCons] [EffRow]
   | Handle Handler
+  | Paren Block
   | Resume Expr
-  deriving (Eq, Ord)
+  | Let LetPattern Expr Expr
+  | PropAccess Expr Text
+  | IfElse Expr Expr Expr
+  deriving (Eq, Ord, Show)
 
-{-
-
--}
-
-data ERecordProp = ERecordProp Mutability String Typ Expr deriving (Show, Eq, Ord)
-
-instance Show Expr where
-  show = \case
-    Int i -> show i
-    Float f -> show f
-    Boolean b -> show b
-    String s -> s
+instance Pretty Expr where
+  pretty = \case
+    Int i -> T.pack $ show i
+    Float f -> T.pack $ show f
+    Boolean b -> T.pack $ show b
+    String s -> "'" <> s <> "'"
     Nil -> "()"
-    XVar v -> v
-    List es -> "[" ++ intercalate ", " (map show es) ++ "]"
-    Pair l r -> printf "(%s, %s)" (show l) (show r)
-    XLambda lam -> show lam
-    _ -> "#TODO#"
+    XVar n -> n
+    -- Array [ArrayEntry]
+    Pair l r -> "(" <> pretty l <> ", " <> pretty r <> ")"
+    XLambda l -> pretty l
+    -- NLambda NativeLambda
+    Apply f e -> pretty f <> " " <> pretty e
+    -- Record (Maybe Expr) [ERecordProp]
+    -- With Expr [TypeArg] [EffCons] -- expr with [ts] {fxs}
+    Handle h -> pretty h
+    Paren b -> "(" <> pretty b <> ")"
+    Resume e -> "resume " <> pretty e
+    -- Let LetPattern Expr Expr
+    PropAccess e n -> pretty e <> "@" <> n
+    IfElse p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
+    e -> T.pack $ show e
 
-data NativeLambda = NativeLambda NativeLambdaSign (Expr -> IO Expr)
+data TypeArg =
+  TAInt
+  | TAFloat
+  | TABoolean
+  | TAString
+  | TANil
+  | TANothing
+  | TAFlat Text
+  | TAArray TypeArg
+  | TAPair TypeArg TypeArg
+  | TAFunct TypeArg TypeArg
+  | TARecord [TARecordProp]
+  | TAVar Taste
+  deriving (Eq, Ord, Show, Generic)
 
-instance Eq NativeLambda where
-  (NativeLambda sign1 _) == (NativeLambda sign2 _) = sign1 == sign2
+instance Sexp TypeArg
 
-instance Ord NativeLambda where
-  (NativeLambda sign1 _) `compare` (NativeLambda sign2 _) = sign1 `compare` sign2
--- arg argT retT fxs
-data NativeLambdaSign = NativeLambdaSign String (Maybe Typ) (Maybe Typ) EffRow deriving (Eq, Ord)
+instance Pretty TypeArg where
+  pretty = T.pack . show
+
+data TARecordProp = TARecordProp Mutability Text TypeArg deriving (Eq, Ord, Show, Generic)
+instance Sexp TARecordProp
+
+data LetPattern =
+  LPATom AtomLetPattern
+  | LPParam LambdaParam deriving (Eq, Ord, Show)
+
+data AtomLetPattern =
+  ALPNil
+  | ALPUnderscore
+  | ALPPair LetPattern LetPattern
+  | ALPRecord [LetPatternRecordProp]
+  deriving (Eq, Ord, Show)
+
+data LetPatternRecordProp = LetPatternRecordProp Mutability LambdaParam (Maybe AtomLetPattern) deriving (Eq, Ord, Show)
+
+data LambdaParam = LambdaParam Text (Maybe Typ) deriving (Eq, Ord, Show)
+data ERecordProp = ERecordProp {
+  erMut :: Mutability,
+  erName :: Text,
+  erType :: Maybe Typ,
+  erExpr :: Expr
+} deriving (Show, Eq, Ord)
+
+data NativeLambdaSign = NativeLambdaSign Text Typ Typ EffRow deriving (Eq, Ord, Show)
+
+prettyTvars :: [Taste] -> Bool -> Text
+prettyTvars ts skipBrackets =
+  if null ts then
+    if skipBrackets then "" else "[]"
+  else
+    "[" <> T.intercalate "; " (map tasteName ts) <> "] "
 
 data Lambda = Lambda {
-  arg   ::  String,
-  argT ::  Maybe Typ,
-  retT ::  Maybe Typ,
-  fxs   ::  EffRow,
-  block ::  Block
+  lTvars :: [Taste],
+  lEvars :: [Taste],
+  lArg   ::  Text,
+  lArgT  ::  Maybe Typ,
+  lRetT  ::  Maybe Typ,
+  lFxs   ::  EffRow,
+  lBlock ::  Block
 } deriving (Eq, Ord)
 
-instance Show Lambda where
-  show (Lambda arg argT retT fxs block) =
-    "{"
-    ++ arg
-    ++ maybe "" (\t -> " " ++ show t) argT
-    ++ show fxs
-    ++ maybe "" (\t -> " " ++ show t) retT
-    ++ "= "
-    ++ show block
-    ++ "}"
+instance Pretty Lambda where
+  pretty (Lambda ts es n t r fxs b) = T.concat [
+      "{",
+      prettyTvars ts True,
+      " ",
+      if null es then " " else "{" <> T.intercalate "; " (map tasteName es) <> "} ",
+      "(", n, maybe "" ((" : " <>) . pretty) t, ")",
+      " : ",
+      pretty fxs,
+      maybe "" pretty r,
+      " = ",
+      pretty b,
+      "}"
+    ]
 
-type NativeBlock  = (Typ, Expr)
+instance Show Lambda where
+  show (Lambda ts es arg argT retT fxs block) =
+    concat [
+      "{",
+      concat ["[", intercalate "; " $ map show ts, "]"],
+      concat ["{", intercalate "; " $ map show es, "}"],
+      T.unpack arg,
+      maybe "" ((<> " ") . show) argT,
+      show fxs,
+      maybe "" ((<> " ") . show) retT,
+      " = ",
+      show block,
+      "}"
+    ]
+
+-- type NativeBlock  = (Typ, Expr)
 type Block        = ([Stat], Expr)
 
+instance Pretty Block where
+  pretty (stats, e) = T.concat [
+      T.intercalate "; " $ map pretty stats,
+      if null stats then "" else "; ",
+      pretty e
+    ]
+
 data Stat =
-  Bind Mutability String (Maybe Typ) Expr
-  | Assign String Expr
+  Bind Mutability Text (Maybe Typ) Expr
+  | Assign Text Expr
   | Expr Expr
   deriving (Eq, Ord)
+
+instance Pretty Stat where
+  pretty = \case
+    Bind m n t e -> T.concat [pretty m, " ", n, maybe "" ((" " <>) . pretty) t, " = ", pretty e]
+    Assign n e -> n <> " := " <> pretty e
+    Expr e -> pretty e
 
 instance Show Stat where
   show = \case
     Bind mut name typ expr ->
-      show mut ++ " " ++ name ++ maybe "" (\t -> " " ++ show t) typ ++ " = " ++ show expr
-    Assign name expr ->
-      name ++ " := " ++ show expr
+      show mut <> " " <> T.unpack name <> maybe "" ((" " <>) . show) typ <> " = " <> show expr
+    Assign name expr -> T.unpack name <> " := " <> show expr
     Expr expr -> show expr
 
 data TopLevelStat =
-  SFunctDecl FunctDecl
-  | STypeDecl String Typ
-  | SEffDecl EffDecl
+  SFunctDef FunctDecl
+  | STypeDef Text [Text] {-[String]-} Typ
+  | SEffDef EffDef
+  | SRowDef RowDef
+  deriving (Show, Generic)
+instance Sexp TopLevelStat where sexp = show
+
+instance Pretty TopLevelStat where
+  pretty = \case
+    SFunctDef f -> pretty f
+    SRowDef r -> pretty r
+    SEffDef e -> pretty e
+    s -> T.pack $ show s
 
 data FunctDecl = FunctDecl {
-  fname  :: String,
-  tvars  :: [String],
-  evars  :: [String],
-  args   :: [(String, Maybe Typ)],
-  ret    :: (Maybe EffRow, Typ),
+  fName  :: Text,
+  fTvars  :: [Text],
+  fEvars  :: [Text],
+  fRvars  :: [Text],
+  fArgs   :: [(Text, Typ)],
+  fRet    :: (Maybe EffRow, Typ),
   fBlock :: Block
-}
+}  deriving (Show, Generic)
+
+instance Pretty FunctDecl where
+  pretty (FunctDecl n ts es rs args (fx, t) b) =
+    T.concat [
+      "funct ", n,
+      "[" <> T.unwords ts <> "]",
+      "{" <> T.unwords es <> (if null rs then "" else " | " <> T.unwords rs) <> "}",
+      T.unwords $ map (\(n', t') -> "(" <> n' <> " : " <> pretty t' <> ")") args,
+      " : ", maybe "" ((<> " ") . pretty) fx, pretty t, " = ", pretty b
+    ]
+
+instance Sexp FunctDecl where sexp = show
 
 --eff block clauses then
 data Handler =
-  NativeHandler EffCons NativeBlock [NativeHandlerClause] (Maybe NativeLambda)
-  | Handler     EffCons Block       [HandlerClause]       (Maybe Lambda)
-  deriving (Eq, Ord)
+  -- NativeHandler EffCons NativeBlock [NativeHandlerClause] (Maybe NativeLambdaSign)
+  -- |
+  Handler EffCons Block [HandlerClause] Lambda
+  deriving (Eq, Ord, Show)
 
-type NativeHandlerClause  = (String, NativeLambda)
-type HandlerClause        = (String, Lambda)
+instance Pretty Handler where
+  pretty = \case
+    -- NativeHandler _eff _block _clauses _then -> ""
+    Handler eff block clauses _then -> T.concat [
+        "under ", pretty eff, " to ", pretty block,
+        " handle ", T.unwords $ map pretty clauses,
+        pretty _then
+      ]
+
+-- type NativeHandlerClause  = (Text, NativeLambdaSign)
+type HandlerClause = (Text, Lambda)
+
+instance Pretty HandlerClause where
+  pretty (n, Lambda _ _ n' _ _ _ b) = T.concat [
+      " | ", n, " ", n', " => ", pretty b
+    ]
+
 
 -- eff clauses
-data HandlerSig = HandlerSig EffCons [(String, Func)]
+data HandlerSig = HandlerSig EffCons [(Text, Funct)] deriving Show
 
 type Chunk = [TopLevelStat]
 
-data Mutability = Val | Var | Imm deriving (Eq, Ord)
+instance Pretty Chunk where pretty = T.intercalate "\n" . map pretty
 
+data Mutability = Val | Var | Imm deriving (Eq, Ord, Generic)
+
+instance Sexp Mutability
+instance Pretty Mutability
 instance Show Mutability where show = \case Val -> "val"; Var -> "var"; Imm -> "imm"
+instance PrintfArg Mutability where formatArg = formatArg . show
 
-type StringMap  = Map String
-type TypeScope  = StringMap Typ
-type ValueScope = StringMap (TypeScheme, Expr, Mutability)
-type EffScope   = StringMap EffDecl
-
-type TypeSubst  = Map Taste Typ
-type EffSubst   = Map Taste EffRow
-
-data Scope = Scope {
-  types       :: TypeScope,
-  values      :: ValueScope,
-  effects     :: EffScope,
-
-  handlerSig  :: Maybe HandlerSig,
-
-  typeSubst   :: TypeSubst,
-  effSubst    :: EffSubst,
-
-  parent      :: Maybe Scope
-}
 
 tfunc :: Typ -> Typ -> Typ
-tfunc i o = TFunc (i, o, EClosed [])
+tfunc i = TFunct . pureFunct i
+
+pureFunct :: Typ -> Typ -> Funct
+pureFunct i o = Funct i o $ RClosed []
 
 pureTFunc :: [Typ] -> Maybe Typ
 pureTFunc = \case
@@ -239,21 +462,28 @@ pureTFunc = \case
   [i, o] -> Just $ tfunc i o
   (i : o) -> tfunc i <$> pureTFunc o
 
-tasteName :: Taste -> String
+tasteName :: Taste -> Text
 tasteName = \case
-  Skolem s -> s
-  Meta s _ -> s
-  Bound s -> s
+  Skolem s _ _ -> s
+  Meta m _ _ -> m
+  Bound b _ -> b
+
+metaLevel :: Taste -> Maybe Int
+metaLevel = \case
+  Meta _ _ lvl -> Just lvl
+  Skolem _ _ lvl -> Just lvl
+  _ -> Nothing
 
 isSkolem :: Taste -> Bool
-isSkolem (Skolem _) = True
+isSkolem Skolem {} = True
 isSkolem _ = False
 
-{-
-data Handler =
-  NativeHandler EffCons NativeBlock [NativeHandlerClause] (Maybe NativeLambda)
-  | Handler     EffCons Block       [HandlerClause]       (Maybe Lambda)
--}
 handlerCons :: Handler -> EffCons
-handlerCons (NativeHandler cons _ _ _) = cons
+-- handlerCons (NativeHandler cons _ _ _) = cons
 handlerCons (Handler cons _ _ _) = cons
+
+-- Funct Typ Typ EffRow
+countArgs :: Funct -> Int
+countArgs (Funct _ tf _) = case tf of
+  TFunct f -> 1 + countArgs f
+  _ -> 1

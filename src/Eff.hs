@@ -1,202 +1,111 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Eff (
   empty,
   label,
+  elabel,
   labels,
   closedOfFlat,
   isEmpty,
   extractEffects,
-  pureFunc,
+  extractTypeEffects,
+  typeHasEffect,
   unionEffRows,
+  unionEffRowsList,
+  appendEff,
+  rowHasEffect,
   pureEffDeclWithOps,
-  fxAssignment,
   fxInput,
   fxOutput,
-  fxIo,
-  effInput,
-  effOutput,
-  effRandom,
-  effTime,
-  effIo,
-  globalHandlerSig,
-  globalHandler
+  fxRandom,
+  fxTime,
+  fxSystem,
+  fxVar,
+  fxRead,
+  fxRebind,
+  fxCell
 ) where
 import Types
 import Data.List (nub, sort)
-import System.Random
-import Numeric.Limits (minValue, maxValue)
-import Text.Read (readEither)
-import System.IO (hPutStrLn)
-import GHC.IO.Handle.FD (stderr)
-import GHC.IO (throwIO)
-import Data.Char (chr)
-import Control.Monad (replicateM)
+import Data.Text (Text)
+import qualified Utils
 
 empty :: EffRow
-empty = EClosed []
+empty = RClosed []
 
-label :: String -> EffCons
-label l = (l, [])
+label :: Text -> EffCons
+label = EffCons . elabel
 
-labels :: [String] -> [EffCons]
+elabel :: Text -> ECons
+elabel = flip ECons []
+
+labels :: [Text] -> [EffCons]
 labels = map label
 
-closedOfFlat :: String -> EffRow
-closedOfFlat l = EClosed [label l]
+closedOfFlat :: Text -> EffRow
+closedOfFlat l = RClosed [label l]
 
 isEmpty :: EffRow -> Bool
-isEmpty = \case EClosed [] -> True; _ -> False
+isEmpty = \case RClosed [] -> True; _ -> False
 
 extractEffects :: EffRow -> [EffCons]
 extractEffects = \case
-    EVar _ -> []
-    EClosed fxs' -> fxs'
-    EOpen fxs' _ -> fxs'
+  RClosed fxs' -> fxs'
+  ROpen fxs' _ -> fxs'
+  _ -> []
 
-pureFunc :: Typ -> Typ -> Typ
-pureFunc i o = TFunc (i, o, EClosed [])
+rowHasEffect :: EffRow -> EffCons -> Bool
+rowHasEffect r = (`elem` extractEffects r)
+
+extractTypeEffects :: Typ -> [EffCons]
+extractTypeEffects = \case
+  TArray t -> extractTypeEffects t
+  TPair l r -> extractTypeEffects l <> extractTypeEffects r
+  TFunct (Funct i o r) -> extractTypeEffects i <> extractTypeEffects o <> extractEffects r
+  TRecord props -> Utils.uniqPreserveOrder $ concatMap (extractTypeEffects . tTyp) props
+  TForall _ _ _ t -> extractTypeEffects t
+  _ -> []
+
+typeHasEffect :: Typ -> EffCons -> Bool
+typeHasEffect t = (`elem` extractTypeEffects t)
+
+appendEff :: EffRow -> EffCons -> EffRow
+appendEff r e = case r of
+  ROpen cs t -> ROpen (cs <> [e]) t
+  RClosed cs -> RClosed $ cs <> [e]
+  _ -> r
 
 unionEffRows :: EffRow -> EffRow -> EffRow
 unionEffRows r1 r2 =
   let effects1 = extractEffects r1 in
   let effects2 = extractEffects r2 in
 
-  let combinedEffects = sort $ nub $ effects1 ++ effects2 in
+  let combinedEffects = sort $ nub $ effects1 <> effects2 in
 
   case (r1, r2) of
     -- Если хотя бы один ряд открытый - результат открытый
-    (EOpen _ v, _) -> EOpen combinedEffects v
-    (_, EOpen _ v) -> EOpen combinedEffects v
-    -- Если есть переменная, но нет открытого ряда
-    (EVar _, _) -> r1
-    (_, EVar _) -> r2
+    (ROpen _ v, _) -> ROpen combinedEffects v
+    (_, ROpen _ v) -> ROpen combinedEffects v
     -- Оба закрытые
-    (EClosed _, EClosed _) -> EClosed combinedEffects
+    (RClosed _, RClosed _) -> RClosed combinedEffects
+    (RVar _, RVar _) -> error "Cannot union two abstract row variables"
+    (RVar v, r) -> ROpen (extractEffects r) v
+    (r, RVar v) -> ROpen (extractEffects r) v
 
-pureEffDeclWithOps :: String -> [(String, Func)] -> EffDecl
-pureEffDeclWithOps name = EffDecl name []
+unionEffRowsList :: [EffRow] -> EffRow
+unionEffRowsList = foldl unionEffRows $ RClosed []
 
-fxAssignment, fxInput, fxOutput, fxIo :: EffRow
-fxAssignment = closedOfFlat "Assignment"
+pureEffDeclWithOps :: Text -> [(Text, Funct)] -> EffDef
+pureEffDeclWithOps name = EffDef name []
+
+fxInput, fxOutput, fxRandom, fxTime, fxSystem, fxVar, fxRead, fxRebind, fxCell :: EffRow
 fxInput = closedOfFlat "Input"
 fxOutput = closedOfFlat "Output"
-fxIo = unionEffRows fxInput fxOutput
-
-effInput, effOutput, effRandom, effTime, effIo :: EffDecl
-effInput = pureEffDeclWithOps "Input" [
-    ("read_int", (TNil, TInt, EClosed [])),
-    ("read_string", (TNil, TString, EClosed []))
-  ]
-
-effOutput = pureEffDeclWithOps "Output" [
-    ("sayn", (TString, TNil, EClosed [])),
-    ("say", (TString, TNil, EClosed []))
-  ]
-
-effRandom = pureEffDeclWithOps "Random" [
-    ("random_int", (TNil, TInt, EClosed [])),
-    ("random_float", (TNil, TFloat, EClosed [])),
-    ("random_boolean", (TNil, TBoolean, EClosed [])),
-    ("random_string", (TInt, TString, EClosed [])) -- N given random printable ASCII-characters
-  ]
-
-effTime = pureEffDeclWithOps "Time" [
-    ("get_time_ms", (TNil, TInt, EClosed []))
-  ]
-
-effIo = EffAlias "Io" (EClosed [label "Input", label "Output", label "Random"])
-
-globalHandlerSig :: HandlerSig
-globalHandlerSig =
-  let inp = closedOfFlat "Input"
-      out = closedOfFlat "Output"
-      rand = closedOfFlat "Random" in
-  HandlerSig (label "Io") [
-    ("read_int", (TNil, TInt, inp)),
-    ("read_string", (TNil, TInt, inp)),
-    ("sayn", (TString, TNil, out)),
-    ("say", (TString, TNil, out )),
-    ("random_int", (TNil, TInt, rand)),
-    ("random_float", (TNil, TFloat, rand)),
-    ("random_boolean", (TNil, TBoolean, rand)),
-    ("random_string", (TInt, TString, rand))
-  ]
-
-globalHandler :: NativeBlock -> (Expr -> String) -> IO Handler
-globalHandler bl exprToString =
-  pure $ NativeHandler
-    (label "Io")
-    bl
-    [
-      ("read_int", -- read_int : () -> {Input} Int
-        NativeLambda
-          (NativeLambdaSign "_" (Just TNil) (Just TInt) $ closedOfFlat "Input")
-          $ \_ -> do
-            input <- getLine
-            case readEither input of
-              Left err -> do
-                hPutStrLn stderr $ "Error reading Int: " ++ err
-                error "Invalid Int input"
-              Right n -> pure $ Int n),
-      ("read_string", -- read_string : () -> {Input} String
-        NativeLambda
-          (NativeLambdaSign "_" (Just TNil) (Just TString) $ closedOfFlat "Input")
-          $ \_ -> do
-            input <- getLine
-            case readEither input of
-              Left err -> do
-                hPutStrLn stderr $ "Error reading String: " ++ err
-                error "Invalid String input"
-              Right n -> pure $ String n),
-      ("sayn", -- sayn : String -> {Output} ())
-        NativeLambda
-          (NativeLambdaSign "s" (Just TString) (Just TNil) $ closedOfFlat "Output")
-          $ \s -> do
-            print s
-            pure Nil),
-      ("say", -- say : String -> {Output} ())
-        NativeLambda
-          (NativeLambdaSign "s" (Just TString) (Just TNil) $ closedOfFlat "Output")
-          $ \s -> do
-            putStr $ show s
-            pure Nil),
-      ("random_int", -- random_int : () -> {Random} Int)
-        NativeLambda
-          (NativeLambdaSign "_" (Just TNil) (Just TInt) $ closedOfFlat "Random")
-          $ \_ -> do Int <$> randomInt),
-      ("random_float", -- random_float : () -> {Random} Float)
-        NativeLambda
-          (NativeLambdaSign "_" (Just TNil) (Just TFloat) $ closedOfFlat "Random")
-          $ \_ -> do Float <$> randomFloat),
-      ("random_boolean", -- random_boolean : () -> {Random} Boolean)
-        NativeLambda
-          (NativeLambdaSign "_" (Just TNil) (Just TBoolean) $ closedOfFlat "Random")
-          $ \_ -> do Boolean <$> randomBool),
-      ("random_string", -- random_string : () -> {Random} String)
-        NativeLambda
-          (NativeLambdaSign "n" (Just TInt) (Just TString) $ closedOfFlat "Random")
-          $ \n -> do
-              case n of
-                Int n' -> do
-                  chars <- replicateM n' (do
-                    j <- randomIntFromTo 0 94
-                    pure $ chr (33 + j))
-                  pure $ String chars
-                _ -> throwIO $ userError "Type error: random_string must accept Int parameter")
-    ]
-    Nothing
-  where
-    randomInt :: IO Int
-    randomInt = randomRIO (minBound, maxBound)
-
-    randomIntFromTo :: Int -> Int -> IO Int
-    randomIntFromTo from to = randomRIO (from, to)
-
-    -- Случайное Float в диапазоне [-maxFloat/2, maxFloat/2]
-    randomFloat :: IO Float
-    randomFloat = randomRIO (minValue, maxValue)
-
-    -- Случайный Bool
-    randomBool :: IO Bool
-    randomBool = randomIO  -- или randomRIO (False, True)
+fxRandom = closedOfFlat "Random"
+fxTime = closedOfFlat "Time"
+fxSystem = closedOfFlat "System"
+fxVar = closedOfFlat "Var"
+fxRead = closedOfFlat "Read"
+fxRebind = closedOfFlat "Rebind"
+fxCell = closedOfFlat "Cell"

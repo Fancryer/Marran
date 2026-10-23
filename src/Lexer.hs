@@ -4,6 +4,7 @@
 
 module Lexer (
   Token(..),
+  LToken(..),
   Keyword(..),
   tokens,
   token
@@ -13,7 +14,7 @@ import Data.Void
 import Data.Text(Text)
 import qualified Data.Text as T
 
-import Text.Megaparsec(Parsec, choice, some, MonadParsec (notFollowedBy, try, eof), satisfy, oneOf, between, optional, many)
+import Text.Megaparsec(Parsec, choice, some, MonadParsec (notFollowedBy, try, eof), satisfy, oneOf, between, optional, many, SourcePos, getSourcePos)
 import Text.Megaparsec.Char(space1, char, string)
 import qualified Text.Megaparsec.Char.Lexer as L
 import GHC.Unicode (isAlphaNum, isDigit, isHexDigit)
@@ -25,8 +26,8 @@ import Utils (Pretty (..))
 
 type Lexer = Parsec Void Text
 
-tokens :: Lexer [Token]
-tokens = between sc eof $ many token
+tokens :: Lexer [LToken]
+tokens = between sc eof $ many locatedToken
 
 sc :: Lexer ()
 sc = L.space
@@ -149,9 +150,12 @@ tvar = lexeme $ TTVar <$> (char '`' *> nameText)
 infixName :: Lexer Token
 infixName = lexeme $ TInfixName <$> between (char '`') (char '`') nameText
 
+locatedToken :: Lexer LToken
+locatedToken = LToken <$> getSourcePos <*> token
+
 token :: Lexer Token
 token = choice [
-    infixName,
+    try infixName,
     tvar,
     sym "$" TDollar,
     sym "@" TAt,
@@ -211,6 +215,8 @@ stringChar =
 charString :: Lexer Token
 charString = lexeme $ TString . T.pack <$> between (char '\'') (char '\'') (many stringChar)
 
+data LToken = LToken {ltPos :: SourcePos, ltToken :: Token} deriving (Eq, Show, Ord)
+
 data Token =
   TDollar
   | TAt
@@ -249,43 +255,43 @@ data Token =
 
 instance Pretty Token where
   pretty = \case
-    TDollar -> "$"
-    TAt -> "@"
-    TColon -> ":"
-    TComma -> ","
-    TSemi -> ";"
+    TDollar   -> "$"
+    TAt       -> "@"
+    TColon    -> ":"
+    TComma    -> ","
+    TSemi     -> ";"
     TEllipsis -> "..."
 
-    TParenL -> "("
-    TParenR -> ")"
-    TBraceL -> "{"
-    TBraceR -> "}"
-    TSquareL -> "["
-    TSquareR -> "]"
-    TSharpBraceL -> "#{"
+    TParenL       -> "("
+    TParenR       -> ")"
+    TBraceL       -> "{"
+    TBraceR       -> "}"
+    TSquareL      -> "["
+    TSquareR      -> "]"
+    TSharpBraceL  -> "#{"
     TSharpSquareL -> "#["
 
     TAssign -> "="
     TRebind -> ":="
-    TPipe -> "|"
+    TPipe   -> "|"
 
     TUnderscore -> "_"
-    TArrow -> "->"
+    TArrow      -> "->"
     TMatchArrow -> "=>"
-    THRPArrow -> "==>"
+    THRPArrow   -> "==>"
 
-    TKW k -> pretty k
-    TName n -> n
-    TInfixName n -> "`" <> n <> "`"
-    TTVar v -> "`" <> v
+    TKW k         -> pretty k
+    TName n       -> n
+    TInfixName n  -> "`" <> n <> "`"
+    TTVar v       -> "`" <> v
 
-    TInt i -> T.pack $ show i
-    TFloat f -> T.pack $ show f
-    THexInt i -> T.pack $ show i
+    TInt i      -> T.pack $ show i
+    TFloat f    -> T.pack $ show f
+    THexInt i   -> T.pack $ show i
     THexFloat f -> T.pack $ show f
 
     TString s -> "'" <> s <> "'"
-    TNil -> "()"
+    TNil      -> "()"
 
 data Keyword =
   KWEffect
@@ -314,25 +320,25 @@ data Keyword =
 
 instance Pretty Keyword where
   pretty = \case
-    KWEffect -> "effect"
-    KWElse -> "else"
-    KWEnd -> "end"
-    KWFalse -> "false"
-    KWForall -> "forall"
-    KWFunct -> "funct"
-    KWHandle -> "handle"
-    KWIf -> "if"
-    KWIn -> "in"
-    KWImm -> "imm"
-    KWLet -> "let"
-    KWMatch -> "match"
-    KWResume -> "resume"
-    KWRow -> "row"
-    KWThen -> "then"
-    KWTo -> "to"
-    KWTrue -> "true"
-    KWType -> "type"
-    KWUnder -> "under"
-    KWVal -> "val"
-    KWVar -> "var"
-    KWWith -> "with"
+    KWEffect  -> "effect"
+    KWElse    -> "else"
+    KWEnd     -> "end"
+    KWFalse   -> "false"
+    KWForall  -> "forall"
+    KWFunct   -> "funct"
+    KWHandle  -> "handle"
+    KWIf      -> "if"
+    KWIn      -> "in"
+    KWImm     -> "imm"
+    KWLet     -> "let"
+    KWMatch   -> "match"
+    KWResume  -> "resume"
+    KWRow     -> "row"
+    KWThen    -> "then"
+    KWTo      -> "to"
+    KWTrue    -> "true"
+    KWType    -> "type"
+    KWUnder   -> "under"
+    KWVal     -> "val"
+    KWVar     -> "var"
+    KWWith    -> "with"

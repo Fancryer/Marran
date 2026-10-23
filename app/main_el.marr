@@ -1,0 +1,7 @@
+row Mutation = {Var; Cell; Read; Rebind}
+row Io = {Input; Output}
+row Main = {Var; Cell; Read; Rebind; Input; Output | `R}
+funct apply[]{}(f : `A -> { | `R} `B) (x : `A) : { | `R} `B = f x
+funct while[]{}(pred : () -> {Var; Cell; Read; Rebind; Input; Output | `R} Boolean) (do : () -> {Var; Cell; Read; Rebind; Input; Output | `R} ()) : {Var; Cell; Read; Rebind; Input; Output | `R} () = if pred () then while pred do else ()
+funct guess_game[]{}(. : ()) : {Var; Cell; Read; Rebind; Input; Output | `R} () = var i = 10; force (while {  (.) : {} = i; False} {  (.) : {} = say 'i: '; sayn i; i := - i 1; ()})
+funct main[]{}(. : ()) : {Var; Cell; Read; Rebind; Input; Output | `R} () = apply + 3 2

@@ -1,0 +1,6 @@
+row Mutation = {Var; Cell; Read; Rebind}
+row Io = {Input; Output}
+row Main = {Var; Cell; Read; Rebind; Input; Output | e}
+funct while(pred : () -> {Read} Boolean) (do : () -> {Output; Read; Rebind} ()) : {Output; Read; Rebind} () = (If (Apply (XVar "pred" TFunct (Funct TNil TBoolean (RClosed [EffCons (ECons "Read" [])]))) Nil) (Apply (Apply (XVar "while" TFunct (Funct (TFunct (Funct TNil TBoolean (RClosed [EffCons (ECons "Read" [])]))) (TFunct (Funct (TFunct (Funct TNil TNil (RClosed [EffCons (ECons "Output" []),EffCons (ECons "Read" []),EffCons (ECons "Rebind" [])]))) TNil (RClosed [EffCons (ECons "Output" []),EffCons (ECons "Read" []),EffCons (ECons "Rebind" [])]))) (RClosed []))) (XVar "pred" TFunct (Funct TNil TBoolean (RClosed [EffCons (ECons "Read" [])])))) (XVar "do" TFunct (Funct TNil TNil (RClosed [EffCons (ECons "Output" []),EffCons (ECons "Read" []),EffCons (ECons "Rebind" [])])))) Nil)
+funct guess_game(. : ()) : {Output; Read; Var; Rebind} () = var i = 10; force (while { (. : `m19) : {Read} Boolean = i; False} { (. : `m25) : {Output; Read; Rebind} () = say 'i: '; sayn i; i := - i 1; ()})
+funct main(. : ()) : {Output; Read; Rebind; Var} () = guess_game ()

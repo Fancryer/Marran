@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE LambdaCase #-}
 {-# OPTIONS_GHC -Wno-unused-top-binds -fno-warn-orphans #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -8,7 +9,7 @@ module Spec (
   printExps
 ) where
 
-import Parser (parseTokens, Parser, exp, tupleExp, block, blockStat)
+import Parser (parseTokens, Parser, exp, parseTokensUnposed, effCons, effRow, chunk, typ, block, parseFromText)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.QuickCheck (
     Positive (Positive),
@@ -27,12 +28,11 @@ import Test.QuickCheck (
     vectorOf
   )
 import qualified Data.Text as T
-import Lexer(Token(..), Keyword (..))
+import Lexer(Token(..), Keyword (..), LToken)
 import Numeric(showHex)
 import Test.QuickCheck.Arbitrary (Arbitrary(arbitrary))
 import Data.Scientific(toRealFloat, Scientific, scientific)
-import Text.Megaparsec(ParseErrorBundle, MonadParsec (eof), runParser)
-import Data.Void(Void)
+import Text.Megaparsec(MonadParsec (eof), runParser, errorBundlePretty)
 import Data.Text(Text)
 import Ast(
     Literal(..),
@@ -49,13 +49,12 @@ import Ast(
     ConstantQualifier(Val, Var, Imm),
     LambdaParam(LambdaParam),
     Typ(..),
-    EffRow(EREvar, ERAlias, ERSugar),
+    EffRow(ERAlias, ERSugar),
     RecordTyp(RecordTyp),
     EffRowEntry(EREEffCons, EREEffRow),
     EffCons(EffCons),
     RecordTypProp(RecordTypProp),
-    TypeParams(TParams),
-    Params (Params),
+    TypeParams (..),
     TypeApps(TypeApps),
     EffApps(EffApps),
     TypeArg(..),
@@ -66,22 +65,30 @@ import Ast(
     AtomLetPattern(..),
     AtomLetPatternRecordProp(AtomLetPatternRecordProp),
     HandlerClause(HandlerClause),
-    EffParams(EParams),
-    Under(UFull, UThen),
+    EffParams (EffParams),
+    Under(..),
     LambdaLiteral(LambdaLiteral),
     RecordLiteral(RecordLiteral),
-    LambdaHead(LambdaHead)
+    LambdaHead(LambdaHead), Funct (Funct), ECons (..)
   )
 import Utils (Pretty(pretty))
-import Control.Arrow (ArrowChoice(left))
-import Test.QuickCheck.Property ((===))
 import Data.Int (Int64)
 import Control.Monad (foldM)
 import Data.List ((\\))
 import Text.Printf (printf)
-
-parseTok :: Parser a -> [Token] -> Either (ParseErrorBundle [Token] Void) a
-parseTok p = runParser (p <* eof) ""
+import Sexp (Sexp (..))
+import Elaborator (elaborate, elaborateEffRow, ElabState (..), ElabM, ElaborationError, elaborateExpr, ElabEnv (..), elaborateBlock)
+import System.IO (readFile')
+import Control.Monad.State.Lazy (runState, evalState)
+import Control.Monad.Except (runExceptT)
+import Types (TopLevelStat(SFunctDef), Expr (..), Lambda (..))
+import Scope (globalScope)
+import Infer (inferExpr, inferBlock, inferChunk, InferResult (..))
+import qualified Data.Map as Map
+import qualified System.Environment as IO
+import System.Environment (getArgs)
+import Unify (TypeCheckState(..), evalTypeCheckM)
+import Interpreter (interpret)
 
 genName :: Gen Text
 genName = do
@@ -233,7 +240,7 @@ genTypArrow :: Int -> Gen Typ
 genTypArrow 0 = genTypComma 0
 genTypArrow n = frequency [
     (3, genTypComma n),
-    (1, TFunct <$> sub genTypComma <*> sub genTypArrow <*> maybeGen (sub genEffRow))
+    (1, TFunct <$> (Funct <$> sub genTypComma <*> sub genTypArrow <*> sub genEffRow))
   ]
   where sub f = f $ n `div` 2
 
@@ -249,7 +256,7 @@ instance Arbitrary Typ where arbitrary = sized genTopTyp
 instance Arbitrary EffRow where arbitrary = sized genEffRow
 
 genEffRow :: Int -> Gen EffRow
-genEffRow 0 = oneof [EREvar <$> genName, ERAlias <$> genName]
+genEffRow 0 = ERAlias <$> genName
 genEffRow n = ERSugar <$> listOf (genEffRowEntry $ n `div` 2) <*> maybeGen genName
 
 instance Arbitrary EffRowEntry where arbitrary = sized genEffRowEntry
@@ -262,7 +269,10 @@ genEffRowEntry n = oneof [
   ]
 
 instance Arbitrary EffCons where
-  arbitrary = EffCons <$> genName <*> maybeGen arbitrary
+  arbitrary = EffCons <$> arbitrary
+
+instance Arbitrary ECons where
+  arbitrary = ECons <$> genName <*> maybeGen arbitrary
 
 instance Arbitrary RecordTyp where arbitrary = sized genRecordTyp
 
@@ -276,18 +286,23 @@ genRecordTypProp :: Int -> Gen RecordTypProp
 genRecordTypProp n =
   RecordTypProp <$> arbitrary <*> genName <*> genTopTyp (if n == 0 then 0 else n `div` 2)
 
-instance Arbitrary TypeParams where arbitrary = TParams <$> arbitrary
-
-instance Arbitrary (Params Text) where
+instance Arbitrary TypeParams where
   arbitrary = do
     n <- frequency [
         (4, choose (1, 3)),
         (2, choose (4, 5)),
         (1, choose (6, 8))
       ]
-    Params <$> vectorOf n genName
+    TypeParams <$> vectorOf n genName
 
-instance Arbitrary EffParams where arbitrary = EParams <$> arbitrary
+instance Arbitrary EffParams where
+  arbitrary = do
+    n <- frequency [
+        (4, choose (1, 3)),
+        (2, choose (4, 5)),
+        (1, choose (6, 8))
+      ]
+    EffParams <$> vectorOf n genName
 
 instance Arbitrary TypeApps where arbitrary = sized genTypeApps
 
@@ -482,11 +497,14 @@ genHandlerClause n =
 instance Arbitrary Under where arbitrary = sized genUnder
 
 genUnder :: Int -> Gen Under
-genUnder 0 = UThen <$> arbitrary <*> genBlock 0 <*> pure [] <*> genBlock 0
-genUnder n = oneof [
-    UFull <$> arbitrary <*> subB <*> subHC <*> listOf subHC <*> maybeGen subB,
-    UThen <$> arbitrary <*> subB <*> listOf subHC <*> subB
-  ]
+genUnder 0 = Under <$> arbitrary <*> genBlock 0 <*> pure [] <*> genName <*> genBlock 0
+genUnder n = do
+      a <- arbitrary
+      b <- subB
+      hc <- subHC
+      cs <- listOf subHC
+      let cs' = [hc] <> cs
+      Under a b cs' <$> genName <*> subB
   where
     sub f = f $ n `div` 2
     subB = sub genBlock
@@ -521,33 +539,35 @@ genAtomLetPatternRecordProp :: Int -> Gen AtomLetPatternRecordProp
 genAtomLetPatternRecordProp n = do
   cq <- arbitrary
   lp <- genLambdaParam $ n `div` 2
-  AtomLetPatternRecordProp cq lp <$> genAtomLetPattern (n `div` 2)
+  AtomLetPatternRecordProp cq lp <$> maybeGen (genAtomLetPattern $ n `div` 2)
 
 instance Arbitrary LambdaParam where arbitrary = sized genLambdaParam
 
 genLambdaParam :: Int -> Gen LambdaParam
 genLambdaParam n = LambdaParam <$> genName <*> maybeGen (genTopTyp $ n `div` 2)
 
--- TODO: instance VisualStream [Token] where
---   showTokens _ = concatMap show
-
--- instance TraversableStream [Token] where
---   reachOffset _i st = (Just "Unknown error!", st)
-
-parseFromText :: Parser a -> Text -> Either String a
-parseFromText parser txt = do
-  case Parser.parseTokens txt of
-    Left err -> Left err
-    Right ts -> do {-errorBundlePretty-} show `left` parseTok parser ts
-
 parseExpFromText :: Text -> Either String Exp
 parseExpFromText = parseFromText Parser.exp
 
 prop_roundTripExp :: Exp -> Property
 prop_roundTripExp e =
-  case parseExpFromText $ pretty e of
-    Right e' -> e' === e
-    Left err -> counterexample err False
+  case parseExpFromText (pretty e) of
+    Left err ->
+      counterexample err False
+    Right e' ->
+      counterexample ("input show:  " <> show e) $
+      counterexample ("got show:    " <> show e') $
+      counterexample ("expect show: " <> show e) $
+
+      counterexample ("input pretty:  " <> T.unpack (pretty e)) $
+      counterexample ("got pretty:    " <> T.unpack (pretty e')) $
+      counterexample ("expect pretty: " <> T.unpack (pretty e)) $
+
+      counterexample ("input sexp:  " <> sexp e) $
+      counterexample ("got sexp:    " <> sexp e') $
+      counterexample ("expect sexp: " <> sexp e) $
+
+      property (e' == e)
 
 replaces :: [(Text, Text)] -> Text -> Text
 replaces = flip $ foldl' $ flip $ uncurry T.replace
@@ -556,20 +576,16 @@ spec :: Spec
 spec = do
   describe "Lexer" $ do
     it "parses arbitrary positive decimal integers" $ property prop_decInt
-    it "parses decimal integer" $ parseTokens "123" `shouldBe` Right [TInt 123]
-
-    it "parses decimal with underscores" $
-      parseTokens "1_000_000" `shouldBe` Right [TInt 1000000]
-
-    it "parses hex integer" $
-      parseTokens "0xFF" `shouldBe` Right [THexInt 255]
+    it "parses decimal integer" $ parseTokensUnposed "123" `shouldBe` Right [TInt 123]
+    it "parses decimal with underscores" $ parseTokensUnposed "1_000_000" `shouldBe` Right [TInt 1000000]
+    it "parses hex integer" $ parseTokensUnposed "0xFF" `shouldBe` Right [THexInt 255]
 
     it "parses float" $
       let isRightFloat :: Double -> Either String [Token] -> Bool
           isRightFloat x (Right [TFloat s]) = toRealFloat s == x
           isRightFloat _ _ = False
       in
-      parseTokens "12.34" `shouldSatisfy` isRightFloat 12.34
+      parseTokensUnposed "12.34" `shouldSatisfy` isRightFloat 12.34
 
     it "does not split keywordX into keyword + name" $ property $ do
       n <- genName
@@ -597,29 +613,29 @@ spec = do
           KWVar,
           KWWith
         ]
-      pure $ parseTokens (kw <> n) `shouldBe` Right [TName $ kw <> n]
+      pure $ parseTokensUnposed (kw <> n) `shouldBe` Right [TName $ kw <> n]
 
     it "parses simple string" $ property $ do
       n <- T.concat <$> listOf genName
-      pure $ parseTokens ("'" <> n <> "'") `shouldBe` Right [TString n]
+      pure $ parseTokensUnposed ("'" <> n <> "'") `shouldBe` Right [TString n]
 
     it "parses escaped quote" $ property $ do
       l <- genName
       r <- genName
-      pure $ parseTokens (T.concat ["'", l, "\\'", r, "'"]) `shouldBe`
+      pure $ parseTokensUnposed (T.concat ["'", l, "\\'", r, "'"]) `shouldBe`
         Right [TString $ l <> "'" <> r]
 
     it "parses escaped backslash" $ property $ do
       l <- genName
       r <- genName
-      pure $ parseTokens (T.concat ["'", l, "\\\\", r, "'"]) `shouldBe`
+      pure $ parseTokensUnposed (T.concat ["'", l, "\\\\", r, "'"]) `shouldBe`
         Right [TString $ l <> "\\" <> r]
 
     it "parses complex string" $ property $ do
       n <- genText
       let input = "'" <> n <> "'"
-      pure $ parseTokens input `shouldBe`
-        Right [TString $ T.replace "\\\\" "\\" $ T.replace "\\'" "'" n]
+      pure $ parseTokensUnposed input `shouldBe`
+        Right [TString $ T.replace "\\\\" "\\" (T.replace "\\'" "'" n)]
 
     it "parses arbitrary positive decimal integers with underscores" $ property prop_decIntUnderscore
     it "parses arbitrary positive hex integers" $ property prop_hexInt
@@ -627,22 +643,23 @@ spec = do
   -- describe "Parser" $ do it "goes roundtrip exp" $ property prop_roundTripExp
 
 prop_decInt :: Positive Integer -> Bool
-prop_decInt (Positive n) = parseTokens (T.pack $ show n) == Right [TInt n]
+prop_decInt (Positive n) =
+  case parseTokensUnposed (T.pack $ show n) of
+    Right [TInt n'] | n' == n -> True; _ -> False
 
 prop_decIntUnderscore :: Positive Integer -> Property
 prop_decIntUnderscore (Positive n) =
   forAll (insertUnderscores $ show n) $ \txt ->
-    case parseTokens $ T.pack txt of
+    case parseTokensUnposed $ T.pack txt of
       Right [TInt m]  -> m == n
       _               -> False
 
 prop_hexInt :: Positive Integer -> Bool
 prop_hexInt (Positive n) =
-  let hex = showHex n ""
-      txt = "0x" ++ hex
-  in case parseTokens $ T.pack txt of
-       Right [THexInt m]  -> m == n
-       _                  -> False
+  let hex = showHex n ""; txt = "0x" <> hex
+  in case parseTokensUnposed $ T.pack txt of
+      Right [THexInt m]  -> m == n
+      _                  -> False
 
 prop_noCrash :: String -> Bool
 prop_noCrash s =
@@ -661,40 +678,85 @@ insertUnderscores = \case
 
 printExps :: IO ()
 printExps = do
-  -- arr <- generate $ do
-  --   depth <- choose (0, 5)
-  --   vectorOf 2 $ genTopExp depth
-  -- mapM_
-  --   (\a ->
-  --     do
-  --       putStrLn $ T.unpack $ T.append "Exp: " $ pretty a
-  --       putStrLn $ "Exp AST: " ++ show a)
-  --   arr
-  -- _ <- putStrLn ""
-  -- let
-  --   parseAndPrintExp = either
-  --     (putStrLn . (++) "Error: ")
-  --     (\e -> do
-  --       printf "Exp: %s\n" $ pretty e
-  --       printf "Exp AST: %s\n" $ show e)
-  --     . parseExpFromText
-  -- _ <- parseAndPrintExp "#{val x    : Int = 5  }@   x"
-  -- _ <- parseAndPrintExp "[1, 2, 3]"
-  -- _ <- parseAndPrintExp "(1, 2, 3)"
-  -- _ <- parseAndPrintExp "(1, (1, 2), (val x = 5; + x x), {* it it})"
-  -- _ <- parseAndPrintExp "if pred x y then 42 else if f z 4 then 5 else 0"
-  _ <- parseAndPrint "tuple2" parseTupleFromText "(1, 2)"
-  _ <- parseAndPrint "tuple2paren" parseTupleFromText "(1, (2, 3))"
-  _ <- parseAndPrint "tuple3" parseTupleFromText "(1, 2, 3)"
-  _ <- parseAndPrint "bindDef stat" (parseFromText Parser.blockStat) "val x = 5"
-  _ <- parseAndPrint "exp stat" (parseFromText Parser.blockStat) "+ x x"
-  _ <- parseAndPrint "just exp" (parseFromText Parser.exp) "+ x x"
-  _ <- parseAndPrint "block" (parseFromText Parser.block) "val x = 5; + x x"
-  _ <- parseAndPrint "tuple with block" parseTupleFromText "(1, (1, 2), (val x = 5; + x x), {* it it})"
+--   _ <- parseAndPrint "record" parseExpFromText "#{val x    : Int = 5  }@   x"
+--   _ <- parseAndPrint "array" parseExpFromText "[1, 2, 3]"
+--   _ <- parseAndPrint "triple" parseExpFromText "(1, 2, 3)"
+--   _ <- parseAndPrint "if-then-else" parseExpFromText "if pred x y then 42 else if f z 4 then 5 else 0"
+
+--   _ <- parseAndPrint "tuple2" (parseFromText Parser.tupleOrExp) "(1, 2)"
+--   _ <- parseAndPrint "tuple2paren" (parseFromText Parser.tupleOrExp) "(1, (2, 3))"
+--   _ <- parseAndPrint "tuple3" (parseFromText Parser.tupleOrExp) "(1, 2, 3)"
+
+--   _ <- parseAndPrint "tuple2 exp" (parseFromText Parser.exp) "(1, 2)"
+--   _ <- parseAndPrint "tuple2paren exp" (parseFromText Parser.exp) "(1, (2, 3))"
+--   _ <- parseAndPrint "tuple3 exp" (parseFromText Parser.exp) "(1, 2, 3)"
+
+--   _ <- parseAndPrint "bindDef stat" (parseFromText Parser.blockStat) "val x = 5"
+--   _ <- parseAndPrint "exp stat" (parseFromText Parser.blockStat) "+ x x"
+--   _ <- parseAndPrint "just exp" (parseFromText Parser.exp) "+ x x"
+--   _ <- parseAndPrint "block" (parseFromText Parser.block) "val x = 5; + x x"
+--   _ <- parseAndPrint "tuple with lambda" (parseFromText Parser.tupleOrExp) "(1, (1, 2), {* it it})"
+--   _ <- parseAndPrint "tuple with block" (parseFromText Parser.tupleOrExp) "(1, (1, 2), (val x = 5; + x x))"
+--   _ <- parseAndPrint "full tuple with block" (parseFromText Parser.tupleOrExp) "(1, (1, 2), (val x = 5; + x x), {* it it})"
+
+--   _ <- parseAndPrint "mul exp" (parseFromText Parser.exp) "* it it"
+--   _ <- parseAndPrint "mul block" (parseFromText Parser.block) "* it it"
+--   _ <- parseAndPrint "lambda" (parseFromText Parser.lambda) "{* it it}"
+--   _ <- parseAndPrint "lambda exp" (parseFromText Parser.exp) "{* it it}"
+
+--   _ <- parseAndPrint "block in parens" (parseFromText $ parens Parser.block) "(val x = 5; + x x)"
+--   _ <- parseAndPrint "paren exp1" (parseFromText $ Parser.parens Parser.exp) "(123)"
+--   _ <- parseAndPrint "paren exp2" (parseFromText $ Parser.parens Parser.exp) "(+ x x)"
+--   _ <- parseAndPrint "paren exp3" (parseFromText $ Parser.parens Parser.exp) "([])"
+
+--   _ <- parseAndPrint "exp1 in parens" (parseFromText Parser.exp) "(123)"
+--   _ <- parseAndPrint "exp2 in parens" (parseFromText Parser.exp) "(+ x x)"
+--   _ <- parseAndPrint "exp2 out parens" (parseFromText Parser.exp) "+ x x"
+--   _ <- parseAndPrint "exp3 in parens" (parseFromText Parser.exp) "([])"
+--   _ <- parseAndPrint "let exp" (parseFromText Parser.exp) "let a = 5 in a"
+--   _ <- parseAndPrint "if exp" (parseFromText Parser.exp) "if true then 3 else 2"
+--   _ <- parseAndPrint "exp in parens" (parseFromText Parser.exp) "(if true then 3 else 2)"
+--   _ <- parseAndPrint "exp in explicit parens" (parseFromText $ parens Parser.exp) "(if true then 3 else 2)"
+--   _ <- parseAndPrint "triple with comma" (parseFromText Parser.exp) "(1, 2, 3,)"
+--   _ <- parseAndPrint "triple with comma + space" (parseFromText Parser.exp) "(1, 2, 3, )"
+--   _ <- parseAndPrint "triple with comma - space" (parseFromText Parser.exp) "(1, 2, 3 ,)"
+--   _ <- parseAndPrint "triple with comma -+ space" (parseFromText Parser.exp) "(1, 2, 3 , )"
+--   _ <- parseAndPrint "triple no comma" (parseFromText Parser.exp) "(1, 2, 3)"
+--   _ <- parseAndPrint "simple chunk" (parseFromText Parser.chunk) $
+--       T.intercalate "\n" [
+--         "funct ++ [T] (l [T]) (r [T]) : [T] =",
+--         "  concat l r",
+--         "",
+--         "funct main ) : Main () =",
+--         "  say $ ++ [1, 2, 3] [4, 5, 6]"
+--       ]
+  _ <- parseAndPrint "eff cons 1" (parseFromText Parser.effCons) "List"
+  _ <- parseAndPrint "eff cons 2" (parseFromText Parser.effCons) "List [Int]"
+  _ <- parseAndPrint "eff cons 3" (parseFromText Parser.effCons) "Tuple [Int; Float]"
+  _ <- parseAndPrint "eff cons 4" (parseFromText Parser.effCons) "Tuple [Int; Float; Tuple [Int; String]]"
+
+  _ <- parseAndPrint "eff row 1" (parseFromText Parser.effRow) "Mutation"
+  _ <- parseAndPrint "eff row 2" (parseFromText Parser.effRow) "{Var; Rebind; Cell}"
+  _ <- parseAndPrint "eff row 3" (parseFromText Parser.effRow) "{Var; Rebind; Cell | e}"
+
+  _ <- parseAndPrint "resume 1" (parseFromText Parser.exp) "resume + x x"
+
+  _ <- parseAndPrint "type 1" (parseFromText Parser.typ) "Int"
+  _ <- parseAndPrint "type 2" (parseFromText Parser.typ) "Int -> Int"
+  _ <- parseAndPrint "type 3" (parseFromText Parser.typ) "Int -> Int -> Int"
   pure ()
 
-parseTupleFromText :: Text -> Either String Exp
-parseTupleFromText = parseFromText Parser.tupleExp
+
+mapElabM :: Int -> ElabM a -> (ElaborationError -> b) -> (a -> b) -> b
+mapElabM counter elabAction onError onSuccess = do
+  let result = evalState (runExceptT elabAction) $ ElabState counter
+  case result of
+    Left elabError -> onError elabError
+    Right elabSuccess -> onSuccess elabSuccess
+
+onElabSuccess :: Int -> ElabM a -> (a -> IO ()) -> IO ()
+onElabSuccess counter =
+  mapElabM counter `flip` (\elabError -> putStrLn $ "Elaboration error: " <> show elabError)
 
 -- | Debug parsing with nice output.
 --
@@ -704,12 +766,15 @@ parseTupleFromText = parseFromText Parser.tupleExp
 -- * input text
 --
 -- Outputs either error, or two result visualizations: 'pretty' and 'show'.
-parseAndPrint :: (Show a, Pretty a) => Text -> (Text -> Either String a) -> Text -> IO ()
+parseAndPrint :: (Show a, Pretty a, Sexp a) => Text -> (Text -> Either String a) -> Text -> IO ()
 parseAndPrint s f t = either
   (\e -> do
-    putStrLn $ printf "Error '%s' input: %s" s t
-    putStrLn $ printf "Error '%s' details: %s" s e)
+    printf "Error '[[%s]]'\n" s
+    printf "  input: %s\n" t
+    printf "  details: %s\n" e)
   (\e -> do
-    printf "%s: %s\n" s $ T.unpack $ pretty e
-    printf "%s detailed: %s\n" s $ show e)
+    printf "Success '[[%s]]'\n" s
+    printf "  pretty: %s\n" $ T.unpack $ pretty e
+    printf "  details: %s\n" $ show e
+    printf "  sexp: %s\n" $ sexp e)
   $ f t

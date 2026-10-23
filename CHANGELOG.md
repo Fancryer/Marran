@@ -1,4 +1,4 @@
-# Changelog for `numl`
+# Changelog for `Mårran`
 
 All notable changes to this project will be documented in this file.
 

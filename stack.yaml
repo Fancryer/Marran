@@ -10,7 +10,9 @@
 #
 # snapshot: lts-23.0
 # snapshot: nightly-2024-12-13
-snapshot: nightly-2025-09-15
+# snapshot: nightly-2025-09-15
+snapshot: nightly-2026-07-12 # GHC 9.12.4
+# compiler: ghc-9.14.1
 #
 # The location of a snapshot can be provided as a file or url. Stack assumes
 # a snapshot provided as a file might change, whereas a url resource does not.
@@ -50,11 +52,8 @@ extra-deps:
 # extra-package-dbs: []
 
 # Control whether we use the GHC we find on the path
-system-ghc: true
-install-ghc: false
 # system-ghc: false
-# install-ghc: true
-#
+# install-ghc: false
 # Require a specific version of Stack, using version ranges
 # require-stack-version: -any # Default
 # require-stack-version: ">=3.3"
@@ -69,3 +68,5 @@ install-ghc: false
 #
 # Allow a newer minor version of GHC than the snapshot specifies
 # compiler-check: newer-minor
+# ghc-options:
+#   "$everything": "-j2 +RTS -M4G -RTS"

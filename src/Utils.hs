@@ -1,3 +1,5 @@
+{-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Utils (
   mapFst,
   mapSnd,
@@ -5,14 +7,21 @@ module Utils (
   mapSndM,
   mapAccumM,
   uniqPreserveOrder,
+  flip2,
+  flip3,
+  doif,
   (|>),
   Zeroed(..),
-  Pretty(..)
+  Pretty(..),
+  TextMap
 ) where
 
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Map as Data
+import qualified Data.Text as Data
+import Data.Scientific (Scientific)
 
 (|>) :: a -> (a -> b) -> b
 (|>) a f = f a
@@ -47,9 +56,23 @@ uniqPreserveOrder lst = reverse $ snd $ foldl go (Set.empty, []) lst
       | x `Set.member` seen = (seen, acc)
       | otherwise = (Set.insert x seen, x : acc)
 
+flip2 :: (a -> b -> c -> d) -> b -> c -> a -> d
+flip2 f b c a = f a b c
+
+flip3 :: (a -> b -> c -> d) -> c -> b -> a -> d
+flip3 f c b a = f a b c
+
+doif :: Bool -> (() -> ()) -> ()
+doif p f = if p then f () else () 
+
 class Zeroed a where zeroed :: a
 
-class Pretty a where pretty :: a -> Text
+class Pretty a where
+  pretty :: a -> Text
+  default pretty :: (Show a) => a -> Text
+  pretty = T.pack . show
+
+type TextMap a = Data.Map Data.Text a
 
 instance Pretty a => Pretty (Maybe a) where
   pretty (Just a) = pretty a
@@ -58,3 +81,10 @@ instance Pretty a => Pretty (Maybe a) where
 instance (Pretty a, Pretty b) => Pretty (Either a b) where
   pretty (Left a) = pretty a
   pretty (Right b) = pretty b
+
+instance Pretty Int where pretty = T.pack . show
+instance Pretty Integer where pretty = T.pack . show
+instance Pretty Float where pretty = T.pack . show
+instance Pretty Scientific where pretty = T.pack . show
+
+instance Pretty Text where pretty = id

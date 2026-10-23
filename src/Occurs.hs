@@ -2,62 +2,52 @@
 
 module Occurs (
   typeOccursInType,
+  typeOccursInTypeArg,
   typeOccursInEffRow,
-  effOccursInEffRow,
-  effRowContainsEffects,
-  effConsContainsEffects
+  rowOccursInEffRow,
+  typeContainsEffects
 ) where
-import Types (Typ(..), EffRow(..), Taste, EffRow, EffCons, TRecordProp (..))
+import Types (Typ(..), EffRow(..), Taste, EffRow, TRecordProp (..), Funct (..), TypeArg (..), TARecordProp (TARecordProp), EffCons (..), ECons (..))
 
 typeOccursInType :: Taste -> Typ -> Bool
 typeOccursInType x = \case
   TVar y -> x == y
-  TList t -> typeOccursInType x t
+  TArray t -> typeOccursInType x t
   TPair l r -> any (typeOccursInType x) [l, r]
-  TFunc (i, o, fx) -> any (typeOccursInType x) [i, o] || typeOccursInEffRow x fx
-  TForall ts _ typ -> notElem x ts && typeOccursInType x typ
+  TFunct (Funct i o fx) -> any (typeOccursInType x) [i, o] || typeOccursInEffRow x fx
+  TForall ts _ _ typ -> notElem x ts && typeOccursInType x typ
   TRecord props -> any (\(TRecordProp _ _ typ) -> typeOccursInType x typ) props
+  _ -> False
+
+typeOccursInTypeArg :: Taste -> TypeArg -> Bool
+typeOccursInTypeArg x = \case
+  TAVar y -> x == y
+  TAArray t -> typeOccursInTypeArg x t
+  TAPair l r -> any (typeOccursInTypeArg x) [l, r]
+  TAFunct i o -> any (typeOccursInTypeArg x) [i, o]
+  TARecord props -> any (\(TARecordProp _ _ typ) -> typeOccursInTypeArg x typ) props
   _ -> False
 
 typeOccursInEffRow :: Taste -> EffRow -> Bool
 typeOccursInEffRow x = \case
-  EOpen labels _ -> any (any (typeOccursInType x) . snd) labels
-  EClosed labels -> any (any (typeOccursInType x) . snd) labels
-  _ -> False
+  ROpen labels _ -> any (\case
+    EffCons (ECons _ args) -> any (typeOccursInTypeArg x) args
+    EVar _ -> False) labels
+  RClosed labels -> any (\case
+    EffCons (ECons _ args) -> any (typeOccursInTypeArg x) args
+    EVar _ -> False) labels
+  RVar _ -> False
 
-effOccursInEffRow :: Taste -> EffRow -> Bool
-effOccursInEffRow x = \case
-  EVar y -> x == y
-  EOpen _ t -> x == t
+rowOccursInEffRow :: Taste -> EffRow -> Bool
+rowOccursInEffRow x = \case
+  ROpen _ t -> x == t
   _ -> False -- Closed row doesn't contain evar
-
-effRowContainsEffects :: EffRow -> Bool
-effRowContainsEffects = \case
-  EOpen labels _ -> any effConsContainsEffects labels
-  EClosed labels -> any effConsContainsEffects labels
-  _ -> False
-
-effConsContainsEffects :: EffCons -> Bool
-effConsContainsEffects (_, params) = flip any params $
-  \case
-    TFunc (i, o, EClosed []) -> any typeContainsEffects [i, o]
-    TFunc (_, _, EOpen [] _) -> False
-    TFunc (_, _, _) -> True
-    _ -> False
 
 typeContainsEffects :: Typ -> Bool
 typeContainsEffects = \case
-  TFunc (i, o, fxs) ->
-    any typeContainsEffects [i, o] || effRowContainsEffects fxs
-  TList t -> typeContainsEffects t
+  TFunct (Funct i o _) -> any typeContainsEffects [i, o]
+  TArray t -> typeContainsEffects t
   TPair l r -> any typeContainsEffects [l, r]
-  TForall _ es t -> es /= [] || typeContainsEffects t
+  TForall _ es rs t -> es /= [] || rs /= [] || typeContainsEffects t
   TRecord props -> any (\(TRecordProp _ _ typ) -> typeContainsEffects typ) props
   _ -> False
-
-
-{-
-and eff_cons_in_eff_row cons = function
-  | EClosed fxs | EOpen (fxs, _) -> List.exists (Compare.eq_eff_cons cons) fxs
-  | EVar _ -> false
--}

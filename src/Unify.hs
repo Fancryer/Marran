@@ -2,6 +2,12 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE OrPatterns #-}
+{-# LANGUAGE TupleSections #-}
 module Unify (
   freshMetaM,
   freshSkolemM,
@@ -12,297 +18,600 @@ module Unify (
   freshMetaEffM,
   freshSkolemEffM,
   freshBoundEffM,
+  freshMetaRowM,
+  freshSkolemRowM,
+  freshBoundRowM,
   applyTypeSubst,
+  applyTypeArgSubst,
   applyEffRowSubst,
+  applyEffConsSubst,
   unifyTypes,
+  subsumesEffRow,
+  unifyEffRows,
   TypeCheckM,
   TypeCheckError(..),
   runTypeCheckM,
   evalTypeCheckM,
   execTypeCheckM,
   removeConsFromRow,
-  retTypeOf
+  retTypeOf,
+  TypeCheckState(..),
+  withNewLevel,
+  withErrorStack,
+  currentLevel,
+  errorStack,
+  throwTypeCheckError
 ) where
 
 import Control.Monad.State (State)
-import Control.Monad.State.Class
-import Types (Taste(..), Typ (..), EffRow(..), Scope(..), EffCons, TRecordProp (TRecordProp))
+import Types (
+    Taste(..),
+    Typ(..),
+    EffRow(..),
+    EffCons (..),
+    TRecordProp(..),
+    Funct(..),
+    TypeArg(..),
+    TARecordProp(TARecordProp), ECons (..), tasteName
+  )
 import qualified Data.Map as Map hiding (map)
 import qualified Data.IntMap ()
-import Data.List (nub, find, nubBy)
+import Data.List (find, nubBy, (\\), isSubsequenceOf)
 import GHC.OldList (sort)
-import Eff (extractEffects)
-import Occurs (effConsContainsEffects,typeOccursInType, effOccursInEffRow)
+import Eff (unionEffRows)
+import Occurs (typeOccursInType, typeOccursInTypeArg)
 import Control.Monad (foldM)
 import Control.Monad.Except (ExceptT, runExceptT)
 import Control.Monad.State.Lazy (runState)
 import Control.Monad.Error.Class (throwError)
-import Record (tMut, tName, tTyp)
+import Record (taName, taMut, taTypeArg)
 import Data.Bifunctor (bimap)
+import Text.Printf (printf)
+import qualified Data.Text as T
+import Data.Text (Text)
+import Control.Lens (makeLenses, use, Field1 (_1), Field2 (_2), Field3 (_3), (-=), (+=), (%=))
+import TypedIR (Scope(..))
+import Utils (Pretty(..))
+import ErrorContext (ErrorStack, ErrorFrame)
 
 data TypeCheckError =
-  TypeError String
+  TypeError Text
+  | TypeArgError Text
   | TypeUnificationError Typ Typ
-  | EffectUnificationError EffRow EffRow
+  | TypeArgUnificationError TypeArg TypeArg
+  | EffectRowsUnificationError Text EffRow EffRow
   | EffectConsUnificationError EffCons EffCons
-  | EffectConsContainsEffect EffCons  -- ваша ошибка
-  | UndefinedVariable String
-  | ImmutableVariableAssignment String
-  | SameScopeBindingShadowing String
-  | EffectError String
+  | UndefinedVariable Text
+  | ImmutableVariableAssignment Text
+  | SameScopeBindingShadowing Text
+  | EffectError Text
+  | MultipleResumeError Text Int
+  | TodoError Text
   deriving (Show, Eq)
 
-type Counter = (Int, Int) -- Meta, Skolem
+data TypeCheckState = TypeCheckState {
+  _counter :: (Int, Int, Int),
+  _currentLevel :: Int,
+  _errorStack :: ErrorStack
+}
 
-type TypeCheckM a = ExceptT TypeCheckError (State Counter) a
+makeLenses ''TypeCheckState
 
-runTypeCheckM :: TypeCheckM a -> Counter -> (Either TypeCheckError a, Counter)
+withNewLevel :: TypeCheckM a -> TypeCheckM a
+withNewLevel action = do
+  currentLevel += 1
+  result <- action
+  currentLevel -= 1
+  pure result
+
+withErrorStack :: ErrorFrame -> TypeCheckM a -> TypeCheckM a
+withErrorStack frame action = do
+  errorStack %= (frame :)
+  action
+
+type TypeCheckM a = ExceptT (ErrorStack, TypeCheckError) (State TypeCheckState) a
+
+runTypeCheckM :: TypeCheckM a -> TypeCheckState -> (Either (ErrorStack, TypeCheckError) a, TypeCheckState)
 runTypeCheckM comp = runState (runExceptT comp)
 
-evalTypeCheckM :: TypeCheckM a -> Counter -> Either TypeCheckError a
+evalTypeCheckM :: TypeCheckM a -> TypeCheckState -> Either (ErrorStack, TypeCheckError) a
 evalTypeCheckM comp = fst . runTypeCheckM comp
 
-execTypeCheckM :: TypeCheckM a -> Counter -> Counter
+execTypeCheckM :: TypeCheckM a -> TypeCheckState -> TypeCheckState
 execTypeCheckM comp = snd . runTypeCheckM comp
 
-newtype Gen a = Gen {runGen :: State Counter a}
-  deriving (Functor, Applicative, Monad, MonadState Counter)
+throwTypeCheckError :: TypeCheckError -> TypeCheckM a
+throwTypeCheckError err = throwError . (, err) =<< use errorStack
 
 freshMetaM, freshSkolemM, freshBoundM :: TypeCheckM Taste
 freshMetaM = do
-  (m, s) <- get
-  let m' = m + 1
-  put (m', s)
-  pure $ Meta ("m" ++ show m') m'
+  counter . _1 += 1
+  m <- use $ counter . _1
+  Meta ("m" <> pretty m) m <$> use currentLevel
 
 freshSkolemM = do
-  (m, s) <- get
-  put (m, s + 1)
-  pure $ Skolem ("s" ++ show (s + 1))
+  counter . _2 += 1
+  s <- use $ counter . _2
+  Skolem ("s" <> pretty s) s <$> use currentLevel
 
 freshBoundM = do
-  (m, s) <- get
-  put (m, s + 1)
-  pure $ Bound ("b" ++ show (s + 1))
+  counter . _3 += 1
+  b <- use $ counter . _3
+  -- Bound vars are rigid; they don't participate in level-lowering like metas do.
+  pure $ Bound ("b" <> pretty b) b
 
 freshMetaTypeM, freshSkolemTypeM, freshBoundTypeM :: TypeCheckM Typ
 freshMetaTypeM = TVar <$> freshMetaM
 freshSkolemTypeM = TVar <$> freshSkolemM
 freshBoundTypeM = TVar <$> freshBoundM
 
-freshMetaEffM, freshSkolemEffM, freshBoundEffM :: TypeCheckM EffRow
+freshMetaEffM, freshSkolemEffM, freshBoundEffM :: TypeCheckM EffCons
 freshMetaEffM = EVar <$> freshMetaM
 freshSkolemEffM = EVar <$> freshSkolemM
 freshBoundEffM = EVar <$> freshBoundM
 
+freshMetaRowM, freshSkolemRowM, freshBoundRowM :: TypeCheckM EffRow
+freshMetaRowM = RVar <$> freshMetaM
+freshSkolemRowM = RVar <$> freshSkolemM
+freshBoundRowM = RVar <$> freshBoundM
+
+lowerTasteTo :: Int -> Taste -> Taste
+lowerTasteTo target = \case
+  Meta n i lvl | lvl > target -> Meta n i target
+  t -> t
+
+skolemEscapesType :: Int -> Typ -> Bool
+skolemEscapesType target = \case
+  TVar (Skolem _ _ lvl) -> lvl > target
+  TArray t -> skolemEscapesType target t
+  TPair l r -> skolemEscapesType target l || skolemEscapesType target r
+  TFunct (Funct i o row) ->
+    skolemEscapesType target i || skolemEscapesType target o || skolemEscapesRow target row
+  TRecord props -> any (\(TRecordProp _ _ t) -> skolemEscapesType target t) props
+  TForall _ _ _ t -> skolemEscapesType target t
+  _ -> False
+
+skolemEscapesTypeArg :: Int -> TypeArg -> Bool
+skolemEscapesTypeArg target = \case
+  TAVar (Skolem _ _ lvl) -> lvl > target
+  TAArray t -> skolemEscapesTypeArg target t
+  TAPair l r -> skolemEscapesTypeArg target l || skolemEscapesTypeArg target r
+  TAFunct i o -> skolemEscapesTypeArg target i || skolemEscapesTypeArg target o
+  TARecord props -> any (\(TARecordProp _ _ t) -> skolemEscapesTypeArg target t) props
+  _ -> False
+
+skolemEscapesEffCons :: Int -> EffCons -> Bool
+skolemEscapesEffCons target = \case
+  EffCons (ECons _ args) -> any (skolemEscapesTypeArg target) args
+  _ -> False
+
+skolemEscapesRow :: Int -> EffRow -> Bool
+skolemEscapesRow target = \case
+  RClosed cs -> any (skolemEscapesEffCons target) cs
+  ROpen cs t -> any (skolemEscapesEffCons target) cs || case t of
+    Skolem _ _ lvl -> lvl > target
+    _ -> False
+  RVar t -> case t of
+    Skolem _ _ lvl -> lvl > target
+    _ -> False
+
+lowerTypeTo :: Int -> Typ -> Typ
+lowerTypeTo target = \case
+  TVar t -> TVar $ lowerTasteTo target t
+  TArray t -> TArray $ lowerTypeTo target t
+  TPair l r -> TPair (lowerTypeTo target l) $ lowerTypeTo target r
+  TFunct (Funct i o row) ->
+    TFunct $ Funct (lowerTypeTo target i) (lowerTypeTo target o) $ lowerRowTo target row
+  TRecord props ->
+      TRecord [TRecordProp m n $ lowerTypeTo target t | TRecordProp m n t <- props]
+  TForall ts es rs t -> TForall ts es rs $ lowerTypeTo target t
+  t -> t
+
+lowerTypeArgTo :: Int -> TypeArg -> TypeArg
+lowerTypeArgTo target = \case
+  TAVar t -> TAVar $ lowerTasteTo target t
+  TAArray t -> TAArray $ lowerTypeArgTo target t
+  TAPair l r -> TAPair (lowerTypeArgTo target l) $ lowerTypeArgTo target r
+  TAFunct i o ->
+    TAFunct (lowerTypeArgTo target i) $ lowerTypeArgTo target o
+  TARecord props ->
+      TARecord [TARecordProp m n $ lowerTypeArgTo target t | TARecordProp m n t <- props]
+  t -> t
+
+lowerEffConsTo :: Int -> EffCons -> EffCons
+lowerEffConsTo target = \case
+  EffCons (ECons n args) -> EffCons . ECons n $ map (lowerTypeArgTo target) args
+  EVar t -> EVar $ lowerTasteTo target t
+
+lowerRowTo :: Int -> EffRow -> EffRow
+lowerRowTo target = \case
+  RClosed cs -> RClosed $ map (lowerEffConsTo target) cs
+  ROpen cs t -> ROpen (map (lowerEffConsTo target) cs) $ lowerTasteTo target t
+  RVar t -> RVar $ lowerTasteTo target t
+
+bindMetaType :: Scope -> Taste -> Typ -> TypeCheckM Scope
+bindMetaType scope m@(Meta _ _ lvlM) t = do
+  let t' = lowerTypeTo lvlM t
+  if skolemEscapesType lvlM t' then do
+    throwTypeCheckError $ TypeError "Skolem escapes type"
+  else
+    pure scope{typeSubst = Map.insert m t' $ typeSubst scope}
+bindMetaType _ s@Skolem{} _ = throwTypeCheckError $ TypeError "Cannot solve a skolem variable"
+bindMetaType _ b@Bound{} _ =
+  throwTypeCheckError $ TypeError $ "bindMetaType | Cannot solve a bound variable " <> tasteName b
+
+bindMetaTypeArg :: Scope -> Taste -> TypeArg -> TypeCheckM Scope
+bindMetaTypeArg scope m@(Meta _ _ lvlM) t = do
+  let t' = lowerTypeArgTo lvlM t
+  if skolemEscapesTypeArg lvlM t' then
+    throwTypeCheckError $ TypeError "Skolem escapes type arg"
+  else
+    pure scope{typeArgSubst = Map.insert m t' $ typeArgSubst scope}
+bindMetaTypeArg _ Skolem{} _ = throwTypeCheckError $ TypeError "Cannot solve a skolem variable"
+bindMetaTypeArg _ b@Bound{} _ =
+  throwTypeCheckError $ TypeError $ "bindMetaTypeArg | Cannot solve a bound variable " <> tasteName b
+
+bindRowVar :: Scope -> Taste -> EffRow -> TypeCheckM Scope
+bindRowVar scope m@(Meta _ _ lvlM) row = do
+  let row' = lowerRowTo lvlM row
+  if skolemEscapesRow lvlM row' then
+    throwTypeCheckError $ TypeError "Skolem escapes row"
+  else
+    pure scope{rowSubst = Map.insert m row' $ rowSubst scope}
+bindRowVar _ s@Skolem{} _ = throwTypeCheckError $ TypeError $ "Cannot solve a skolem variable " <> tasteName s
+bindRowVar _ b@Bound{} _ =
+  throwTypeCheckError $ TypeError $ "bindRowVar | Cannot solve a bound variable " <> tasteName b
+
+bindEffVar :: Scope -> Taste -> EffCons -> TypeCheckM Scope
+bindEffVar scope m@(Meta _ _ lvlM) e = do
+  let e' = lowerEffConsTo lvlM e
+  if skolemEscapesEffCons lvlM e' then
+    throwTypeCheckError $ TypeError "Skolem escapes eff cons"
+  else
+    pure scope{effSubst = Map.insert m e' $ effSubst scope}
+bindEffVar _ s@Skolem{} _ = throwTypeCheckError $ TypeError $ "Cannot solve a skolem variable " <> tasteName s
+bindEffVar _ b@Bound{} _ =
+  throwTypeCheckError $ TypeError $ "bindEffVar | Cannot solve a bound variable " <> tasteName b
+
 applyTypeSubst :: Scope -> Typ -> TypeCheckM Typ
 applyTypeSubst scope = \case
-  t@(TVar m@(Meta _ lvl)) ->
+  t@(TVar m) ->
     case Map.lookup m (typeSubst scope) of
       Just t' -> applyTypeSubst scope t'
       Nothing -> pure t
-  t@(TVar (Skolem _)) -> pure t
-  TList t -> TList <$> applyTypeSubst scope t
+  TArray t -> TArray <$> applyTypeSubst scope t
   TPair l r -> TPair <$> applyTypeSubst scope l <*> applyTypeSubst scope r
-  TFunc (i, o, fxs) -> do
-    i' <- applyTypeSubst scope i
-    o' <- applyTypeSubst scope o
-    fxs' <- applyEffRowSubst scope fxs
-    pure $ TFunc (i', o', fxs')
+  TFunct (Funct i o fxs) ->
+    TFunct <$> (Funct <$> applyTypeSubst scope i <*> applyTypeSubst scope o <*> pure fxs)
   TRecord props -> do
     props' <- traverse (\(TRecordProp mut name typ) ->
         TRecordProp mut name <$> applyTypeSubst scope typ
       ) props
     pure $ TRecord props'
+  TForall ts es rs t -> do
+    let scope' = scope {
+        typeSubst = foldr Map.delete scope.typeSubst ts,
+        effSubst = foldr Map.delete scope.effSubst es,
+        rowSubst = foldr Map.delete scope.rowSubst rs
+      }
+    TForall ts es rs <$> applyTypeSubst scope' t
   t -> pure t
 
-applyEffRowSubst :: Scope -> EffRow -> TypeCheckM EffRow
-applyEffRowSubst scope row =
-  let newEffRowOrError = case row of
-        EVar (Skolem _) -> pure row
-        EVar (Bound _) -> pure row
-        EVar v@(Meta _ lvl) ->
-          case Map.lookup v (effSubst scope) of
-            Just substitutedRow -> applyEffRowSubst scope substitutedRow
-            Nothing -> pure row
-        EClosed cons -> do
-          cons' <- traverse processEffCons cons
-          pure $ EClosed cons'
-        EOpen cons v -> do
-          cons' <- traverse processEffCons cons
-          case Map.lookup v (effSubst scope) of
-            Just (EVar newV) -> pure $ EOpen cons' newV
-            Just (EClosed extraCons) -> do
-              extraCons' <- traverse processEffCons extraCons
-              pure $ EClosed $ sort $ nub $ cons' ++ extraCons' -- Хвост стал конкретным
-            Just (EOpen extraCons newV) -> do
-              extraCons' <- traverse processEffCons extraCons
-              pure $ EOpen (sort $ nub $ cons' ++ extraCons') newV
-            Nothing -> pure $ EOpen cons' v
-  in newEffRowOrError >>= (\newRow ->
-    case find effConsContainsEffects $ extractEffects newRow of
-      Just c -> throwError $ EffectConsContainsEffect c
-      _ -> pure newRow
-  )
-  where
-    -- Функция для обработки одного эффекта
-    processEffCons :: EffCons -> TypeCheckM EffCons
-    processEffCons (name, params) = do
-      params' <- traverse (applyTypeSubst scope) params  -- traverse вместо map
-      pure (name, params')
+applyTypeArgSubst :: Scope -> TypeArg -> TypeCheckM TypeArg
+applyTypeArgSubst scope = \case
+  t@(TAVar m) -> case Map.lookup m (typeArgSubst scope) of
+    Just t' -> applyTypeArgSubst scope t'
+    Nothing -> pure t
+  TAArray t -> TAArray <$> applyTypeArgSubst scope t
+  TAPair l r -> TAPair <$> applyTypeArgSubst scope l <*> applyTypeArgSubst scope r
+  TAFunct i o -> TAFunct <$> applyTypeArgSubst scope i <*> applyTypeArgSubst scope o
+  TARecord props -> do
+    props' <- traverse (\(TARecordProp mut name typ) ->
+        TARecordProp mut name <$> applyTypeArgSubst scope typ
+      ) props
+    pure $ TARecord props'
+  t -> pure t
 
 unifyTypes :: Scope -> Typ -> Typ -> TypeCheckM Scope
 unifyTypes scope t1 t2 = do
   t1' <- applyTypeSubst scope t1
   t2' <- applyTypeSubst scope t2
   case (t1', t2') of
-    (TNothing, _) -> pure scope
+    (TNothing, _); (TInt, TInt); (TFloat, TFloat);
+      (TBoolean, TBoolean); (TString, TString); (TNil, TNil) ->
+      pure scope
     (TVar x, TVar y) | x == y -> pure scope
-    (TVar x@(Meta _ lvl), t) -> do
+    (TVar x@Meta{}, t) -> do
       t' <- applyTypeSubst scope t
       if typeOccursInType x t' then
-        throwError $ TypeUnificationError t1' t'
+        throwTypeCheckError $ TypeUnificationError t1' t'
       else
-        let newSubst = Map.insert x t' (typeSubst scope) in
-        pure $ scope {typeSubst = newSubst}
+        bindMetaType scope x t'
     (t, TVar _) -> unifyTypes scope t2' t
-    (TInt, TInt) -> pure scope
-    (TFloat, TFloat) -> pure scope
-    (TBoolean, TBoolean) -> pure scope
-    (TString, TString) -> pure scope
-    (TNil, TNil) -> pure scope
     (TFlat x, TFlat y) | x == y -> pure scope
-    (TList l1, TList l2) -> unifyTypes scope l1 l2
+    (TArray l1, TArray l2) -> unifyTypes scope l1 l2
     (TPair l1 r1, TPair l2 r2) -> do
       scope' <- unifyTypes scope l1 l2
       unifyTypes scope' r1 r2
-    (TFunc (i1, o1, e1), TFunc (i2, o2, e2)) -> do
+    (TFunct (Funct i1 o1 e1), TFunct (Funct i2 o2 e2)) -> do
       scope' <- unifyTypes scope i2 i1
       scope'' <- unifyTypes scope' o1 o2
       unifyEffRows scope'' e1 e2
     (TRecord props1, TRecord props2) -> unifyRecords scope props1 props2
-    _ -> throwError $ TypeUnificationError t1' t2'
+    _ -> throwTypeCheckError $ TypeUnificationError t1' t2'
 
 unifyRecords :: Scope -> [TRecordProp] -> [TRecordProp] -> TypeCheckM Scope
 unifyRecords scope props1 props2 = do
   if length props1 /= length props2 then
-    throwError $ TypeUnificationError (TRecord props1) (TRecord props2)
+    throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
   else
     let props1' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props1 in
     let props2' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props2 in
     if length props1 /= length props1' || length props2 /= length props2' then
-      throwError $ TypeUnificationError (TRecord props1) (TRecord props2)
+      throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
     else
       let zipped = zip props1' props2' in
       if any (\(p1, p2) -> tMut p1 /= tMut p2 || tName p1 /= tName p2) zipped then
-        throwError $ TypeUnificationError (TRecord props1) (TRecord props2)
+        throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
       else do
         foldM (
           \sc (typ1, typ2) -> do
             unifyTypes sc typ1 typ2
           ) scope (map (bimap tTyp tTyp) zipped)
 
+applyEffRowSubst :: Scope -> EffRow -> TypeCheckM EffRow
+applyEffRowSubst scope = \case
+  r@(RVar m) -> case m of
+    Meta{} ->
+      case Map.lookup m (rowSubst scope) of
+        Just r' -> applyEffRowSubst scope r'
+        Nothing -> pure r
+    Skolem{}; Bound{} -> pure r
+  RClosed cs -> RClosed <$> traverse (applyEffConsSubst scope) cs
+  ROpen cs t -> do
+    cs' <- traverse (applyEffConsSubst scope) cs
+    t' <- applyEffRowSubst scope $ RVar t
+    pure $ unionEffRows (RClosed cs') t'
+
+applyEffConsSubst :: Scope -> EffCons -> TypeCheckM EffCons
+applyEffConsSubst scope = \case
+  e@(EVar m) -> case m of
+    Meta{} ->
+      case Map.lookup m (effSubst scope) of
+        Just e' -> applyEffConsSubst scope e'
+        Nothing -> pure e
+    Skolem{}; Bound{} -> pure e
+  EffCons (ECons n args) -> EffCons . ECons n <$> traverse (applyTypeArgSubst scope) args
+
+normalizeEffRow :: EffRow -> EffRow
+normalizeEffRow = \case
+  RClosed cs -> RClosed $ sort cs
+  ROpen cs v -> ROpen (sort cs) v
+  r -> r
+
+subsumesEffRow :: Scope -> EffRow -> EffRow -> TypeCheckM Scope
+subsumesEffRow scope r1 r2 = do
+  r1' <- normalizeEffRow <$> applyEffRowSubst scope r1
+  r2' <- normalizeEffRow <$> applyEffRowSubst scope r2
+  case (r1', r2') of
+    -- Закрытый vs закрытый
+    (RClosed cs1, RClosed cs2) ->
+      if cs1 `isSubsequenceOf` cs2
+        then pure scope
+        else throwTypeCheckError $ EffectRowsUnificationError "Not all effects from r1 are presented in r2" r1' r2'
+
+    -- Закрытый фактический, открытый ожидаемый
+    (RClosed cs1, ROpen cs2 v) -> do
+      -- Если открытая часть пуста, хвост связывается со всем закрытым рядом
+      if null cs2 then
+        bindRowVar scope v (RClosed cs1)
+      else do
+        -- Проверяем, что все эффекты из открытой части есть в закрытом
+        let isSubset = cs2 `isSubsequenceOf` cs1
+        if not isSubset then
+          throwTypeCheckError $ EffectRowsUnificationError
+            "Open row has effects not present in closed row"
+            (RClosed cs1)
+            (ROpen cs2 v)
+        else
+          let extra = cs1 \\ cs2
+          in if null extra then pure scope else bindRowVar scope v (RClosed extra)
+
+    -- Открытый фактический, закрытый ожидаемый
+    (ROpen cs1 v1, RClosed cs2) -> do
+      -- Если открытая часть пуста, хвост связывается со всем закрытым рядом
+      if null cs1 then
+        bindRowVar scope v1 (RClosed cs2)
+      else do
+        -- Проверяем, что все эффекты из открытой части есть в закрытом
+        let isSubset = cs1 `isSubsequenceOf` cs2
+        if not isSubset then
+          throwTypeCheckError $ EffectRowsUnificationError
+            "Open row has effects not present in closed row"
+            (ROpen cs1 v1)
+            (RClosed cs2)
+        else
+          -- Все эффекты уже есть в закрытом, хвост становится пустым
+          bindRowVar scope v1 (RClosed [])
+
+    -- Открытый vs открытый
+    (ROpen cs1 v1, ROpen cs2 v2) -> do
+      let extra1 = cs1 \\ cs2   -- эффекты в r1, которых нет в r2
+          extra2 = cs2 \\ cs1   -- эффекты в r2, которых нет в r1
+      scope1 <- bindRowVar scope v1 $ RClosed extra2
+      bindRowVar scope1 v2 $ RClosed extra1
+
+    -- Переменная ряда с чем-то
+    (RVar v, row) -> bindRowVar scope v row
+    (row, RVar v) -> bindRowVar scope v row
+
 unifyEffRows :: Scope -> EffRow -> EffRow -> TypeCheckM Scope
 unifyEffRows scope r1 r2 = do
-  r1' <- applyEffRowSubst scope r1
-  r2' <- applyEffRowSubst scope r2
+  r1' <- normalizeEffRow <$> applyEffRowSubst scope r1
+  r2' <- normalizeEffRow <$> applyEffRowSubst scope r2
   case (r1', r2') of
-    (EVar e1, EVar e2) | e1 == e2 -> pure scope
-    (EVar e, row) -> unifyEffVarWithRow scope e row
-    (row, EVar e) -> unifyEffVarWithRow scope e row
-    (EClosed c1, EClosed c2) -> unifyClosedEffConsLists scope c1 c2
-    (EOpen l1 v1, EOpen l2 v2) -> unifyOpenEffConsLists scope l1 v1 l2 v2
-    (EClosed cl, EOpen op v) -> unifyClosedEffRowWithOpen scope cl op v
-    (EOpen op v, EClosed cl) -> unifyClosedEffRowWithOpen scope cl op v
-
-unifyEffVarWithRow :: Scope -> Taste -> EffRow -> TypeCheckM Scope
-unifyEffVarWithRow scope v row = case v of
-  Skolem _ -> throwError $ EffectUnificationError (EVar v) row
-  m@(Meta _ lvl) ->
-    if effOccursInEffRow v row then
-      throwError $ EffectUnificationError (EVar v) row
-    else
-      pure $ scope {effSubst = Map.insert m row (effSubst scope)}
+    (RClosed c1, RClosed c2) -> unifyClosedEffConsLists scope c1 c2
+    (RClosed cl, ROpen op v) -> unifyClosedEffRowWithOpen scope cl op v
+    (ROpen op v, RClosed cl) -> unifyOpenEffRowWithClosed scope op v cl
+    (ROpen l1 v1, ROpen l2 v2) -> unifyOpenEffConsLists scope l1 v1 l2 v2
+    
+    (RVar e1, RVar e2) | e1 == e2 -> pure scope
+    (RVar e, row) -> unifyRowVarWithEffRow scope e row
+    (row, RVar e) -> unifyRowVarWithEffRow scope e row
 
 unifyClosedEffConsLists :: Scope -> [EffCons] -> [EffCons] -> TypeCheckM Scope
 unifyClosedEffConsLists scope l1 l2
-  | length l1 /= length l2 = throwError $ EffectUnificationError (EClosed l1) (EClosed l2)
-  | otherwise = foldM unifyPair scope (zip l1 l2)
-  where
-    unifyPair scope' ((name1, params1), (name2, params2))
-      | name1 /= name2 = throwError $ EffectUnificationError (EClosed l1) (EClosed l2)
-      | otherwise = unifyTypeLists scope' params1 params2
-
+  | length l1 /= length l2 =
+    throwTypeCheckError $
+      EffectRowsUnificationError
+        (T.concat ["Closed eff cons lists lengths are unequal: ", pretty $ length l1, " != ", pretty $ length l2])
+        (RClosed l1)
+        (RClosed l2)
+  | otherwise = foldM (\scope' (e1, e2) -> unifyEffCons scope' e1 e2) scope (zip l1 l2)
 
 unifyOpenEffConsLists :: Scope -> [EffCons] -> Taste -> [EffCons] -> Taste -> TypeCheckM Scope
-unifyOpenEffConsLists scope l1 v1 l2 v2 =
+unifyOpenEffConsLists scope l1 v1 l2 v2 = do
   -- Унифицируем общие эффекты
-  let commonEffects = filter (`elem` l2) l1 in
-  let scope' = foldM (\sc cons1 ->
+  let commonEffects = filter (`elem` l2) l1
+  scope' <- foldM (\sc cons1 ->
           case find (cons1 ==) l2 of
-            Nothing -> throwError $ EffectConsUnificationError cons1 (error "Shall not happen")
+            Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Shall not happen")
             Just cons2 -> unifyEffCons sc cons1 cons2
-        ) scope commonEffects in
+        ) scope commonEffects
   -- Находим эффекты, уникальные для каждого ряда
-  let uniqueToL1 = filter (`notElem` l2) l1 in
-  let uniqueToL2 = filter (`notElem` l1) l2 in
-  let allEffects = commonEffects ++ uniqueToL1 ++ uniqueToL2 in
-  let combinedEffects = sort $ nub allEffects in do
-    -- Создаём новую переменную для объединённого хвоста
-    freshTail <- freshMetaM
-  -- Унифицируем исходные переменные с новым объединённым рядом
-    let combinedRow = EOpen combinedEffects freshTail
-    scope'' <- scope'
-    scope''' <- unifyEffVarWithRow scope'' v1 combinedRow
-    unifyEffVarWithRow scope''' v2 combinedRow
+  scope'' <- unifyRowVarWithEffRow scope' v1 $ RClosed $ l1 \\ l2
+  unifyRowVarWithEffRow scope'' v2 $ RClosed $ l2 \\ l1
+
+unifyRowVarWithEffRow :: Scope -> Taste -> EffRow -> TypeCheckM Scope
+unifyRowVarWithEffRow scope v = \case
+  RVar n | n == v -> pure scope
+  row -> bindRowVar scope v row
 
 unifyClosedEffRowWithOpen :: Scope -> [EffCons] -> [EffCons] -> Taste -> TypeCheckM Scope
-unifyClosedEffRowWithOpen scope closed open v =
-  -- Проверяем, что все open_labels есть в closed_labels
-  let allPresent = all (`elem` closed) open in
-  if not allPresent then
-    throwError $ EffectUnificationError (EClosed closed) (EOpen open v)
+unifyClosedEffRowWithOpen scope closed open v = do
+  if null open then
+    bindRowVar scope v (RClosed closed)
   else do
-    -- Унифицируем общие эффекты
-    scope' <- foldM (\sc cons1 ->
-          case find (== cons1) closed of
-            Nothing ->
-              -- Этот случай теоретически невозможен, так как allPresent
-              throwError $ EffectConsUnificationError cons1 (error "Should not happen")
-            Just cons2 ->
-              unifyEffCons sc cons1 cons2
+    -- closed должен быть подмножеством open (все эффекты из closed есть в open)
+    let isSubset = closed `isSubsequenceOf` open
+    if not isSubset then
+      throwTypeCheckError $ EffectRowsUnificationError
+        (T.concat [
+          "Closed row has effects not present in open row: [",
+          T.intercalate ", " $ map pretty $ closed \\ open, "]"])
+        (RClosed closed)
+        (ROpen open v)
+    else do
+      -- Унифицируем общие эффекты (для проверки аргументов)
+      scope' <- foldM (\sc cons1 ->
+            case find (== cons1) open of
+              Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Should not happen")
+              Just cons2 -> unifyEffCons sc cons1 cons2
+          ) scope closed   -- проходим по closed, ищем в open
+      -- Хвост v связываем с эффектами из open, которых нет в closed
+      bindRowVar scope' v (RClosed $ open \\ closed)
+
+unifyOpenEffRowWithClosed :: Scope -> [EffCons] -> Taste -> [EffCons] -> TypeCheckM Scope
+unifyOpenEffRowWithClosed scope open v closed = do
+  -- Если открытый ряд пуст, переменная ряда связывается со всем закрытым рядом
+  if null open then
+    bindRowVar scope v (RClosed closed)
+  else do
+    -- open должен быть подмножеством closed
+    let isSubset = open `isSubsequenceOf` closed
+    if not isSubset then
+      throwTypeCheckError $ EffectRowsUnificationError
+        (T.concat [
+          "Open row has effects not present in closed row: [",
+          T.intercalate ", " $ map pretty $ open \\ closed, "]"])
+        (ROpen open v)
+        (RClosed closed)
+    else do
+      -- Унифицируем общие эффекты
+      scope' <- foldM (\sc cons1 ->
+            case find (== cons1) closed of
+              Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Should not happen")
+              Just cons2 -> unifyEffCons sc cons1 cons2
           ) scope open
-    -- Находим эффекты в closed_labels, которых нет в open_labels
-    let extraEffects = filter (`notElem` open) closed
-    unifyEffVarWithRow scope' v
-      $ EClosed
-      $ if extraEffects /= [] then
-        -- Extra effects должны быть учтены в переменной v
-        extraEffects
-      else
-        -- Нет extra effects - переменная v должна быть пустой
-        []
+      -- Хвост становится пустым (все эффекты из open уже есть в closed)
+      bindRowVar scope' v (RClosed [])
 
 unifyEffCons :: Scope -> EffCons -> EffCons -> TypeCheckM Scope
-unifyEffCons scope c1@(name1, params1) c2@(name2, params2)
-  | name1 /= name2 = throwError $ EffectConsUnificationError c1 c2
-  | otherwise = unifyTypeLists scope params1 params2
+unifyEffCons scope c1@(EffCons (ECons name1 params1)) c2@(EffCons (ECons name2 params2))
+  | name1 /= name2 = throwTypeCheckError $ EffectConsUnificationError c1 c2
+  | otherwise = unifyTypeArgLists scope params1 params2
+-- bindEffVar
+unifyEffCons scope (EVar t) c2@(EffCons{}) = bindEffVar scope t c2
+unifyEffCons scope c1@(EffCons{}) (EVar t) = bindEffVar scope t c1
+unifyEffCons scope (EVar e1) c2@(EVar _) = bindEffVar scope e1 c2
 
-unifyTypeLists :: Scope -> [Typ] -> [Typ] -> TypeCheckM Scope
-unifyTypeLists scope l1 l2
-  | length l1 /= length l2 = throwError $ TypeError "Effect parameter lists length mismatch" -- TODO: add lengths
-  | otherwise = foldM (\scope' (t1, t2) -> unifyTypes scope' t1 t2) scope (zip l1 l2)
+unifyTypeArgLists :: Scope -> [TypeArg] -> [TypeArg] -> TypeCheckM Scope
+unifyTypeArgLists scope l1 l2 =
+  let s1 = length l1; s2 = length l2
+  in if length l1 /= length l2 then
+    throwTypeCheckError $ TypeError $ T.pack $ printf "Effect parameter lists length mismatch: %d /= %d" s1 s2
+  else
+    foldM (\scope' (t1, t2) -> unifyTypeArgs scope' t1 t2) scope (zip l1 l2)
+
+unifyTypeArgs :: Scope -> TypeArg -> TypeArg -> TypeCheckM Scope
+unifyTypeArgs scope t1 t2 = do
+  t1' <- applyTypeArgSubst scope t1
+  t2' <- applyTypeArgSubst scope t2
+  case (t1', t2') of
+    (TANothing, _) -> pure scope
+    (TAVar x, TAVar y) | x == y -> pure scope
+    (TAVar x@Meta{}, t) -> do
+      t' <- applyTypeArgSubst scope t
+      if typeOccursInTypeArg x t' then
+        throwTypeCheckError $ TypeArgUnificationError t1' t'
+      else
+        bindMetaTypeArg scope x t'
+    (t, TAVar _) -> unifyTypeArgs scope t2' t
+    (TAInt, TAInt) -> pure scope
+    (TAFloat, TAFloat) -> pure scope
+    (TABoolean, TABoolean) -> pure scope
+    (TAString, TAString) -> pure scope
+    (TANil, TANil) -> pure scope
+    (TAFlat x, TAFlat y) | x == y -> pure scope
+    (TAArray l1, TAArray l2) -> unifyTypeArgs scope l1 l2
+    (TAPair l1 r1, TAPair l2 r2) -> do
+      scope' <- unifyTypeArgs scope l1 l2
+      unifyTypeArgs scope' r1 r2
+    (TAFunct i1 o1, TAFunct i2 o2) -> do
+      scope' <- unifyTypeArgs scope i2 i1
+      unifyTypeArgs scope' o1 o2
+    (TARecord props1, TARecord props2) -> unifyRecordArgs scope props1 props2
+    _ -> throwTypeCheckError $ TypeArgUnificationError t1' t2'
+
+unifyRecordArgs :: Scope -> [TARecordProp] -> [TARecordProp] -> TypeCheckM Scope
+unifyRecordArgs scope props1 props2 = do
+  if length props1 /= length props2 then
+    throwTypeCheckError $ TypeArgUnificationError (TARecord props1) (TARecord props2)
+  else
+    let props1' = sort $ nubBy (\p1 p2 -> taName p1 == taName p2) props1 in
+    let props2' = sort $ nubBy (\p1 p2 -> taName p1 == taName p2) props2 in
+    if length props1 /= length props1' || length props2 /= length props2' then
+      throwTypeCheckError $ TypeArgUnificationError (TARecord props1) (TARecord props2)
+    else
+      let zipped = zip props1' props2' in
+      if any (\(p1, p2) -> taMut p1 /= taMut p2 || taName p1 /= taName p2) zipped then
+        throwTypeCheckError $ TypeArgUnificationError (TARecord props1) (TARecord props2)
+      else do
+        foldM (
+          \sc (typ1, typ2) -> do
+            unifyTypeArgs sc typ1 typ2
+          ) scope (map (bimap taTypeArg taTypeArg) zipped)
 
 removeConsFromRow :: EffCons -> EffRow -> EffRow
 removeConsFromRow cons = \case
-  EClosed lst -> EClosed $ filter (cons /=) lst
-  EOpen lst var -> EOpen (filter (cons /=) lst) var
-  r@(EVar _) -> r
+  RClosed lst -> RClosed $ filter (cons /=) lst
+  ROpen lst var -> ROpen (filter (cons /=) lst) var
+  r@(RVar _) -> r
 
 retTypeOf :: Typ -> Maybe Typ
-retTypeOf (TFunc (_, o, _)) = go o
+retTypeOf (TFunct (Funct _ o _)) = go o
   where
-    go (TFunc (_, o', _)) = go o'
+    go (TFunct (Funct _ o' _)) = go o'
     go t = Just t
 
 retTypeOf _ = Nothing

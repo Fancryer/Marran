@@ -1,0 +1,45 @@
+"filename", "language", "Haskell", "YAML", "Markdown", "JSON", "Cabal", "comment", "blank", "total"
+"/home/alice/haskellets/numl/CHANGELOG.md", "Markdown", 0, 0, -7, 0, 0, 0, -5, -12
+"/home/alice/haskellets/numl/README.md", "Markdown", 0, 0, -1, 0, 0, 0, -1, -2
+"/home/alice/haskellets/numl/Setup.hs", "Haskell", -2, 0, 0, 0, 0, 0, -1, -3
+"/home/alice/haskellets/numl/app/Main.hs", "Haskell", -4, 0, 0, 0, 0, 0, -3, -7
+"/home/alice/haskellets/numl/dist-newstyle/cache/plan.json", "JSON", 0, 0, 0, -1, 0, 0, 0, -1
+"/home/alice/haskellets/numl/hie.yaml", "YAML", 0, -2, 0, 0, 0, 0, 0, -2
+"/home/alice/haskellets/numl/numl.cabal", "Cabal", 0, 0, 0, 0, -104, -3, -7, -114
+"/home/alice/haskellets/numl/package.yaml", "YAML", 0, -67, 0, 0, 0, -6, -8, -81
+"/home/alice/haskellets/numl/src/Ast.hs", "Haskell", -368, 0, 0, 0, 0, -9, -85, -462
+"/home/alice/haskellets/numl/src/Eff.hs", "Haskell", -173, 0, 0, 0, 0, -6, -23, -202
+"/home/alice/haskellets/numl/src/Infer.hs", "Haskell", -151, 0, 0, 0, 0, -424, -18, -593
+"/home/alice/haskellets/numl/src/Lexer.hs", "Haskell", -286, 0, 0, 0, 0, -3, -52, -341
+"/home/alice/haskellets/numl/src/Lib.hs", "Haskell", -5, 0, 0, 0, 0, 0, -2, -7
+"/home/alice/haskellets/numl/src/Occurs.hs", "Haskell", -48, 0, 0, 0, 0, -6, -9, -63
+"/home/alice/haskellets/numl/src/Parser.hs", "Haskell", -440, 0, 0, 0, 0, -13, -80, -533
+"/home/alice/haskellets/numl/src/Record.hs", "Haskell", -25, 0, 0, 0, 0, 0, -7, -32
+"/home/alice/haskellets/numl/src/Resume.hs", "Haskell", -14, 0, 0, 0, 0, -3, -6, -23
+"/home/alice/haskellets/numl/src/Scope.hs", "Haskell", -106, 0, 0, 0, 0, -78, -20, -204
+"/home/alice/haskellets/numl/src/Types.hs", "Haskell", -204, 0, 0, 0, 0, -14, -41, -259
+"/home/alice/haskellets/numl/src/Unify.hs", "Haskell", -265, 0, 0, 0, 0, -15, -28, -308
+"/home/alice/haskellets/numl/src/Utils.hs", "Haskell", -48, 0, 0, 0, 0, 0, -12, -60
+"/home/alice/haskellets/numl/stack.yaml", "YAML", 0, -6, 0, 0, 0, -60, -6, -72
+"/home/alice/haskellets/numl/stack.yaml.lock", "YAML", 0, -7, 0, 0, 0, -4, -2, -13
+"/home/alice/haskellets/numl/test/Main.hs", "Haskell", -11, 0, 0, 0, 0, 0, -1, -12
+"/home/alice/haskellets/numl/test/Spec.hs", "Haskell", -531, 0, 0, 0, 0, -47, -108, -686
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Ast.hs", "Haskell", 437, 0, 0, 0, 0, 23, 96, 556
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Debug.hs", "Haskell", 9, 0, 0, 0, 0, 55, 3, 67
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Eff.hs", "Haskell", 112, 0, 0, 0, 0, 2, 21, 135
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Elaborator.hs", "Haskell", 586, 0, 0, 0, 0, 6, 64, 656
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Infer.hs", "Haskell", 715, 0, 0, 0, 0, 56, 88, 859
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Interpreter.hs", "Haskell", 146, 0, 0, 0, 0, 14, 17, 177
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Lexer.hs", "Haskell", 290, 0, 0, 0, 0, 0, 54, 344
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Lib.hs", "Haskell", 5, 0, 0, 0, 0, 0, 2, 7
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Occurs.hs", "Haskell", 47, 0, 0, 0, 0, 0, 6, 53
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Parser.hs", "Haskell", 639, 0, 0, 0, 0, 72, 106, 817
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Record.hs", "Haskell", 26, 0, 0, 0, 0, 0, 7, 33
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Resume.hs", "Haskell", 15, 0, 0, 0, 0, 2, 6, 23
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Scope.hs", "Haskell", 173, 0, 0, 0, 0, 18, 23, 214
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Sexp.hs", "Haskell", 44, 0, 0, 0, 0, 0, 9, 53
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/TypedIR.hs", "Haskell", 253, 0, 0, 0, 0, 49, 36, 338
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Types.hs", "Haskell", 386, 0, 0, 0, 0, 9, 68, 463
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Unify.hs", "Haskell", 443, 0, 0, 0, 0, 14, 48, 505
+"/mnt/c/Users/Alice Liddell/Documents/projects/haskellets/marran/src/Utils.hs", "Haskell", 67, 0, 0, 0, 0, 0, 17, 84
+"Total", "-", 1712, -82, -8, -1, -104, -371, 146, 1292

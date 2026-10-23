@@ -1,0 +1,61 @@
+module Debug (
+
+)
+where
+
+
+-- let rec scope_to_string
+--   ?(max_depth=100)
+--   ?(depth=0)
+--   ({types; values; effects; handler_sig; type_subst; eff_subst; parent} : scope)
+--   =
+--   if depth > max_depth then
+--     "Scope{...}"  (* Предотвращаем бесконечную рекурсию *)
+--   else
+--     let indent = String.make (depth * 2) ' ' in
+--     let types_str = 
+--       Hashtbl.to_seq types
+--       |> Seq.map (fun (k, v) -> Printf.sprintf "%s: %s" k @@ type_to_string v)
+--       |> List.of_seq
+--       |> String.concat "; "
+--     in
+--     let values_str =
+--       Hashtbl.to_seq values
+--       |> Seq.map (fun (k, (t, e, v)) -> 
+--           Printf.sprintf "%s %s : %s = %s" (if v then "val" else "var") k (type_to_string t) (expr_to_string e))
+--       |> List.of_seq
+--       |> String.concat "; "
+--     in
+--     let effects_str =
+--       Hashtbl.to_seq effects
+--       |> Seq.map (fun (k, eff_decl) -> Printf.sprintf "%s: %s" k @@ eff_decl_to_string eff_decl)
+--       |> List.of_seq
+--       |> String.concat "; "
+--     in
+--     let handler_str = Option.fold ~none:"None" ~some:handler_sig_to_string handler_sig in
+--     let type_subst_str =
+--       Hashtbl.to_seq type_subst
+--       |> Seq.map (fun (k, v) -> Printf.sprintf "%s: %s" (taste_to_string k) @@ type_to_string v)
+--       |> List.of_seq
+--       |> String.concat "; "
+--     in
+--     let eff_subst_str =
+--       Hashtbl.to_seq eff_subst
+--       |> Seq.map (fun (k, v) -> Printf.sprintf "%s: %s" (taste_to_string k) @@ eff_row_to_string v)
+--       |> List.of_seq
+--       |> String.concat "; "
+--     in
+--     let parent_str = match parent with
+--       | Some p -> scope_to_string ~max_depth ~depth:(depth + 1) p
+--       | None -> "None"
+--     in
+--     Printf.sprintf "%sScope {\n%stypes = {%s}\n%svalues = {%s}\n%seffects = {%s}\n%shandler = %s\n%stype_subst = {%s}\n%seff_subst = {%s}\n%sparent = %s\n%s}"
+--       indent
+--       (String.make ((depth + 1) * 2) ' ') types_str
+--       (String.make ((depth + 1) * 2) ' ') values_str
+--       (String.make ((depth + 1) * 2) ' ') effects_str
+--       (String.make ((depth + 1) * 2) ' ') handler_str
+--       (String.make ((depth + 1) * 2) ' ') type_subst_str
+--       (String.make ((depth + 1) * 2) ' ') eff_subst_str
+--       (String.make ((depth + 1) * 2) ' ') parent_str
+--       indent

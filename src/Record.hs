@@ -1,31 +1,32 @@
 module Record(
-    tMut,
-    tName,
-    tTyp,
+    taMut,
+    taName,
+    taTypeArg,
     eMut,
     eName,
     eTyp,
     eExp
 )
 where
-import Types (TRecordProp (TRecordProp), ERecordProp (ERecordProp), Mutability, Typ, Expr)
+import Types (ERecordProp (ERecordProp), Mutability, Typ, Expr, TARecordProp (..), TypeArg)
+import Data.Text (Text)
 
-tMut :: TRecordProp -> Mutability
-tMut (TRecordProp m _ _) = m
+taMut :: TARecordProp -> Mutability
+taMut (TARecordProp m _ _) = m
 
-tName :: TRecordProp -> String
-tName (TRecordProp _ n _) = n
+taName :: TARecordProp -> Text
+taName (TARecordProp _ n _) = n
 
-tTyp :: TRecordProp -> Typ
-tTyp (TRecordProp _ _ t) = t
+taTypeArg :: TARecordProp -> TypeArg
+taTypeArg (TARecordProp _ _ t) = t
 
 eMut :: ERecordProp -> Mutability
 eMut (ERecordProp m _ _ _) = m
 
-eName :: ERecordProp -> String
+eName :: ERecordProp -> Text
 eName (ERecordProp _ n _ _) = n
 
-eTyp :: ERecordProp -> Typ
+eTyp :: ERecordProp -> Maybe Typ
 eTyp (ERecordProp _ _ t _) = t
 
 eExp :: ERecordProp -> Expr

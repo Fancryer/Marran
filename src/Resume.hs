@@ -6,15 +6,11 @@ module Resume (
 ) where
 import GHC.Natural (Natural)
 
-data ResumeInfo = NoResume | OneResume | MultipleResume Int
-  deriving (Show, Eq)
+data ResumeInfo = NoResume | OneResume | MultipleResume Int deriving (Show, Eq)
 
-instance Semigroup ResumeInfo where
-  x <> y = fromNatural (toNatural x + toNatural y)
+instance Semigroup ResumeInfo where x <> y = fromNatural (toNatural x + toNatural y)
 
--- instance Monoid ResumeInfo where
---   mempty = NoResume
-
+instance Monoid ResumeInfo where mempty = NoResume
 
 toNatural :: ResumeInfo -> Natural
 toNatural = \case NoResume -> 0; OneResume -> 1; MultipleResume n -> fromIntegral n
