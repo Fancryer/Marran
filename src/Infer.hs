@@ -56,6 +56,7 @@ import Types(
     pureTFunc, tfunc, ECons (..), countArgs
   )
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Record (taTypeArg, eExp)
 import Resume (ResumeInfo(..))
 import Unify (
@@ -265,6 +266,15 @@ buildCurried []     fxs ret = TFunct $ Funct TNil ret $ fromMaybe (RClosed []) f
 buildCurried [a]    fxs ret = TFunct $ Funct a ret $ fromMaybe (RClosed []) fxs
 buildCurried (a:as) fxs ret = tfunc a $ buildCurried as fxs ret
 
+-- | Тип выражения с предварительной подстановкой решений унификации.
+--   typeOfTypedExpr чистая и не знает подстановок: без этого вызов функции,
+--   результат которой ещё метапеременная (apply + 3 2), даёт "Apply of non-function".
+typeOfTypedExprIn :: Scope -> TypedExpr -> TypeCheckM Typ
+typeOfTypedExprIn scope e = substituteTypedExpr scope e >>= typeOfTypedExprUnsafe
+
+typeOfTypedBlockIn :: Scope -> TypedIR.Block -> TypeCheckM Typ
+typeOfTypedBlockIn scope b = substituteBlock scope b >>= typeOfTypedBlockUnsafe
+
 typeOfTypedExprUnsafe :: TypedExpr -> TypeCheckM Typ
 typeOfTypedExprUnsafe e = do
   case typeOfTypedExpr e of
@@ -335,7 +345,7 @@ inferChunk args chunk = do
         ) funScope functDecl.fArgs
 
       InferResult typedBlock blockFxs finalScope <- inferBlock scopeWithArgs functDecl.fBlock
-      blockTyp <- typeOfTypedBlockUnsafe typedBlock
+      blockTyp <- typeOfTypedBlockIn finalScope typedBlock
 
       -- Унифицируем тип результата
       scopeUnified <- unifyTypes finalScope blockTyp retTyp
@@ -446,17 +456,20 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
     wrapInferResultWithCell $ InferResult (TEXLambda lam') fxs scope'
   Apply callee arg -> do
     InferResult calleeT calleeFxs calleeScope <- inferExpr scope callee
-    calleeT' <- typeOfTypedExprUnsafe calleeT
+    calleeT' <- typeOfTypedExprIn calleeScope calleeT
     expectedFromT <- freshMetaTypeM
     expectedToT <- freshMetaTypeM
     expectedCalleeT <- TFunct . Funct expectedFromT expectedToT . ROpen [] <$> freshMetaM
     scope' <- unifyTypes calleeScope calleeT' expectedCalleeT
     InferResult argT argFxs argScope <- inferExpr scope' arg
-    argT' <- typeOfTypedExprUnsafe argT
+    argT' <- typeOfTypedExprIn argScope argT
     scope'' <- unifyTypes argScope argT' expectedFromT
 
     -- Эффект вызова (T-App): латентный ряд callee ПОСЛЕ унификации
-    resultRow <- case expectedCalleeT of
+    -- берётся собственный ряд callee (а не ожидаемый: унификация открытых рядов
+    -- привязывает хвост ожидаемого к разности и теряет эффекты)
+    calleeResolved <- applyTypeSubst scope'' calleeT'
+    resultRow <- case calleeResolved of
       TFunct (Funct _ _ row) -> applyEffRowSubst scope'' row
       _ -> throwTypeCheckError $ TypeError "Apply: callee must be a function"
 
@@ -532,7 +545,7 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
   Let lp wht whr -> do
     (lpT, scope1) <- inferLetPattern scope lp
     InferResult whtT whtFxs scope2 <- inferExpr scope1 wht
-    whT' <- typeOfTypedExprUnsafe whtT
+    whT' <- typeOfTypedExprIn scope2 whtT
     scope3 <- unifyTypes scope2 lpT whT'
     InferResult whrT whrFxs scope4 <- inferExpr scope3 whr
     wrapInferResultWithCell $
@@ -564,12 +577,12 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
             $ printf "Cannot access property '%s' of expression: expected record, got: %s" n $ pretty recT
   IfElse p t f -> do
     InferResult typP pFxs pScope <- inferExpr scope p
-    typP' <- typeOfTypedExprUnsafe typP
+    typP' <- typeOfTypedExprIn pScope typP
     scope' <- unifyTypes pScope TBoolean typP'
     InferResult typT tFxs tScope <- inferExpr scope' t
     InferResult typF fFxs fScope <- inferExpr tScope f
-    typT' <- typeOfTypedExprUnsafe typT
-    typF' <- typeOfTypedExprUnsafe typF
+    typT' <- typeOfTypedExprIn fScope typT
+    typF' <- typeOfTypedExprIn fScope typF
     iScope <- unifyTypes fScope typT' typF'
     wrapInferResultWithCell $ InferResult
       (TEIfElse typP typT typF)
@@ -748,8 +761,11 @@ inferLambda scope lam = withNewLevel $ do
   argT' <- maybe freshMetaTypeM pure lam.lArgT
   scope2 <- Scope.addBinding lam.lArg (Scheme [] [] [] argT') (XVar lam.lArg) Val scope1
   retT' <- maybe freshMetaTypeM pure lam.lRetT
-  InferResult blockT blockFxs scope3 <- inferBlock scope2 lam.lBlock
-  blockT' <- typeOfTypedBlockUnsafe blockT
+  InferResult blockT blockFxs0 scope3 <- inferBlock scope2 lam.lBlock
+  -- модель (T-Lam): упоминание переменной, несущей состояние, попадает в латентный ряд
+  men <- mentionRow scope3 (Set.delete lam.lArg (fvTypedBlock blockT))
+  let blockFxs = Eff.unionEffRows blockFxs0 men
+  blockT' <- typeOfTypedBlockIn scope3 blockT
   scope4 <- unifyTypes scope3 retT' blockT'
 
   rowFxs <- if lam.lFxs == RClosed [] then ROpen [] <$> freshMetaM else pure lam.lFxs
@@ -787,6 +803,8 @@ instantiateTypeScheme scope (Scheme tvars evars rvars typ) = do
 
   let typeMapping = Map.fromList [(tv, TVar mv) | (tv, mv) <- zip tvars freshTypes]
       effMapping = Map.fromList [(ev, EVar mv) | (ev, mv) <- zip evars freshEffects]
+      -- переменные рядов схемы получают свежие метапеременные (раньше использовались evars:
+      -- ряды не инстанциировались, и эффектная полиморфность не работала между вызовами)
       rowMapping = Map.fromList [(rv, RVar mv) | (rv, mv) <- zip rvars freshRows]
       scope' = scope {
     typeSubst = Map.union typeMapping scope.typeSubst,
@@ -806,7 +824,19 @@ inferBlock outer (stats, expr) = withNewLevel $ do
       pure (sc', Eff.unionEffRows accFxs fxs, accStats <> [stat'])
     ) (scope, Eff.empty, []) stats
   InferResult exprT exprFxs scope' <- inferExpr scopeAfterStats expr
-  pure $ InferResult (stats', exprT) (Eff.unionEffRows statFxs exprFxs) (Scope.keepSubst scope' outer)
+  -- модель (T-Block): Cell, если локальный var достижим из результата блока (состояние
+  -- уходит наружу, например в замыкании); иначе Var, если var есть; иначе ничего
+  exprTyp <- typeOfTypedExprIn scope' exprT
+  let varNames = [n | TypedIR.Bind Var n _ <- stats']
+      escapes = canHoldState exprTyp && any (`Set.member` reachNames stats' exprT) varNames
+      phi
+        | null varNames = Eff.empty
+        | escapes = Eff.closedOfFlat "Cell"
+        | otherwise = Eff.closedOfFlat "Var"
+  pure $ InferResult
+    (stats', exprT)
+    (Eff.unionEffRows phi $ Eff.unionEffRows statFxs exprFxs)
+    (Scope.keepSubst scope' outer)
 
 inferStat :: Scope -> Types.Stat -> InferM TypedIR.Stat
 inferStat scope = \case
@@ -830,11 +860,15 @@ inferStat scope = \case
       case m of
         Imm -> do
           let frozenExpr = freeze inferredTypedExpr
-          frozenTyp <- typeOfTypedExprUnsafe frozenExpr
+          -- модель (T-Imm): тип значения замораживается (freezeTyp), а не берётся у
+          -- переписанного выражения: латентные ряды внутри стрелок тоже теряют мутацию
+          frozenTyp <- freezeTyp <$> applyTypeSubst scope1 inferredTyp
           -- Удаляем эффекты Read, Var, Rebind, Cell
           let removedFxs = foldl (flip removeConsFromRow) inferredFxs $
                 map Eff.label ["Read", "Var", "Rebind", "Cell"]
-          pure (frozenExpr, frozenTyp, removedFxs)
+          -- модель (T-ImmBind): сам снимок читает текущее состояние (Men)
+          men <- mentionRow scope1 (fvTyped inferredTypedExpr)
+          pure (frozenExpr, frozenTyp, Eff.unionEffRows removedFxs men)
         _ -> pure (inferredTypedExpr, inferredTyp, inferredFxs)
 
     -- 2. Handle annotation (используем typForBinding)
@@ -863,9 +897,8 @@ inferStat scope = \case
     scope4 <- Scope.addBinding n finalScheme (XVar n) m scope3
 
     -- 6. Финальные эффекты
-    let finalFxs = if m == Var then
-          Eff.unionEffRows fxsForBinding $ Eff.closedOfFlat "Var"
-        else fxsForBinding
+    -- модель (T-VarBind): эффект Var/Cell добавляет блок (phi), а не оператор
+    let finalFxs = fxsForBinding
 
     -- 7. Возвращаем типизированный биндинг с замороженным выражением (для Imm) или исходным
     pure $ InferResult (TypedIR.Bind m n exprForBinding) finalFxs scope4
@@ -988,19 +1021,120 @@ collectRvarsFromEffRow except fx =
     ROpen _ v -> [v | v `notElem` except]
     _ -> []
 
+-- | Свободные переменные типизированного выражения (для анализа выхода состояния из блока).
+--   Привязки let учитываются консервативно (не вычитаются).
+-- | Тип несёт изменяемое состояние (модель: St_T): var-поле записи, латентный ряд стрелки
+--   с Read/Rebind или хвост ряда, не обобщённый схемой (неизвестные эффекты).
+--   У стрелки учитывается только её собственный ряд, а не тип результата: функция,
+--   которая создаёт состояние (make), само состояние не держит.
+bearsState :: [Taste] -> Typ -> Bool
+bearsState quantified = go
+  where
+    go = \case
+      TArray t -> go t
+      TPair l r -> go l || go r
+      TFunct (Funct _ _ row) -> rowUses row
+      TRecord props -> any (\p -> tMut p == Var || go (tTyp p)) props
+      -- переменная типа может быть конкретизирована типом, несущим состояние
+      TVar _ -> True
+      _ -> False
+    rowUses = \case
+      RClosed cs -> any isUse cs
+      ROpen cs v -> any isUse cs || v `notElem` quantified
+      RVar v -> v `notElem` quantified
+    isUse = \case
+      EffCons (ECons n _) -> n == "Read" || n == "Rebind"
+      _ -> False
+
+-- | Несёт ли переменная состояние (модель: St): var-привязка или тип, несущий состояние
+varBearsState :: Scope -> Text -> TypeCheckM Bool
+varBearsState scope n =
+  case Scope.findBinding True scope n of
+    Nothing -> pure False
+    Just (Scheme _ _ rvs t, _, m) -> do
+      t' <- applyTypeSubst scope t
+      pure $ m == Var || bearsState rvs t'
+
+-- | Упоминание (модель: Men): Read, если среди переменных есть несущая состояние.
+--   Снимок такой переменной прочитал бы изменяемое состояние, даже если переменная
+--   только упомянута и не используется.
+mentionRow :: Scope -> Set.Set Text -> TypeCheckM EffRow
+mentionRow scope names = do
+  flags <- mapM (varBearsState scope) (Set.toList names)
+  pure $ if or flags then Eff.closedOfFlat "Read" else Eff.empty
+
+fvTyped :: TypedExpr -> Set.Set Text
+fvTyped = \case
+  TEXVar n _ -> Set.singleton n
+  TEArray _ es -> Set.unions (map fvTyped es)
+  TEPair l r -> Set.union (fvTyped l) (fvTyped r)
+  TEXLambda lam -> Set.delete lam.lArg (fvTypedBlock lam.lBlock)
+  TEApply f x -> Set.union (fvTyped f) (fvTyped x)
+  TERecord me props ->
+    Set.unions $ maybe [] (pure . fvTyped) me <> [fvTyped e | TERecordProp _ _ _ e <- props]
+  TEHandle (TypedIR.Handler _ block clauses mlam) _ ->
+    Set.unions $ [fvTypedBlock block, fvTypedBlock mlam.lBlock]
+      <> map (\(_, l, _, _) -> fvTypedBlock l.lBlock) clauses
+  TEParen b -> fvTypedBlock b
+  TEResume e _ -> fvTyped e
+  TELet _ bound body -> Set.union (fvTyped bound) (fvTyped body)
+  TEPropAccess e _ -> fvTyped e
+  TEIfElse p t f -> Set.unions [fvTyped p, fvTyped t, fvTyped f]
+  _ -> Set.empty
+
+fvTypedBlock :: TypedIR.Block -> Set.Set Text
+fvTypedBlock (stats, expr) = go Set.empty stats
+  where
+    go bound [] = Set.difference (fvTyped expr) bound
+    go bound (s : ss) =
+      let (fvS, bound') = stat bound s
+      in Set.union fvS (go bound' ss)
+    stat bound = \case
+      TypedIR.Bind _ n e -> (Set.difference (fvTyped e) bound, Set.insert n bound)
+      TypedIR.Rebind n e -> (Set.difference (Set.insert n (fvTyped e)) bound, bound)
+      TypedIR.Expr e -> (Set.difference (fvTyped e) bound, bound)
+
+-- | Может ли значение этого типа держать изменяемое состояние (замыкание, запись,
+--   структура с такими компонентами). Значения базовых типов состояния не держат,
+--   поэтому из блока с результатом Int или () состояние наружу не уходит.
+canHoldState :: Typ -> Bool
+canHoldState = \case
+  TInt -> False
+  TFloat -> False
+  TBoolean -> False
+  TString -> False
+  TNil -> False
+  TNothing -> False
+  TArray t -> canHoldState t
+  TPair l r -> canHoldState l || canHoldState r
+  _ -> True
+
+-- | Имена, достижимые из результата блока (модель: reach): свободные переменные результата,
+--   замкнутые относительно привязок и присваиваний блока.
+reachNames :: [TypedIR.Stat] -> TypedExpr -> Set.Set Text
+reachNames stats result = grow (fvTyped result)
+  where
+    grow acc =
+      let acc' = foldl step acc stats
+      in if acc' == acc then acc else grow acc'
+    step acc = \case
+      TypedIR.Bind m n e | m /= Imm, Set.member n acc -> Set.union acc (fvTyped e)
+      TypedIR.Rebind n e | Set.member n acc -> Set.union acc (fvTyped e)
+      _ -> acc
+
 introducesLocalState :: TypedIR.Block -> Bool
 introducesLocalState (stats, _) = any (\case TypedIR.Bind Var _ _ -> True; _ -> False) stats
 
 createsCell :: TypedExpr -> Bool
 createsCell = \case
-  TEParen b -> introducesLocalState b
+  TEParen _ -> False  -- Var/Cell блока учитывает inferBlock (phi)
   TEArray _ es -> any createsCell es
   TEPair l r -> createsCell l || createsCell r
-  TEXLambda lam -> introducesLocalState lam.lBlock
+  TEXLambda _ -> False  -- латентный ряд тела несёт Var/Cell
   TERecord me props ->
     maybe False createsCell me ||
     any (\(TERecordProp m _ _ e) -> m == Var || createsCell e) props
-  TEHandle h _ -> handlerCreatesCell h
+  TEHandle _ _ -> False
   TEResume e _ -> createsCell e
   TELet _ wht whr -> any createsCell [wht, whr]
   TEIfElse p t f -> any createsCell [p, t, f]
@@ -1034,6 +1168,21 @@ freeze = \case
   TEPropAccess t x -> TEPropAccess (freeze t) x
   TEIfElse p t f -> TEIfElse (freeze p) (freeze t) (freeze f)
   e -> e
+
+-- | Заморозка типа: var-поля записей становятся val, из рядов стрелок убираются
+--   Var, Read, Rebind, Cell (модель: freeze на типах)
+freezeTyp :: Typ -> Typ
+freezeTyp = \case
+  TArray t -> TArray (freezeTyp t)
+  TPair l r -> TPair (freezeTyp l) (freezeTyp r)
+  TFunct (Funct i o fxs) -> TFunct (Funct (freezeTyp i) (freezeTyp o) (freezeRowMut fxs))
+  TRecord props ->
+    TRecord [p {tMut = freezeMutability (tMut p), tTyp = freezeTyp (tTyp p)} | p <- props]
+  t -> t
+
+freezeRowMut :: EffRow -> EffRow
+freezeRowMut row = foldl (flip removeConsFromRow) row $
+  map Eff.label ["Read", "Var", "Rebind", "Cell"]
 
 freezeMutability :: Mutability -> Mutability
 freezeMutability = \case Var -> Val; m -> m

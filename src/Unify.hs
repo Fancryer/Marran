@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveFunctor #-}
+
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
@@ -8,6 +8,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE OrPatterns #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE DeriveFunctor #-}
 module Unify (
   freshMetaM,
   freshSkolemM,
@@ -232,8 +233,7 @@ lowerRowTo target = \case
 bindMetaType :: Scope -> Taste -> Typ -> TypeCheckM Scope
 bindMetaType scope m@(Meta _ _ lvlM) t = do
   let t' = lowerTypeTo lvlM t
-  if skolemEscapesType lvlM t' then do
-    throwTypeCheckError $ TypeError "Skolem escapes type"
+  if skolemEscapesType lvlM t' then throwTypeCheckError $ TypeError "Skolem escapes type"
   else
     pure scope{typeSubst = Map.insert m t' $ typeSubst scope}
 bindMetaType _ s@Skolem{} _ = throwTypeCheckError $ TypeError "Cannot solve a skolem variable"
@@ -254,10 +254,17 @@ bindMetaTypeArg _ b@Bound{} _ =
 bindRowVar :: Scope -> Taste -> EffRow -> TypeCheckM Scope
 bindRowVar scope m@(Meta _ _ lvlM) row = do
   let row' = lowerRowTo lvlM row
-  if skolemEscapesRow lvlM row' then
-    throwTypeCheckError $ TypeError "Skolem escapes row"
-  else
-    pure scope{rowSubst = Map.insert m row' $ rowSubst scope}
+  -- проверка вхождения: цикл в rowSubst заставил бы applyEffRowSubst зависнуть
+  resolved <- applyEffRowSubst scope row'
+  case resolved of
+    RVar n | n == m -> pure scope
+    ROpen _ n | n == m ->
+      throwTypeCheckError $ TypeError "Occurs check: a row variable occurs in its own binding"
+    _ ->
+      if skolemEscapesRow lvlM row' then
+        throwTypeCheckError $ TypeError "Skolem escapes row"
+      else
+        pure scope{rowSubst = Map.insert m row' $ rowSubst scope}
 bindRowVar _ s@Skolem{} _ = throwTypeCheckError $ TypeError $ "Cannot solve a skolem variable " <> tasteName s
 bindRowVar _ b@Bound{} _ =
   throwTypeCheckError $ TypeError $ "bindRowVar | Cannot solve a bound variable " <> tasteName b
@@ -341,23 +348,22 @@ unifyTypes scope t1 t2 = do
     _ -> throwTypeCheckError $ TypeUnificationError t1' t2'
 
 unifyRecords :: Scope -> [TRecordProp] -> [TRecordProp] -> TypeCheckM Scope
-unifyRecords scope props1 props2 = do
-  if length props1 /= length props2 then
+unifyRecords scope props1 props2 = if length props1 /= length props2 then
+  throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
+else
+  let props1' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props1 in
+  let props2' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props2 in
+  if length props1 /= length props1' || length props2 /= length props2' then
     throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
   else
-    let props1' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props1 in
-    let props2' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props2 in
-    if length props1 /= length props1' || length props2 /= length props2' then
+    let zipped = zip props1' props2' in
+    if any (\(p1, p2) -> tMut p1 /= tMut p2 || tName p1 /= tName p2) zipped then
       throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
-    else
-      let zipped = zip props1' props2' in
-      if any (\(p1, p2) -> tMut p1 /= tMut p2 || tName p1 /= tName p2) zipped then
-        throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
-      else do
-        foldM (
-          \sc (typ1, typ2) -> do
-            unifyTypes sc typ1 typ2
-          ) scope (map (bimap tTyp tTyp) zipped)
+    else do
+      foldM (
+        \sc (typ1, typ2) -> do
+          unifyTypes sc typ1 typ2
+        ) scope (map (bimap tTyp tTyp) zipped)
 
 applyEffRowSubst :: Scope -> EffRow -> TypeCheckM EffRow
 applyEffRowSubst scope = \case
@@ -398,24 +404,20 @@ subsumesEffRow scope r1 r2 = do
     (RClosed cs1, RClosed cs2) ->
       if cs1 `isSubsequenceOf` cs2
         then pure scope
-        else throwTypeCheckError $ EffectRowsUnificationError "Not all effects from r1 are presented in r2" r1' r2'
+        else throwTypeCheckError $ EffectRowsUnificationError
+          (T.concat [
+            "Effects of the body are not allowed by the declared row; missing in the declaration: [",
+            T.intercalate ", " $ map pretty (cs1 \\ cs2), "]"])
+          r1' r2'
 
-    -- Закрытый фактический, открытый ожидаемый
+    -- Закрытый фактический, открытый ожидаемый: лишние эффекты уходят в хвост
     (RClosed cs1, ROpen cs2 v) -> do
-      -- Если открытая часть пуста, хвост связывается со всем закрытым рядом
-      if null cs2 then
-        bindRowVar scope v (RClosed cs1)
-      else do
-        -- Проверяем, что все эффекты из открытой части есть в закрытом
-        let isSubset = cs2 `isSubsequenceOf` cs1
-        if not isSubset then
-          throwTypeCheckError $ EffectRowsUnificationError
-            "Open row has effects not present in closed row"
-            (RClosed cs1)
-            (ROpen cs2 v)
-        else
-          let extra = cs1 \\ cs2
-          in if null extra then pure scope else bindRowVar scope v (RClosed extra)
+      let extra = cs1 \\ cs2
+      if null extra
+        then pure scope
+        else do
+          r <- freshMetaM
+          bindRowVar scope v (ROpen extra r)
 
     -- Открытый фактический, закрытый ожидаемый
     (ROpen cs1 v1, RClosed cs2) -> do
@@ -435,11 +437,7 @@ subsumesEffRow scope r1 r2 = do
           bindRowVar scope v1 (RClosed [])
 
     -- Открытый vs открытый
-    (ROpen cs1 v1, ROpen cs2 v2) -> do
-      let extra1 = cs1 \\ cs2   -- эффекты в r1, которых нет в r2
-          extra2 = cs2 \\ cs1   -- эффекты в r2, которых нет в r1
-      scope1 <- bindRowVar scope v1 $ RClosed extra2
-      bindRowVar scope1 v2 $ RClosed extra1
+    (ROpen cs1 v1, ROpen cs2 v2) -> unifyOpenOpen scope cs1 v1 cs2 v2
 
     -- Переменная ряда с чем-то
     (RVar v, row) -> bindRowVar scope v row
@@ -454,7 +452,7 @@ unifyEffRows scope r1 r2 = do
     (RClosed cl, ROpen op v) -> unifyClosedEffRowWithOpen scope cl op v
     (ROpen op v, RClosed cl) -> unifyOpenEffRowWithClosed scope op v cl
     (ROpen l1 v1, ROpen l2 v2) -> unifyOpenEffConsLists scope l1 v1 l2 v2
-    
+
     (RVar e1, RVar e2) | e1 == e2 -> pure scope
     (RVar e, row) -> unifyRowVarWithEffRow scope e row
     (row, RVar e) -> unifyRowVarWithEffRow scope e row
@@ -478,9 +476,27 @@ unifyOpenEffConsLists scope l1 v1 l2 v2 = do
             Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Shall not happen")
             Just cons2 -> unifyEffCons sc cons1 cons2
         ) scope commonEffects
-  -- Находим эффекты, уникальные для каждого ряда
-  scope'' <- unifyRowVarWithEffRow scope' v1 $ RClosed $ l1 \\ l2
-  unifyRowVarWithEffRow scope'' v2 $ RClosed $ l2 \\ l1
+  unifyOpenOpen scope' l1 v1 l2 v2
+
+-- | Ряд из явных эффектов и хвоста (пустой список эффектов даёт просто переменную)
+mkOpenRow :: [EffCons] -> Taste -> EffRow
+mkOpenRow [] t = RVar t
+mkOpenRow cs t = ROpen cs t
+
+-- | Унификация двух открытых рядов (по Реми): у обоих рядов общий свежий хвост r,
+--   v1 := (l2 \ l1 | r), v2 := (l1 \ l2 | r). Хвост не теряется, поэтому
+--   эффектная полиморфность функций высшего порядка сохраняется.
+unifyOpenOpen :: Scope -> [EffCons] -> Taste -> [EffCons] -> Taste -> TypeCheckM Scope
+unifyOpenOpen scope l1 v1 l2 v2
+  | v1 == v2 =
+      if null (l1 \\ l2) && null (l2 \\ l1)
+        then pure scope
+        else throwTypeCheckError $ EffectRowsUnificationError
+          "Open rows with the same tail have different effects" (ROpen l1 v1) (ROpen l2 v2)
+  | otherwise = do
+      r <- freshMetaM
+      scope1 <- bindRowVar scope v1 (mkOpenRow (l2 \\ l1) r)
+      bindRowVar scope1 v2 (mkOpenRow (l1 \\ l2) r)
 
 unifyRowVarWithEffRow :: Scope -> Taste -> EffRow -> TypeCheckM Scope
 unifyRowVarWithEffRow scope v = \case
@@ -489,52 +505,27 @@ unifyRowVarWithEffRow scope v = \case
 
 unifyClosedEffRowWithOpen :: Scope -> [EffCons] -> [EffCons] -> Taste -> TypeCheckM Scope
 unifyClosedEffRowWithOpen scope closed open v = do
-  if null open then
-    bindRowVar scope v (RClosed closed)
+  -- явная часть открытого ряда должна содержаться в закрытом ряду
+  let missing = open \\ closed
+  if not (null missing) then
+    throwTypeCheckError $ EffectRowsUnificationError
+      (T.concat [
+        "Open row has effects not present in closed row: [",
+        T.intercalate ", " $ map pretty missing, "]"])
+      (RClosed closed)
+      (ROpen open v)
   else do
-    -- closed должен быть подмножеством open (все эффекты из closed есть в open)
-    let isSubset = closed `isSubsequenceOf` open
-    if not isSubset then
-      throwTypeCheckError $ EffectRowsUnificationError
-        (T.concat [
-          "Closed row has effects not present in open row: [",
-          T.intercalate ", " $ map pretty $ closed \\ open, "]"])
-        (RClosed closed)
-        (ROpen open v)
-    else do
-      -- Унифицируем общие эффекты (для проверки аргументов)
-      scope' <- foldM (\sc cons1 ->
-            case find (== cons1) open of
-              Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Should not happen")
-              Just cons2 -> unifyEffCons sc cons1 cons2
-          ) scope closed   -- проходим по closed, ищем в open
-      -- Хвост v связываем с эффектами из open, которых нет в closed
-      bindRowVar scope' v (RClosed $ open \\ closed)
+    -- унифицируем общие эффекты (для проверки аргументов)
+    scope' <- foldM (\sc cons1 ->
+          case find (== cons1) closed of
+            Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Should not happen")
+            Just cons2 -> unifyEffCons sc cons1 cons2
+        ) scope open
+    -- хвост получает остаток закрытого ряда
+    bindRowVar scope' v (RClosed $ closed \\ open)
 
 unifyOpenEffRowWithClosed :: Scope -> [EffCons] -> Taste -> [EffCons] -> TypeCheckM Scope
-unifyOpenEffRowWithClosed scope open v closed = do
-  -- Если открытый ряд пуст, переменная ряда связывается со всем закрытым рядом
-  if null open then
-    bindRowVar scope v (RClosed closed)
-  else do
-    -- open должен быть подмножеством closed
-    let isSubset = open `isSubsequenceOf` closed
-    if not isSubset then
-      throwTypeCheckError $ EffectRowsUnificationError
-        (T.concat [
-          "Open row has effects not present in closed row: [",
-          T.intercalate ", " $ map pretty $ open \\ closed, "]"])
-        (ROpen open v)
-        (RClosed closed)
-    else do
-      -- Унифицируем общие эффекты
-      scope' <- foldM (\sc cons1 ->
-            case find (== cons1) closed of
-              Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Should not happen")
-              Just cons2 -> unifyEffCons sc cons1 cons2
-          ) scope open
-      -- Хвост становится пустым (все эффекты из open уже есть в closed)
-      bindRowVar scope' v (RClosed [])
+unifyOpenEffRowWithClosed scope open v closed = unifyClosedEffRowWithOpen scope closed open v
 
 unifyEffCons :: Scope -> EffCons -> EffCons -> TypeCheckM Scope
 unifyEffCons scope c1@(EffCons (ECons name1 params1)) c2@(EffCons (ECons name2 params2))
@@ -584,23 +575,22 @@ unifyTypeArgs scope t1 t2 = do
     _ -> throwTypeCheckError $ TypeArgUnificationError t1' t2'
 
 unifyRecordArgs :: Scope -> [TARecordProp] -> [TARecordProp] -> TypeCheckM Scope
-unifyRecordArgs scope props1 props2 = do
-  if length props1 /= length props2 then
+unifyRecordArgs scope props1 props2 = if length props1 /= length props2 then
+  throwTypeCheckError $ TypeArgUnificationError (TARecord props1) (TARecord props2)
+else
+  let props1' = sort $ nubBy (\p1 p2 -> taName p1 == taName p2) props1 in
+  let props2' = sort $ nubBy (\p1 p2 -> taName p1 == taName p2) props2 in
+  if length props1 /= length props1' || length props2 /= length props2' then
     throwTypeCheckError $ TypeArgUnificationError (TARecord props1) (TARecord props2)
   else
-    let props1' = sort $ nubBy (\p1 p2 -> taName p1 == taName p2) props1 in
-    let props2' = sort $ nubBy (\p1 p2 -> taName p1 == taName p2) props2 in
-    if length props1 /= length props1' || length props2 /= length props2' then
+    let zipped = zip props1' props2' in
+    if any (\(p1, p2) -> taMut p1 /= taMut p2 || taName p1 /= taName p2) zipped then
       throwTypeCheckError $ TypeArgUnificationError (TARecord props1) (TARecord props2)
-    else
-      let zipped = zip props1' props2' in
-      if any (\(p1, p2) -> taMut p1 /= taMut p2 || taName p1 /= taName p2) zipped then
-        throwTypeCheckError $ TypeArgUnificationError (TARecord props1) (TARecord props2)
-      else do
-        foldM (
-          \sc (typ1, typ2) -> do
-            unifyTypeArgs sc typ1 typ2
-          ) scope (map (bimap taTypeArg taTypeArg) zipped)
+    else do
+      foldM (
+        \sc (typ1, typ2) -> do
+          unifyTypeArgs sc typ1 typ2
+        ) scope (map (bimap taTypeArg taTypeArg) zipped)
 
 removeConsFromRow :: EffCons -> EffRow -> EffRow
 removeConsFromRow cons = \case
@@ -615,3 +605,22 @@ retTypeOf (TFunct (Funct _ o _)) = go o
     go t = Just t
 
 retTypeOf _ = Nothing
+
+instance Pretty TypeCheckError where
+  pretty = \case
+    TypeError e -> "TypeError: " <> e
+    TypeArgError e -> "TypeArgError: " <> e
+    TypeUnificationError l r ->
+      T.pack $ printf "TypeUnificationError: (%s) ~ (%s)" (pretty l) (pretty r)
+    TypeArgUnificationError l r ->
+      T.pack $ printf "TypeArgUnificationError: (%s) ~ (%s)" (pretty l) (pretty r)
+    EffectRowsUnificationError t l r ->
+      T.pack $ printf "EffectRowsUnificationError (%s): %s ~ %s" t (pretty l) (pretty r)
+    EffectConsUnificationError l r ->
+      T.pack $ printf "EffectConsUnificationError: %s ~ %s" (pretty l) (pretty r)
+    UndefinedVariable e -> "UndefinedVariable: " <> e
+    ImmutableVariableAssignment e -> "ImmutableVariableAssignment: " <> e
+    SameScopeBindingShadowing e -> "SameScopeBindingShadowing: " <> e
+    EffectError e -> "EffectError: " <> e
+    MultipleResumeError e n -> "MultipleResumeError (" <> pretty n <> "): " <> e
+    TodoError e -> "TodoError: " <> e

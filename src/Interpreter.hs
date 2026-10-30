@@ -5,13 +5,15 @@
 {-# LANGUAGE OrPatterns #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Interpreter (interpret) where
 
 import qualified TypedIR as IR
 import Types (
     Mutability(..),
-    ECons,
+    ECons(..),
+    EffCons(..),
     LetPattern(..),
     AtomLetPattern(..),
     LetPatternRecordProp(..),
@@ -25,10 +27,11 @@ import Data.Scientific (Scientific, fromFloatDigits)
 import Control.Monad.Cont (ContT(..), callCC)
 import Utils (TextMap, Pretty (..))
 import Data.Foldable (find)
+import Data.List (intercalate)
 import TypedIR (TypedExpr(..), Lambda(..), Block, TERecordProp(..))
 import Control.Monad.State
 import Control.Monad (foldM, forM, forM_, void, replicateM, foldM_, when)
-import Infer (freezeMutability, freeze)
+import Infer (freezeMutability, freeze, freezeBlock, freezeLambda)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import qualified Eff
@@ -40,7 +43,8 @@ import Control.Concurrent (threadDelay)
 import Resume (ResumeInfo(..))
 import Text.Printf (printf)
 import Data.Traversable (for)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
+import System.Environment (lookupEnv)
 
 class Stringify a where
   stringify :: a -> Interp Text
@@ -219,13 +223,27 @@ derefUnsafeIn a = do
 unpackRef :: Env -> Heap -> Text -> Maybe Value
 unpackRef e h x = getRef e x >>= deref h
 
+-- | Код замыкания (нужен, чтобы снимок мог переписать функцию, а не только её данные)
+data Code
+  = CodeLam IR.Lambda
+  | CodeFun [Text] IR.Block
+
+-- | События мутации (теорема об эффектах): чтение var, перепривязка, создание var, чтение снимком
+data Event = EvRead | EvRebind | EvCreate | EvSnapRead
+  deriving (Eq, Ord, Show)
+
 data InterpState = InterpState {
   sEnv      :: EnvId,
   sEnvs     :: Map EnvId Env,
   sHeap     :: Heap,
   sKstack   :: [HandlerFrame],
   sNextAddr :: Int,
-  sNextEnv  :: Int
+  sNextEnv  :: Int,
+  sCode     :: Map Address Code,
+  sFreezeMemo :: Map Address Address,
+  sTrace    :: Bool,
+  sEvents   :: Map Event Int,
+  sNoMemo   :: Bool
 }
 
 type Clause = [Address] -> (Address -> Interp Address) -> Interp Address
@@ -242,13 +260,20 @@ type Interp a = ContT Value (StateT InterpState IO) a
 -- | Запуск интерпретации
 interpret :: IR.Chunk -> [String] -> IO Value
 interpret chunk cmdArgs = do
+  traceOn <- isJust <$> lookupEnv "MARRAN_TRACE"
+  noMemo <- isJust <$> lookupEnv "MARRAN_NO_MEMO"
   let initState = InterpState {
         sEnv = EnvId 0,
         sEnvs = Map.empty,
         sHeap = Map.empty,
         sKstack = globalHandlers,
         sNextAddr = 0,
-        sNextEnv = 1
+        sNextEnv = 1,
+        sCode = Map.empty,
+        sFreezeMemo = Map.empty,
+        sTrace = traceOn,
+        sEvents = Map.empty,
+        sNoMemo = noMemo
       }
   (result, finalState) <- runStateT (runContT (do
       root <- newEnv $ Env Map.empty Nothing
@@ -258,133 +283,114 @@ interpret chunk cmdArgs = do
     ) pure) initState
   pure result
 
+-- | Операция эффекта: арность и клауза объявляются вместе (единственный источник арности)
+data Op = Op {
+  opArity  :: Int,
+  opClause :: Clause
+}
+
+-- | Встроенные эффекты и их операции
+globalOps :: [(ECons, [(Text, Op)])]
+globalOps = [
+    (Eff.elabel "Output", [
+      ("say", Op 1 $ \case
+        [addrArg] -> \_ -> do
+          liftIO . putStr . T.unpack =<< stringify =<< forceValue addrArg
+          alloc VNil
+        _ -> error "Incorrect args amount"),
+      ("sayn", Op 1 $ \case
+        [addrArg] -> \_ -> do
+          liftIO . putStrLn . T.unpack =<< stringify =<< forceValue addrArg
+          alloc VNil
+        _ -> error "Incorrect args amount"),
+      ("trace", Op 1 $ \case
+        [addrArg] -> \_ -> do
+          st <- get
+          liftIO $ putStrLn $ T.unpack $ pretty $ derefUnsafe st.sHeap addrArg
+          pure addrArg
+        _ -> error "Incorrect args amount")
+    ]),
+    (Eff.elabel "Input", [
+      ("read_string", Op 1 $ \_ _ -> do
+        input <- T.pack <$> liftIO getLine
+        case Parser.parseFromText Parser.stringLiteral input of
+          Left err -> error err
+          Right s -> alloc $ VString s),
+      ("read_int", Op 1 $ \_ _ -> do
+        input <- T.pack <$> liftIO getLine
+        case Parser.parseFromText Parser.intLiteral input of
+          Left err -> liftIO (putStrLn err) >> alloc (VInt 0)
+          Right i -> alloc $ VInt i),
+      ("read_float", Op 1 $ \_ _ -> do
+        input <- T.pack <$> liftIO getLine
+        case Parser.parseFromText Parser.floatLiteral input of
+          Left err -> liftIO (putStrLn err) >> alloc (VFloat 0.0)
+          Right f -> alloc $ VFloat f),
+      ("read_boolean", Op 1 $ \_ _ -> do
+        input <- T.pack <$> liftIO getLine
+        case Parser.parseFromText Parser.bool input of
+          Left err -> liftIO (putStrLn err) >> alloc (VBoolean False)
+          Right b -> alloc $ VBoolean b)
+    ]),
+    (Eff.elabel "Random", [
+      ("random_int", Op 2 $ \case
+        [minI, maxI] -> \_ -> do
+          lo <- forceValue minI
+          hi <- forceValue maxI
+          case (lo, hi) of
+            (VInt a, VInt b) -> do
+              r <- liftIO $ toInteger <$> (randomRIO (fromIntegral a, fromIntegral b) :: IO Int)
+              alloc $ VInt r
+            _ -> error "Expected Int and Int in random_int"
+        _ -> error "Incorrect args amount"),
+      ("random_float", Op 1 $ \_ _ -> do
+        r <- liftIO $ fromFloatDigits <$> (randomRIO (0.0, 1.0) :: IO Double)
+        alloc $ VFloat r),
+      ("random_boolean", Op 1 $ \_ _ -> alloc . VBoolean =<< randomIO),
+      ("random_string", Op 1 $ \case
+        [addr] -> \_ -> do
+          st <- get
+          r <- T.pack <$> case derefUnsafe st.sHeap addr of
+            VInt n | n <= 0 -> pure ""
+            VInt n -> map chr <$> replicateM (fromInteger n) (randomRIO (32, 126))
+            _ -> error "Not Int"
+          alloc $ VString r
+        _ -> error "Incorrect args amount")
+    ]),
+    (Eff.elabel "Time", [
+      ("time_ms", Op 1 $ \_ _ -> do
+        cpuTime <- liftIO getCPUTime
+        alloc $ VInt $ fromInteger $ cpuTime `div` 1_000_000_000),
+      ("sleep", Op 1 $ \case
+        [addr] -> \_ -> do
+          st <- get
+          case derefUnsafe st.sHeap addr of
+            VInt i -> liftIO (threadDelay $ fromInteger i) >> alloc VNil
+            _ -> error "Not Int"
+        _ -> error "Incorrect args amount")
+    ])
+  ]
+
 globalHandlers :: [HandlerFrame]
 globalHandlers = [
     HandlerFrame {
-      hEffect = Eff.elabel "Output",
-      hClauses = Map.fromList [
-        ("say", \case
-          [addrArg] -> \_ -> do
-            liftIO . putStr . T.unpack =<< stringify =<< forceValue addrArg
-            alloc VNil
-          _ -> error "Incorrect args amount"),
-        ("sayn", \case
-          [addrArg] -> \_ -> do
-            liftIO . putStrLn . T.unpack =<< stringify =<< forceValue addrArg
-            alloc VNil
-          _ -> error "Incorrect args amount"),
-        ("trace", \case
-          [addrArg] -> \_ -> do
-            st <- get
-            liftIO $ putStrLn $ T.unpack $ pretty $ derefUnsafe st.sHeap addrArg
-            pure addrArg
-          _ -> error "Incorrect args amount")
-      ],
-      hThen = pure
-    },
-    HandlerFrame {
-      hEffect = Eff.elabel "Input",
-      hClauses = Map.fromList [
-        ("read_string", \_ _ -> do
-          input <- T.pack <$> liftIO getLine
-          case Parser.parseFromText Parser.stringLiteral input of
-            Left err -> error err
-            Right s -> alloc $ VString s),
-        ("read_int", \_ _ -> do
-          input <- T.pack <$> liftIO getLine
-          case Parser.parseFromText Parser.intLiteral input of
-            Left err -> liftIO (putStrLn err) >> alloc (VInt 0)
-            Right i -> alloc $ VInt i),
-        ("read_float", \_ _ -> do
-          input <- T.pack <$> liftIO getLine
-          case Parser.parseFromText Parser.floatLiteral input of
-            Left err -> liftIO (putStrLn err) >> alloc (VFloat 0.0)
-            Right f -> alloc $ VFloat f),
-        ("read_boolean", \_ _ -> do
-          input <- T.pack <$> liftIO getLine
-          case Parser.parseFromText Parser.bool input of
-            Left err -> liftIO (putStrLn err) >> alloc (VBoolean False)
-            Right b -> alloc $ VBoolean b)
-      ],
-      hThen = pure
-    },
-    HandlerFrame {
-      hEffect = Eff.elabel "Random",
-      hClauses = Map.fromList [
-        ("random_int", \_ _ -> do
-          r <- liftIO $ toInteger <$> (randomRIO (minBound, maxBound) :: IO Int)
-          alloc $ VInt r),
-        ("random_float", \_ _ -> do
-          r <- liftIO $ fromFloatDigits <$> (randomRIO (0.0, 1.0) :: IO Double)
-          alloc $ VFloat r),
-        ("random_boolean", \_ _ -> alloc . VBoolean =<< randomIO),
-        ("random_string", \case
-          [addr] -> \_ -> do
-            st <- get
-            r <- T.pack <$> case derefUnsafe st.sHeap addr of
-              VInt n | n <= 0 -> pure ""
-              VInt n -> map chr <$> replicateM (fromInteger n) (randomRIO (32, 126))
-              _ -> error "Not Int"
-            alloc $ VString r
-          _ -> error "Incorrect args amount")
-      ],
-      hThen = pure
-    },
-    HandlerFrame {
-      hEffect = Eff.elabel "Time",
-      hClauses = Map.fromList [
-        ("time_ms", \_ _ -> do
-          cpuTime <- liftIO getCPUTime
-          alloc $ VInt $ fromInteger $ cpuTime `div` 1_000_000_000),
-        ("sleep", \case
-          [addr] -> \_ -> do
-            st <- get
-            case derefUnsafe st.sHeap addr of
-              VInt i -> liftIO (threadDelay $ fromInteger i) >> alloc VNil
-              _ -> error "Not Int"
-          _ -> error "Incorrect args amount")
-      ],
+      hEffect = eff,
+      hClauses = Map.fromList [(n, opClause o) | (n, o) <- ops],
       hThen = pure
     }
+  | (eff, ops) <- globalOps
   ]
 
 buildInitialEnv :: Interp EnvId
 buildInitialEnv = do
-  let allocEffectCall eff op arity = do
+  -- замыкания операций строятся из той же таблицы, что и клаузы (арность не дублируется)
+  let allocEffectCall eff (op, o) = do
         env <- gets sEnv
-        clos <- makeEffectClosure env arity (Eff.elabel eff) op
+        clos <- makeEffectClosure env o.opArity eff op
         addr <- alloc $ VClosure env Nothing clos
-        pure (op, addr)
-  -- Замыкания для операций
-  sayAddr           <- allocEffectCall "Output" "say" 1
-  saynAddr          <- allocEffectCall "Output" "sayn" 1
-  traceAddr         <- allocEffectCall "Output" "trace" 1
-  readStringAddr    <- allocEffectCall "Input"  "read_string" 1
-  readIntAddr       <- allocEffectCall "Input"  "read_int" 1
-  readFloatAddr     <- allocEffectCall "Input"  "read_float" 1
-  readBooleanAddr   <- allocEffectCall "Input"  "read_boolean" 1
-  randomIntAddr     <- allocEffectCall "Random" "random_int" 1
-  randomFloatAddr   <- allocEffectCall "Random" "random_float" 1
-  randomBoolAddr    <- allocEffectCall "Random" "random_boolean" 1
-  randomStringAddr  <- allocEffectCall "Random" "random_string" 1
-  timeMsAddr        <- allocEffectCall "Time"   "time_ms" 1
-  sleepAddr         <- allocEffectCall "Time"   "sleep" 1
-
-  let operations = Map.fromList $ map (\(n, a) -> (n, (Val, a))) [
-          sayAddr,
-          saynAddr,
-          traceAddr,
-          readStringAddr,
-          readIntAddr,
-          readFloatAddr,
-          readBooleanAddr,
-          randomIntAddr,
-          randomFloatAddr,
-          randomBoolAddr,
-          randomStringAddr,
-          timeMsAddr,
-          sleepAddr
-        ]
+        pure (op, (Val, addr))
+  opBindings <- fmap concat $ forM globalOps $ \(eff, ops) -> mapM (allocEffectCall eff) ops
+  let operations = Map.fromList opBindings
   st <- get
 
   let getInt :: Address -> Interp Integer
@@ -441,6 +447,15 @@ buildInitialEnv = do
       alloc $ VClosure st'.sEnv emptyCache $ \addrB -> do
         b <- getInt addrB
         alloc $ VBoolean $ a > b
+  iltAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
+      a <- getInt addrA
+      st' <- get
+      alloc $ VClosure st'.sEnv emptyCache $ \addrB -> do
+        b <- getInt addrB
+        alloc $ VBoolean $ a < b
+  notAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
+      a <- getBool addrA
+      alloc $ VBoolean $ not a
   andAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
       a <- getBool addrA
       st' <- get
@@ -453,7 +468,9 @@ buildInitialEnv = do
           ("force", forceAddr),
           ("ieq", ieqAddr),
           (">", igtAddr),
-          ("and", andAddr)
+          ("<", iltAddr),
+          ("and", andAddr),
+          ("not", notAddr)
         ]
   modifyCurrentEnv $ \e -> e {bindings = operations <> justNatives <> e.bindings}
 
@@ -468,14 +485,19 @@ evalChunk chunk = do
     let cache = case fst fd.fRet of
           Just fxs -> if isPureClosure fxs then Just Map.empty else Nothing
           _ -> Just Map.empty
-    bindValIn env0 fd.fName . VClosure env0 cache =<< makeTopLevelClosure fd
+    fn <- makeTopLevelClosure fd
+    a <- bindValIn env0 fd.fName (VClosure env0 cache fn)
+    modify $ \s -> s {sCode = Map.insert a (CodeFun (map fst $ IR.fArgs fd) (IR.fBlock fd)) s.sCode}
 
   let mainDecl = findMain chunk
   case mainDecl of
     Nothing -> liftIO (putStrLn "Warning: No 'main' function found") >> pure VNil
     Just (IR.SFunctDef mainFunct) -> do
-      resultAddr <- evalBlock (IR.fBlock mainFunct) pure
-      liftIO $ putStrLn $ T.unpack $ "evalChunk resultAddr: " <> pretty resultAddr
+      resultAddr0 <- evalBlock (IR.fBlock mainFunct) pure
+      -- результат main доводится до значения: иначе отложенный хвост (ветка if) не выполнится
+      resultAddr <- whnfAddr resultAddr0
+      reportEvents (fst $ IR.fRet mainFunct)
+      traceEval $ T.unpack $ "evalChunk resultAddr: " <> pretty resultAddr
       st' <- get
       pure $ derefUnsafe st'.sHeap resultAddr
     Just _ -> error "'main' is not a function definition"
@@ -507,59 +529,69 @@ makeClosureChain (argName:rest) block = do
         parent = Just oldEnv
       }
     modify $ \s -> s {sEnv = eid}
-    alloc $ VClosure eid (Just Map.empty) restClosure
+    allocClosure eid (Just Map.empty) (CodeFun rest block) restClosure
+
+-- | Замыкание с кодом: код нужен снимку, чтобы переписать функцию (модель: freezeV на замыканиях)
+allocClosure :: EnvId -> Maybe (Map Address Address) -> Code -> (Address -> Interp Address) -> Interp Address
+allocClosure env cache code fn = do
+  a <- alloc (VClosure env cache fn)
+  modify $ \s -> s {sCode = Map.insert a code s.sCode}
+  pure a
 
 -- | Выполнение выражения
 evalExpr :: TypedExpr -> (Address -> Interp Address) -> Interp Address
 evalExpr expr cont =
   case expr of
     TEInt i -> do
-      -- liftIO $ putStrLn $ "evalExpr [TEInt] | " <> show i
+      traceEval $ "evalExpr [TEInt] | " <> show i
       cont =<< alloc (VInt i)
     TEFloat f -> do
-      -- liftIO $ putStrLn $ "evalExpr [TEFloat] | " <> show f
+      traceEval $ "evalExpr [TEFloat] | " <> show f
       cont =<< alloc (VFloat f)
     TEBoolean b -> do
-      -- liftIO $ putStrLn $ "evalExpr [TEBoolean] | " <> show b
+      traceEval $ "evalExpr [TEBoolean] | " <> show b
       cont =<< alloc (VBoolean b)
     TEString s -> do
-      -- liftIO $ putStrLn $ "evalExpr [TEString] | " <> T.unpack s
+      traceEval $ "evalExpr [TEString] | " <> T.unpack s
       cont =<< alloc (VString s)
     TENil -> do
-      -- liftIO $ putStrLn "evalExpr [TENil]"
+      traceEval $ "evalExpr [TENil]"
       cont =<< alloc VNil
     TEXVar n _ -> do
-      -- liftIO $ putStrLn $ "evalExpr [TEXVar] | " <> T.unpack n
+      traceEval $ "evalExpr [TEXVar] | " <> T.unpack n
       env <- gets sEnv
-      cont =<< lookupRef env n
+      (_, m, a) <- findBindingEnv env n
+      when (m == Var) $ logEvent EvRead
+      cont a
     TEArray _ xs -> do
-      -- liftIO $ putStrLn $ "evalExpr [TEArray] | [" <> T.unpack (T.intercalate ", " $ map pretty xs) <> "]"
+      traceEval $ "evalExpr [TEArray] | [" <> T.unpack (T.intercalate ", " $ map pretty xs) <> "]"
       st <- get
       xs' <- mapM (\x -> alloc $ VThunk x st.sEnv) xs
       cont =<< alloc (VArray xs')
     TEPair l r -> do
       env <- gets sEnv
-      -- liftIO $ putStrLn $ "evalExpr [TEPair] | l: " <> T.unpack (pretty l) <> ", r: " <> T.unpack (pretty r)
+      traceEval $ "evalExpr [TEPair] | l: " <> T.unpack (pretty l) <> ", r: " <> T.unpack (pretty r)
       l' <- alloc $ VThunk l env
       r' <- alloc $ VThunk r env
       cont =<< alloc (VPair l' r')
     TEXLambda lam -> do
       env <- gets sEnv
-      -- liftIO $ putStrLn $ "evalExpr [TEXLambda] | " <> T.unpack (pretty lam)
+      traceEval $ "evalExpr [TEXLambda] | " <> T.unpack (pretty lam)
       body <- evalLambda env lam
       let cache = if isPureClosure lam.lFxs then Just Map.empty else Nothing
-      cont =<< alloc (VClosure env cache body)
+      cont =<< allocClosure env cache (CodeLam lam) body
     TENLambda _ -> error "TODO"
     TEApply f x -> do
-      liftIO $ putStrLn $ "evalExpr [TEApply] | f: " <> T.unpack (pretty f) <> ", x: " <> T.unpack (pretty x)
+      traceEval $ "evalExpr [TEApply] | f: " <> T.unpack (pretty f) <> ", x: " <> T.unpack (pretty x)
       fAddr <- force =<< evalExpr f pure
       xAddr <- delayArg x
       st <- get
       case derefUnsafe st.sHeap fAddr of
-        VClosure env' (Just cache) clos ->
-          case Map.lookup xAddr cache of
+        VClosure env' (Just cache) clos -> do
+          noMemo <- gets sNoMemo
+          case (if noMemo then Nothing else Map.lookup xAddr cache) of
             Just cached -> do
-              liftIO $ putStrLn $ concat [
+              traceEval $ concat [
                   "evalExpr [TEApply] | fAddr: ",
                   T.unpack $ pretty fAddr,
                   ", xAddr: ",
@@ -584,6 +616,7 @@ evalExpr expr cont =
         _ -> error "Not a function"
     TERecord _ ps -> do
       st <- get
+      when (any (\p -> p.terMut == Var) ps) $ logEvent EvCreate
       triples <- mapM (\p -> (p.terMut, p.terName, ) <$> alloc (VThunk p.terExpr st.sEnv)) ps
       eid <- newEnv Env {
         bindings = Map.fromList [(n, (m, a)) | (m, n, a) <- triples],
@@ -591,25 +624,26 @@ evalExpr expr cont =
       }
       cont =<< alloc (VRecord eid)
     TEPropAccess r x -> do
-      rAddr0 <- evalExpr r pure
-      h0 <- gets sHeap
-      rAddr <- case deref h0 rAddr0 of
-        Just (VThunk _ _) -> force rAddr0
-        _ -> pure rAddr0
+      rAddr <- whnf =<< evalExpr r pure
       st <- get
       case derefUnsafe st.sHeap rAddr of
         VRecord eid -> do
           env <- getEnv eid
-          case getRef env x of
-            Just a -> cont a
+          case getCell env x of
+            Just (m, a) -> do
+              when (m == Var) $ logEvent EvRead
+              cont a
             Nothing -> error $ concat ["Record doesn't have binding '", T.unpack x, "'"]
         _ -> error "Not a record"
     TEHandle (IR.Handler fx b clauses thenLam) _ -> do
       env <- gets sEnv
       thenFn <- evalLambda env thenLam
+      kstack0 <- gets sKstack
       callCC $ \finish -> do
         let finishWithThen result = do
-              liftIO $ putStrLn "running then"
+              traceEval $ "running then"
+              -- обработчик снимается до then: эффекты в then обрабатывает внешний обработчик
+              modify $ \s -> s {sKstack = kstack0}
               thenResult <- thenFn result
               modify $ \s -> s {sEnv = env}
               finish thenResult
@@ -627,9 +661,11 @@ evalExpr expr cont =
       env <- gets sEnv
       cont =<< alloc (VThunk p env)
     TEResume t _ -> do
-      st <- get
-      env <- getEnv st.sEnv
-      case lookupVar env st.sHeap "resume" of
+      -- resume живёт в окружении клаузы, а вызов идёт в его потомке: ищем по цепочке
+      env <- gets sEnv
+      rAddr <- lookupRef env "resume"
+      rVal <- derefUnsafeIn rAddr
+      case rVal of
         VClosure _ _ clos -> do
           tAddr <- evalExpr t pure
           clos tAddr
@@ -661,18 +697,18 @@ force addr = do
   heap <- gets sHeap
   case deref heap addr of
     Just (VThunk expr env') -> do
-      liftIO $ putStrLn $ "force | Forcing " <> T.unpack (pretty addr) <> ": " <> show expr
+      traceEval $ "force | Forcing " <> T.unpack (pretty addr) <> ": " <> show expr
       oldEnv <- gets sEnv
       modify $ \s -> s {sEnv = env'}
       resultAddr <- case expr of
         TEParen b -> evalBlock b pure
         _ -> evalExpr expr pure
-      liftIO $ putStrLn $ "force | resultAddr: " <> T.unpack (pretty resultAddr)
+      traceEval $ "force | resultAddr: " <> T.unpack (pretty resultAddr)
       resultAddr' <- force resultAddr
-      liftIO $ putStrLn $ "force | resultAddr': " <> T.unpack (pretty resultAddr')
+      traceEval $ "force | resultAddr': " <> T.unpack (pretty resultAddr')
       st' <- get
       let resultVal = derefUnsafe st'.sHeap resultAddr'
-      liftIO $ putStrLn $ "force | resultVal: " <> T.unpack (pretty resultVal)
+      traceEval $ "force | resultVal: " <> T.unpack (pretty resultVal)
       modify $ \s -> s {sEnv = oldEnv, sHeap = Map.insert addr resultVal s.sHeap}
       pure addr  -- возвращаем тот же адрес, но теперь там значение
     Just (VArray es) -> do
@@ -694,9 +730,29 @@ force addr = do
             Just p -> go p
             _ -> pure eid'
     Just _ -> do
-      liftIO $ putStrLn $ "force | No need to force " <> T.unpack (pretty addr)
+      traceEval $ "force | No need to force " <> T.unpack (pretty addr)
       pure addr
     Nothing -> error $ T.unpack $ "force | undead address " <> pretty addr
+
+-- | Слабая головная нормальная форма (модель: S-Expr, E-Prop): thunk вычисляется до
+--   значения, компоненты записей, массивов и пар остаются ленивыми (в отличие от force)
+whnf :: Address -> Interp Address
+whnf addr = do
+  heap <- gets sHeap
+  case deref heap addr of
+    Just (VThunk expr env') -> do
+      oldEnv <- gets sEnv
+      modify $ \s -> s {sEnv = env'}
+      resultAddr <- case expr of
+        TEParen b -> evalBlock b pure
+        _ -> evalExpr expr pure
+      resultAddr' <- whnf resultAddr
+      st' <- get
+      let resultVal = derefUnsafe st'.sHeap resultAddr'
+      modify $ \s -> s {sEnv = oldEnv, sHeap = Map.insert addr resultVal s.sHeap}
+      pure addr
+    Just _ -> pure addr
+    Nothing -> error $ T.unpack $ "whnf | undead address " <> pretty addr
 
 -- | Приводит VThunk к значению и возвращает само значение
 forceValue :: Address -> Interp Value
@@ -704,7 +760,7 @@ forceValue addr = do
   st <- get
   case deref st.sHeap addr of
     Just (VThunk expr env') -> do
-      liftIO $ putStrLn $ "forceValue | Forcing " <> T.unpack (pretty addr) <> ": " <> show expr
+      traceEval $ "forceValue | Forcing " <> T.unpack (pretty addr) <> ": " <> show expr
       oldEnv <- gets sEnv
       modify $ \s -> s {sEnv = env'}
       resultAddr <- force =<< evalExpr expr pure
@@ -713,16 +769,16 @@ forceValue addr = do
       modify $ \s -> s {sEnv = oldEnv, sHeap = Map.insert addr resultVal s.sHeap}
       pure resultVal
     Just v -> do
-      liftIO $ putStrLn $ "forceValue | No need to force " <> T.unpack (pretty addr)
+      traceEval $ "forceValue | No need to force " <> T.unpack (pretty addr)
       pure v
     Nothing -> error $ T.unpack $ "forceValue | undead address " <> pretty addr
 
 callEffect :: ECons -> Text -> [Address] -> Interp Address
 callEffect eff opName args = do
   callCC $ \k -> do
-    -- liftIO $ putStrLn $ concat [
-    --     "callEffect: ", show eff, " ", show opName, " with args [", intercalate ", " $ map show args, "]"
-    --   ]
+    traceEval $ concat [
+        "callEffect: ", show eff, " ", show opName, " with args [", intercalate ", " $ map show args, "]"
+      ]
     st <- get
     case find ((== eff) . hEffect) st.sKstack of
       Just handler -> do
@@ -826,8 +882,8 @@ evalBlock (sts, expr) cont = do
   cont result
 
 -- | Новое окружение для остатка блока: одна привязка поверх текущего
---   (модель: S-Val/Var/Imm). Ранее созданные замыкания и thunk'и остаются
---   в прежнем окружении и поэтому не видят новую привязку.
+  -- (модель: S-Val/Var/Imm). Ранее созданные замыкания и thunk'и остаются
+  -- в прежнем окружении и поэтому не видят новую привязку.
 extendEnv :: Text -> Mutability -> Address -> Interp EnvId
 extendEnv n m a = do
   cur <- gets sEnv
@@ -839,7 +895,7 @@ extendEnv n m a = do
   pure eid'
 
 -- | Аргумент применения откладывается (E-App): атомарные выражения вычисляются
---   сразу, остальные становятся thunk'ом над текущим окружением.
+  -- сразу, остальные становятся thunk'ом над текущим окружением.
 delayArg :: TypedExpr -> Interp Address
 delayArg x = case x of
   TEXVar _ _ -> evalExpr x pure
@@ -853,6 +909,11 @@ delayArg x = case x of
     env <- gets sEnv
     alloc (VThunk x env)
 
+-- | Довести отложенное вычисление по адресу до значения (без глубокого форсирования
+  -- уже вычисленных структур)
+whnfAddr :: Address -> Interp Address
+whnfAddr = whnf
+
 evalStat :: IR.Stat -> Interp ()
 evalStat stat = case stat of
   IR.Bind m n t -> do
@@ -862,6 +923,7 @@ evalStat stat = case stat of
       _ -> do
         -- thunk замкнут на окружение ДО привязки: привязки не рекурсивны
         a <- alloc $ VThunk t eid
+        when (m == Var) $ logEvent EvCreate
         void $ extendEnv n m a
   IR.Rebind n t -> do
     env <- gets sEnv
@@ -870,8 +932,10 @@ evalStat stat = case stat of
       Var -> void $ rebind n t
       _ -> error $ "Cannot assign to non-var binding: " <> T.unpack (pretty m)
   IR.Expr t -> do
-    _ <- evalExpr t pure
-    pure ()
+    -- модель (S-Expr): оператор-выражение вычисляется до слабой головной нормальной формы;
+    -- иначе эффекты в отложенных ветках if и в скобках (...) никогда не выполнятся
+    a <- evalExpr t pure
+    void $ whnfAddr a
 
 -- | Поиск привязки без ошибки (по цепочке родителей)
 findBindingMaybe :: EnvId -> Text -> Interp (Maybe (Mutability, Address))
@@ -891,34 +955,108 @@ rootEnvOf eid = do
   env <- getEnv eid
   maybe (pure eid) rootEnvOf env.parent
 
--- | Снимок (модель: snapshot). Свободные переменные ищутся по всей цепочке
---   окружений и копируются с замораживанием; у снимка нет живого родителя,
---   кроме глобального окружения (в нём только val-привязки).
-snapshot :: EnvId -> Heap -> Set Text -> Interp EnvId
-snapshot oldEnvId oldHeap liveVars = do
-  root <- rootEnvOf oldEnvId
+-- | Окружение снимка (модель: snapshot): свободные переменные ищутся по всей цепочке
+--   окружений, каждая привязка заменяется замороженной копией ячейки; живого родителя нет,
+--   кроме глобального окружения.
+snapshotEnv :: EnvId -> Set Text -> Interp EnvId
+snapshotEnv envId names = do
+  root <- rootEnvOf envId
   env <- newEnv Env {
     bindings = Map.empty,
     parent = Just root
   }
-  forM_ (Set.toList liveVars) $ \name -> do
-    found <- findBindingMaybe oldEnvId name
+  forM_ (Set.toList names) $ \name -> do
+    found <- findBindingMaybe envId name
     case found of
       -- имя связано внутри самого выражения
       Nothing -> pure ()
-      Just (m, addr) ->
-        case deref oldHeap addr of
-          Just v -> do
-            frozenVal <- freezeValue v
-            newAddr <- case v of
-              -- функции (в том числе встроенные) разделяются, а не копируются
-              VClosure {} -> pure addr
-              _ -> alloc frozenVal
-            void $ modifyEnv env $ \env' -> env' {
-              bindings = Map.insert name (freezeMutability m, newAddr) env'.bindings
-            }
-          Nothing -> error $ T.unpack $ "Undead address in snapshot: " <> pretty addr
+      Just (m, addr) -> do
+        when (m == Var) $ logEvent EvSnapRead
+        addr' <- freezeCell addr
+        void $ modifyEnv env $ \env' -> env' {
+          bindings = Map.insert name (freezeMutability m, addr') env'.bindings
+        }
   pure env
+
+-- | Свободные переменные кода замыкания
+codeFreeVars :: Code -> Set Text
+codeFreeVars = \case
+  CodeLam lam -> Set.delete lam.lArg (freeVarsBlock lam.lBlock)
+  CodeFun args block -> foldr Set.delete (freeVarsBlock block) args
+
+-- | Переписанный код и функция, собранная из него в окружении env'
+freezeCode :: EnvId -> Code -> Interp (Code, Address -> Interp Address)
+freezeCode env' = \case
+  CodeLam lam -> do
+    let lam' = freezeLambda lam
+    fn <- evalLambda env' lam'
+    pure (CodeLam lam', fn)
+  CodeFun args block -> do
+    let block' = freezeBlock block
+    fn <- makeClosureChain args block'
+    pure (CodeFun args block', fn)
+
+-- | Замороженная копия ячейки (модель: freezeV). Копирование транзитивно: данные,
+--   thunk'и и код замыканий, достижимые по свободным переменным. Общая таблица
+--   sFreezeMemo сохраняет разделение и обрывает циклы (рекурсия функций).
+freezeCell :: Address -> Interp Address
+freezeCell a = do
+  memo <- gets sFreezeMemo
+  case Map.lookup a memo of
+    Just a' -> pure a'
+    Nothing -> do
+      st <- get
+      v <- case deref st.sHeap a of
+        Just v0 -> pure v0
+        Nothing -> error $ T.unpack $ "Undead address in freezeCell: " <> pretty a
+      case v of
+        VClosure env cache _ ->
+          case Map.lookup a st.sCode of
+            -- встроенные операции и операции эффектов не несут изменяемого состояния
+            Nothing -> share a
+            Just code -> do
+              a' <- placeholder
+              env' <- snapshotEnv env (codeFreeVars code)
+              (code', fn') <- freezeCode env' code
+              setCell a' (VClosure env' (fmap (const Map.empty) cache) fn')
+              modify $ \s -> s {sCode = Map.insert a' code' s.sCode}
+              pure a'
+        VThunk expr env -> do
+          a' <- placeholder
+          env' <- snapshotEnv env (freeVars expr)
+          setCell a' (VThunk (freeze expr) env')
+          pure a'
+        VArray as -> do
+          a' <- placeholder
+          as' <- mapM freezeCell as
+          setCell a' (VArray as')
+          pure a'
+        VPair l r -> do
+          a' <- placeholder
+          l' <- freezeCell l
+          r' <- freezeCell r
+          setCell a' (VPair l' r')
+          pure a'
+        VRecord eid -> do
+          a' <- placeholder
+          env <- getEnv eid
+          bs <- forM (Map.toList env.bindings) $ \(n, (m, x)) -> do
+            when (m == Var) $ logEvent EvSnapRead
+            x' <- freezeCell x
+            pure (n, (freezeMutability m, x'))
+          eid' <- newEnv Env {bindings = Map.fromList bs, parent = Nothing}
+          setCell a' (VRecord eid')
+          pure a'
+        -- литералы и прочие значения неизменяемы: разделяются
+        _ -> share a
+  where
+    remember x y = modify $ \s -> s {sFreezeMemo = Map.insert x y s.sFreezeMemo}
+    share x = remember x x >> pure x
+    placeholder = do
+      a' <- alloc VBottom
+      remember a a'
+      pure a'
+    setCell x val = modify $ \s -> s {sHeap = Map.insert x val s.sHeap}
 
 -- | Модель (S-Rebind): привязка перенаправляется в том окружении, где она
 --   объявлена, на новую ленивую ячейку; правая часть видит старую привязку.
@@ -934,6 +1072,7 @@ rebind x t = do
       }
       addr' <- alloc $ VThunk t rhsEnv
       _ <- modifyEnv ex $ \env -> env {bindings = Map.insert x (Var, addr') env.bindings}
+      logEvent EvRebind
       pure addr'
     _ -> error $ concat ["Cannot rebind '", T.unpack x, "': it's ", T.unpack $ pretty m]
 
@@ -943,6 +1082,42 @@ allocIn st v =
       addr = Address addri
       heap' = Map.insert addr v st.sHeap
   in (st {sHeap = heap', sNextAddr = addri + 1}, addr)
+
+-- | Трассировка вычислений: включается переменной окружения MARRAN_TRACE
+traceEval :: String -> Interp ()
+traceEval msg = do
+  on <- gets sTrace
+  when on $ liftIO $ putStrLn msg
+
+-- | Запись события мутации (счётчики по видам событий)
+logEvent :: Event -> Interp ()
+logEvent ev = modify $ \s -> s {sEvents = Map.insertWith (+) ev 1 s.sEvents}
+
+-- | Проверка теоремы об эффектах на выполнении: каждое событие мутации должно быть разрешено
+--   объявленным рядом main. Включается переменной MARRAN_CHECK_EVENTS. Открытый ряд не проверяется.
+reportEvents :: Maybe EffRow -> Interp ()
+reportEvents declared = do
+  chk <- liftIO $ isJust <$> lookupEnv "MARRAN_CHECK_EVENTS"
+  when chk $ do
+    evs <- gets sEvents
+    let count e = Map.findWithDefault 0 e evs
+        reads' = count EvRead + count EvSnapRead
+    liftIO $ putStrLn $ concat [
+        "EVENTS: read=", show (count EvRead),
+        " snapshot-read=", show (count EvSnapRead),
+        " rebind=", show (count EvRebind),
+        " create=", show (count EvCreate)
+      ]
+    case declared of
+      Just (RClosed cs) -> do
+        let has n = EffCons (Eff.elabel n) `elem` cs
+            bad = [ "Read" | reads' > 0, not (has "Read") ]
+               <> [ "Rebind" | count EvRebind > 0, not (has "Rebind") ]
+               <> [ "Var/Cell" | count EvCreate > 0, not (has "Var" || has "Cell") ]
+        liftIO $ putStrLn $
+          if null bad then "EVENTS: licensed"
+          else "EVENT-VIOLATION: not in the declared row: " <> intercalate ", " bad
+      _ -> liftIO $ putStrLn "EVENTS: declared row is open or missing, not checked"
 
 alloc :: Value -> Interp Address
 alloc v = do
@@ -977,8 +1152,11 @@ bindVarAddrIn e x a = do
 bindImm :: Text -> TypedExpr -> Interp Address
 bindImm name expr = do
   st <- get
-  let liveVars = freeVars expr
-  frozenEnv <- snapshot st.sEnv st.sHeap liveVars
+  -- общая таблица копий на один снимок: сохраняет разделение и обрывает циклы (рекурсивные функции)
+  saved <- gets sFreezeMemo
+  modify $ \s -> s {sFreezeMemo = Map.empty}
+  frozenEnv <- snapshotEnv st.sEnv (freeVars expr)
+  modify $ \s -> s {sFreezeMemo = saved}
   addr <- alloc $ VThunk expr frozenEnv
   _ <- extendEnv name Imm addr
   pure addr
@@ -1004,34 +1182,6 @@ lookupMut :: EnvId -> Text -> Interp Mutability
 lookupMut e name = do
   (_, m, _) <- findBindingEnv e name
   pure m
-
-freezeValue :: Value -> Interp Value
-freezeValue v = do
-  st <- get
-  imm <- isImmutableValue st.sHeap v
-  if imm
-    then pure v
-    else case v of
-      VArray addrs -> do
-        vals <- forM addrs $ \a ->
-          maybe (error $ T.unpack $ "Undead address: " <> pretty a) freezeValue $ deref st.sHeap a
-        VArray <$> mapM alloc vals
-      VPair l r -> do
-        lVal <- maybe (error $ T.unpack $ "Undead address in pair left: " <> pretty l) freezeValue $ deref st.sHeap l
-        rVal <- maybe (error $ T.unpack $ "Undead address in pair right: " <> pretty r) freezeValue $ deref st.sHeap r
-        VPair <$> alloc lVal <*> alloc rVal
-      VRecord eid -> do
-        env <- getEnv eid
-        env' <- forM (Map.toList env.bindings) $ \(name, (m, addr)) -> do
-          val <- maybe (error $ T.unpack $ "Undead address: " <> pretty addr) freezeValue $ deref st.sHeap addr
-          newAddr <- alloc val
-          pure (name, (freezeMutability m, newAddr))
-        VRecord <$> newEnv Env {
-          bindings = Map.fromList env',
-          parent = Nothing
-        }
-      VThunk expr eid -> VThunk (freeze expr) <$> snapshot eid st.sHeap (freeVars expr)
-      other -> pure other
 
 freeVars :: TypedExpr -> Set Text
 freeVars = \case

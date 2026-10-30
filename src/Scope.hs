@@ -244,9 +244,21 @@ globalScope args = do
       (NativeLambdaSign "a" TBoolean (tfunc TBoolean TBoolean) Eff.empty)
       scope9
   
-  do
-    addPureBinding
-      ">"
-      (tfunc TInt $ tfunc TInt TBoolean)
-      (NativeLambdaSign "a" TInt (tfunc TInt TBoolean) Eff.empty)
-      scope10
+  scope11 <- addPureBinding
+    ">"
+    (tfunc TInt $ tfunc TInt TBoolean)
+    (NativeLambdaSign "a" TInt (tfunc TInt TBoolean) Eff.empty)
+    scope10
+  
+  scope12 <- addPureBinding
+    "<"
+    (tfunc TInt $ tfunc TInt TBoolean)
+    (NativeLambdaSign "a" TInt (tfunc TInt TBoolean) Eff.empty)
+    scope11
+  
+  addBinding
+    "random_int"
+    (Scheme [] [] [] $ TFunct $ Funct TInt (TFunct $ Funct TInt TInt Eff.fxRandom) Eff.empty)
+    (NLambda $ NativeLambdaSign "a" TInt (TFunct $ Funct TInt TInt Eff.fxRandom) Eff.empty)
+    Val
+    scope12

@@ -2,81 +2,31 @@ row Mutation = {Var; Cell; Read; Rebind}
 row Io = {Input; Output}
 row Main = {... Mutation; ... Io | `R}
 
-funct apply (f `A -> `R `B) (x `A) : `R `B = f x
+funct while (pred () -> Main Boolean) (do () -> Main ()) : Main ()
+  = if pred () then (do (); while pred do) else ()
 
-
-
-/|
-funct guess_game () : {Input; Output; Random} () =
+funct guess_game () : Main () =
   val secret = random_int 1 100;
   var attempts = 0;
   var guessed = false;
   
   sayn 'Guess the number (1-100)';
+  sayn 'Enter your guess:';
   while {not guessed}
   {
-    sayn 'Enter your guess:';
-    val guess = read_int ();
+    val guess = force $ read_int ();
     attempts := + 1 attempts;
-    if eq guess secret then (
+    if ieq guess secret then (
       guessed := true;
       say 'Correct! You took '; say attempts; sayn ' attempts.'
     )
-    else if lt guess secret then
+    else if < guess secret then
       sayn 'Too low!'
     else
-    sayn 'Too high!'
-  }
-|\
-
-funct while
-  (pred () -> Main Boolean)
-  (do () -> Main ())
-  : Main ()
-  = if pred () then while pred do else ()
-
-funct guess_game () : Main () =
-  var i = 10;
-  force $ while {/|> i 0|\i; false} {
-    say 'i: '; sayn i;
-    i := - i 1;
-    ()
+      sayn 'Too high!'
   }
 
-funct main () : Main () = apply + 3 2
-
-//| funct while
-//|   (pred () -> Main Boolean)
-//|   (do () -> Main ())
-//|   : Main ()
-//|   = if pred () then while pred do else ()
-
-//| funct main () : {Output; Read; Rebind; Var} () =
-//|   val a = counter ();
-//|   val b = counter ();
-//|   force $ sayn $ a ();
-//|   force $ sayn $ a ();
-//|   force $ sayn $ b ()
-
-//| type NonEmptyTree[T] = #{
-//|   var v : `T;
-//|   val tail : [NonEmptyTree[`T]]
-//| }
-
-//| funct make_tree [T] (first `T) (rest [`T]) : NonEmptyTree[`T] =
-//|   #{
-//|     var v = first;
-//|     val tail = if empty rest then [] else [make_tree rest]
-//|   }
-
-//| effect Math
-//|   add : Int -> Int -> Int;
-//|   sub : Int -> Int -> Int
-//| end
-
-//| funct make () : {Var} () -> {Rebind} Int =
-//|   var x = 9; {x := + x 1; x}
-
-//| funct foo () : {Var} () = imm f = make (); ()
-
-//| funct create () : () -> {Var} Int = {var x = 5; x}
+funct main () : Main () =
+  val add = {a b = + a b};
+  sayn $ add 5 3
+  //|force $ guess_game ()
