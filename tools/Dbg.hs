@@ -35,7 +35,7 @@ main = do
       putStrLn "usage: dbg <file.marr>"
       exitFailure
   src <- TIO.readFile path
-  case parseFromTextNamed (T.pack (takeFileName path)) chunk src of
+  case parseFromTextNamed (takeFileName path) chunk src of
     Left e -> putStrLn e
     Right parsed -> do
       let Right elab = evalState (runExceptT (elaborate parsed)) (ElabState 0)
