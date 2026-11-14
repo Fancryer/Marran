@@ -1514,8 +1514,11 @@ matchPattern pat addr = do
     LPATom (ALPUnderscore; ALPNil) -> pure []
     LPATom (ALPPair l r) -> case v of
       VPair addrL addrR -> do
-        bindL <- matchPattern l addrL
-        bindR <- matchPattern r addrR
+        -- A component is a cell of its own and may still be a thunk.  It is
+        -- forced only when the nested pattern has to inspect it, so
+        -- `let (a, b) = p` with two names stays as lazy as `let a = ...`.
+        bindL <- matchPattern l =<< valueIfNeeded l addrL
+        bindR <- matchPattern r =<< valueIfNeeded r addrR
         pure (bindL <> bindR)
       _ -> rtError $ "this pattern expects a pair, but the value is " <> describe v
     LPATom (ALPRecord props) -> case v of
@@ -1527,12 +1530,17 @@ matchPattern pat addr = do
                 case mPat of
                   Nothing -> pure $ (n, m, fieldAddr) : acc
                   Just subPat -> do
-                    subBindings <- matchPattern (LPATom subPat) fieldAddr
+                    let nested = LPATom subPat
+                    subBindings <- matchPattern nested =<< valueIfNeeded nested fieldAddr
                     pure $ acc <> subBindings
               Nothing -> rtError $ "this pattern names the field `" <> n <> "`, which the record does not have"
           ) [] props
       _ -> rtError $ "this pattern expects a record, but the value is " <> describe v
     LPParam (LambdaParam n _) -> pure [(n, Val, addr)]
+
+-- | Force a cell only if the pattern about to match it destructures.
+valueIfNeeded :: LetPattern -> Address -> Interp Address
+valueIfNeeded pat addr = if needsValue pat then whnf addr else pure addr
 
 isImmutableValue :: Heap -> Value -> Interp Bool
 isImmutableValue heap v = evalStateT (go v) IntMap.empty

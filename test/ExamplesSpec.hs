@@ -477,6 +477,35 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
           "a pair pattern must force its right-hand side: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe` ["3"]
 
+    it "destructures nested components of a pair" $ do
+      -- A component of a pair is a cell of its own; a nested pattern has to
+      -- force it before matching, or the interpreter reports that it expects
+      -- a pair but sees an unevaluated expression.
+      r <- runSourceWithInput "let_pair_nested.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val p = (1, (2, 3));"
+        , "  let (a, (b, c)) = p in"
+        , "    sayn (+ a (+ b c))"
+        ]
+      case r of
+        Left err -> expectationFailure $
+          "a nested component has to be forced: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["6"]
+
+    it "does not force a component that the pattern does not inspect" $ do
+      -- Only a destructuring pattern needs the value.  A name pattern keeps
+      -- the cell, so a component that would diverge stays unevaluated.
+      r <- runSourceWithInput "let_pair_lazy_component.marr" "" $ T.unlines
+        [ "funct spin (n Int) : Int = spin n"
+        , "funct main () : {Output} () ="
+        , "  let (a, b) = (spin 1, 2) in"
+        , "    sayn b"
+        ]
+      case r of
+        Left err -> expectationFailure $
+          "a name pattern must not force its component: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["2"]
+
     it "destructures a record that the right-hand side does not spell out" $ do
       r <- runSourceWithInput "let_record_thunk.marr" "" $ T.unlines
         [ "funct main () : {Output; Var; Read; Cell} () ="
@@ -489,6 +518,18 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> expectationFailure $
           "a record pattern must force its right-hand side: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe` ["7"]
+
+    it "destructures a nested record field" $ do
+      r <- runSourceWithInput "let_record_nested.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val r = #{ val b = #{ val c = 2 } };"
+        , "  let #{ val b } = r in"
+        , "    sayn b@c"
+        ]
+      case r of
+        Left err -> expectationFailure $
+          "a nested record field has to be forced: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["2"]
 
     it "does not leak the alias row out of the let body" $ do
       -- `let y = x in y` reads the var inside the block and returns an Int, so
