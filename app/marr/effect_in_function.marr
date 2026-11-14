@@ -1,0 +1,14 @@
+//| Эффект объявлен один раз, а выполняется в функции: `ask` видна там, где
+//| объявлен `effect`, и функция называет эффект в своём ряду.
+//| Ожидается вывод: 3
+effect Doubt
+  ask : Int -> Int
+end
+
+funct twice () : {Doubt} Int = + (ask 1) (ask 2)
+
+funct main () : {Output} () =
+  sayn (under Doubt to twice ()
+  handle
+  | ask x => resume x
+  | then s => s)

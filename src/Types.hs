@@ -269,7 +269,14 @@ instance Pretty EffCons where
     EffCons e -> pretty e
     EVar n -> "`" <> tasteName n
 
-data EffDef = EffDef Text [Text] [(Text, Funct)] deriving Show
+-- | A declared effect: its name, the type parameters it abstracts over, and
+--   its operations.
+--
+--   The parameters are kept as 'Taste's, not as names, because the operations
+--   of the effect mention them by taste: a use site @Loop[Int]@ has to
+--   replace exactly the variables the declaration bound, and two different
+--   declarations may well use the same parameter name.
+data EffDef = EffDef Text [Taste] [(Text, Funct)] deriving Show
 
 effName :: EffDef -> Text
 effName (EffDef n _ _) = n
@@ -279,7 +286,7 @@ instance Pretty EffDef where
     T.concat [
       "effect ",
       n,
-      if null ts then " " else "[" <> T.intercalate "; " ts <> "] ",
+      if null ts then " " else "[" <> T.intercalate "; " (map tasteName ts) <> "] ",
       T.intercalate "; " $ map (\(n', f) -> n' <> " : " <> pretty f) ops,
       " end"
     ]

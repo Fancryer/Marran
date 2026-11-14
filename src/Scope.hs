@@ -20,6 +20,9 @@ module Scope (
   hasHandler,
   addBinding,
   addBindingWithRow,
+  bindLocal,
+  findOperations,
+  operationNames,
   addType,
   addEffect,
   addHandler,
@@ -181,6 +184,58 @@ addBindingWithRow name typ expr mut row scope =
     throwTypeCheckError $ SameScopeBindingShadowing $ "Cannot shadow a `" <> name <> "` binding in the same scope!"
   else
     pure $ scope {values = Map.insert name (ValueBinding typ expr mut row) scope.values}
+
+-- | Insert a binding, shadowing whatever the current scope already has under
+--   that name.
+--
+--   The checker's own bookkeeping uses this, not programs: an operation name
+--   is a legitimate collision (two effects may declare the same operation, and
+--   a row then decides which one a use means), while a user declaration that
+--   repeats a name in one scope is a mistake 'addBinding' reports.
+bindLocal :: Text -> TypeScheme -> Expr -> Mutability -> Scope -> Scope
+bindLocal name typ expr mut scope =
+  scope {values = Map.insert name (ValueBinding typ expr mut Eff.empty) scope.values}
+
+-- | The operations this name denotes, from the innermost scope that declares
+--   any.
+--
+--   An operation is not a value binding: `effect A` and `effect B` may both
+--   declare `ping`, and which one a use means is decided by the row, not by the
+--   order of declarations.  A real binding of the same name — an argument, or
+--   the operation a row licensed — shadows this, and callers look in
+--   'findBinding' first.
+findOperations :: Bool -> Scope -> Text -> [(Text, [Taste], Funct)]
+findOperations uptop scope name = go scope
+  where
+    go :: Scope -> [(Text, [Taste], Funct)]
+    go sc = case here sc of
+      [] -> case (uptop, sc.parent) of
+        (True, Just p) -> go p
+        _ -> []
+      found -> found
+
+    here :: Scope -> [(Text, [Taste], Funct)]
+    here sc =
+      [ (effN, params, opType)
+      | (effN, EffDef _ params ops) <- Map.toList sc.effects
+      , (opN, opType) <- ops
+      , opN == name
+      ]
+
+-- | Every operation name the declared effects in scope provide, for a "did you
+--   mean?" hint when a name is not bound.
+operationNames :: Scope -> [Text]
+operationNames = go
+  where
+    go :: Scope -> [Text]
+    go sc =
+      let here' =
+            [ opN
+            | EffDef _ _ ops <- Map.elems sc.effects
+            , (opN, _) <- ops
+            ]
+          outer = maybe [] go sc.parent
+      in here' <> filter (`notElem` here') outer
 
 addType :: Text -> Typ -> Scope -> TypeCheckM Scope
 addType name typ scope =

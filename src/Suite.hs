@@ -59,6 +59,7 @@ cases =
   , ("imm_recursion",     ["15"])
   , ("row_poly",          ["hello", "42"])
   , ("under",             ["1"])
+  , ("effect_in_function", ["3"])
   ]
 
 -- | The program that the type checker must reject; the error must name @Read@.

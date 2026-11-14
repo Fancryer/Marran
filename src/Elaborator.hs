@@ -43,7 +43,17 @@ import qualified Suggest
 data FlatRow = FlatRow [Types.EffCons] (Maybe Taste)
 data TypeAliasDef = TypeAliasDef [Text] Ast.Typ
 
-type RowEnv = [(String, Ast.EffRow)]
+-- | The rows and effects a chunk declares.
+--
+--   The effect names are kept next to the row aliases so that a name used in
+--   row position can be told apart from a misspelled alias: `{Doubt}` names a
+--   row that contains the effect @Doubt@, while a bare @Doubt@ is not a row at
+--   all, because an effect is not a row.
+data RowEnv = RowEnv {
+  rowAliases :: [(String, Ast.EffRow)],
+  declaredEffects :: [String]
+}
+
 type TypEnv = [(String, TypeAliasDef)]
 data ElabEnv = ElabEnv {
   _typBounds :: TextMap Taste,
@@ -178,10 +188,12 @@ elaborate (Ast.Chunk stats) = do
   mapM (elaborateTopLevelStat rowEnv typEnv) stats
 
 collectRowEnv :: [Ast.TopLevelStat] -> ElabM RowEnv
-collectRowEnv = foldM go []
+collectRowEnv stats = RowEnv <$> foldM addRow [] stats <*> pure effectNames
   where
-    go :: RowEnv -> Ast.TopLevelStat -> ElabM RowEnv
-    go acc stat = case stat of
+    effectNames = [ T.unpack n | Ast.EffectDef _ n _ _ <- stats ]
+
+    addRow :: [(String, Ast.EffRow)] -> Ast.TopLevelStat -> ElabM [(String, Ast.EffRow)]
+    addRow acc stat = case stat of
       Ast.RowDef _ n row -> do
         let name = T.unpack n
         when (any ((name ==) . fst) acc) $
@@ -211,9 +223,13 @@ elaborateTopLevelStat' env renv tenv = \case
     let env' = extendTyp ts' env
     Types.STypeDef sp n (coerce ts) <$> elaborateType' renv tenv env' [] t
   Ast.EffectDef sp n ts ops -> do
+    -- The effect's parameters become rigid variables of its operations, so the
+    -- declaration records the variables themselves: a use `Loop[Int]` has to
+    -- substitute exactly these, and matching them by name would confuse two
+    -- effects that both call a parameter `T`.
     ts' <- for (coerce ts) $ \nm -> (nm,) <$> freshBound nm
     let env' = extendTyp ts' env
-    Types.SEffDef sp . Types.EffDef n (coerce ts)
+    Types.SEffDef sp . Types.EffDef n (map snd ts')
       <$> forM ops (\(Ast.EffectOp n' t) -> (n',) <$> elaborateFunct renv tenv env' t)
   Ast.RowDef sp n fxs ->
     Types.SRowDef sp . Types.RowDef n <$> elaborateEffRow' renv tenv env fxs
@@ -768,11 +784,20 @@ flattenEffRow :: RowEnv -> TypEnv -> ElabEnv -> [String] -> Ast.EffRow -> ElabM 
 flattenEffRow renv tenv env visiting = \case
   Ast.ERAlias n ->
     let name = T.unpack n
+        aliases = rowAliases renv
     in if name `elem` visiting then
       elabError $ "Cyclic row alias: " <> name
     else
-      case lookup name renv of
-        Nothing -> case Suggest.suggestionNote (map (T.pack . fst) renv) (T.pack name) of
+      case lookup name aliases of
+        -- An effect is not a row: `{Doubt}` names a row containing the effect,
+        -- but a bare `Doubt` in row position would mean "the row of Doubt",
+        -- which does not exist.  The name is declared, so the mistake is not a
+        -- typo and must not be reported as an unknown alias.
+        Nothing | name `elem` declaredEffects renv ->
+          elabError $ printf
+            "`%s` is an effect, not a row: write `{%s}` to put it in a row"
+            name name
+        Nothing -> case Suggest.suggestionNote (map (T.pack . fst) aliases) (T.pack name) of
           Just hint -> elabError $ "Unknown row alias: " <> name <> "; " <> T.unpack hint
           Nothing -> elabError $ "Unknown row alias: " <> name
         Just row -> flattenEffRow renv tenv env (name : visiting) row

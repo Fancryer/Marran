@@ -695,6 +695,81 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Right out -> filter (not . isReport) (lines out) `shouldBe`
           ["[1, 2]", "[[a], [b, c]]", "[(1, 2), (3, 4)]", "#{val xs = [1]}"]
 
+  describe "effects visible where they are declared" $ do
+    it "runs an operation from a function that names the effect in its row" $ do
+      r <- runSourceWithInput "effect_in_function.marr" "" $ T.unlines
+        [ "effect Doubt"
+        , "  ask : Int -> Int"
+        , "end"
+        , ""
+        , "funct twice () : {Doubt} Int = + (ask 1) (ask 2)"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (under Doubt to twice ()"
+        , "  handle"
+        , "  | ask x => resume x"
+        , "  | then s => s)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the effect must be callable from a function: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["3"]
+
+    it "charges the effect of an operation to the caller" $ do
+      -- `ask` may only be called where `Doubt` is allowed: the operation's own
+      -- declared type says nothing about the effect, so the row does.
+      r <- runSourceWithInput "effect_unlicensed.marr" "" $ T.unlines
+        [ "effect Doubt"
+        , "  ask : Int -> Int"
+        , "end"
+        , ""
+        , "funct twice () : Int = + (ask 1) (ask 2)"
+        , ""
+        , "funct main () : {Output} () = sayn (twice ())"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Doubt" `isInfixOf`)
+        Right out -> expectationFailure $
+          "calling an operation without its effect in the row must be rejected; got output: "
+            ++ take 300 out
+
+    it "rejects a bare effect name in row position, suggesting `{Doubt}`" $ do
+      r <- runSourceWithInput "effect_as_row.marr" "" $ T.unlines
+        [ "effect Doubt"
+        , "  ask : Int -> Int"
+        , "end"
+        , ""
+        , "funct twice () : Doubt Int = + (ask 1) (ask 2)"
+        , ""
+        , "funct main () : {Output} () = sayn (twice ())"
+        ]
+      case r of
+        Left err -> do
+          err `shouldSatisfy` ("not a row" `isInfixOf`)
+          err `shouldSatisfy` ("{Doubt}" `isInfixOf`)
+          err `shouldSatisfy` (not . ("Unknown row alias" `isInfixOf`))
+        Right out -> expectationFailure $
+          "an effect is not a row; got output: " ++ take 300 out
+
+    it "still lets a row alias name a row of effects" $ do
+      r <- runSourceWithInput "effect_row_alias.marr" "" $ T.unlines
+        [ "effect Doubt"
+        , "  ask : Int -> Int"
+        , "end"
+        , ""
+        , "row D = {Doubt}"
+        , ""
+        , "funct twice () : {...D} Int = + (ask 1) (ask 2)"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (under Doubt to twice ()"
+        , "  handle"
+        , "  | ask x => resume x"
+        , "  | then s => s)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a row alias over an effect must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["3"]
+
   it (rejectedProgram ++ " is rejected with the missing Read effect") $ do
     r <- runProgram rejectedProgram
     case r of

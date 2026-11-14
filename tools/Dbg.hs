@@ -37,8 +37,10 @@ main = do
   src <- TIO.readFile path
   case parseFromTextNamed (takeFileName path) chunk src of
     Left e -> putStrLn e
-    Right parsed -> do
-      let Right elab = evalState (runExceptT (elaborate parsed)) (ElabState 0)
-      case evalTypeCheckM (inferChunk [] elab) (TypeCheckState (0,0,0) 0 []) of
-        Left e -> print e
-        Right ir -> putStrLn (T.unpack (pretty ir))
+    Right parsed ->
+      case evalState (runExceptT (elaborate parsed)) (ElabState 0) of
+        Left e -> putStrLn (T.unpack (pretty e))
+        Right elab ->
+          case evalTypeCheckM (inferChunk [] elab) (TypeCheckState (0,0,0) 0 []) of
+            Left e -> print e
+            Right ir -> putStrLn (T.unpack (pretty ir))

@@ -69,6 +69,7 @@ import Types(
     effName,
     FunctDecl(..),
     tfunc, ECons (..), countArgs, monoScheme, EffDef(..),
+    TARecordProp(TARecordProp),
     typeArgToTyp
   )
 import qualified Data.Map as Map
@@ -302,30 +303,44 @@ effectDeclaration = Scope.findEff True
 
 -- | Replace the type parameters of an effect with the arguments of one use.
 --
---   The declared parameter names are recovered from the operation types: an
---   effect's operations only ever mention the effect's own parameters as
---   `Bound` variables, so matching by name is exact.
-instantiateOps :: EffDef -> [TypeArg] -> [(Text, Funct)]
-instantiateOps (EffDef _ params ops) args
+--   The declaration records the variables themselves, so the substitution is
+--   by identity and not by name: two effects that both call a parameter @T@
+--   stay apart.  The parameters also occur in the latent rows of the
+--   operations (the operation performs its own effect), so rows and effect
+--   constructors are rewritten too.
+instantiateOps :: [Taste] -> [(Text, Funct)] -> [TypeArg] -> [(Text, Funct)]
+instantiateOps params ops args
   | null params && null args = ops
   | length params /= length args = ops
   | otherwise =
-      let subst = Map.fromList (zip params (map typeArgToTyp args))
+      let subst = Map.fromList (zip params args)
+          goArg :: TypeArg -> TypeArg
+          goArg = \case
+            TAVar v -> Map.findWithDefault (TAVar v) v subst
+            TAArray t -> TAArray (goArg t)
+            TAPair l r -> TAPair (goArg l) (goArg r)
+            TAFunct i o -> TAFunct (goArg i) (goArg o)
+            TARecord ps -> TARecord [TARecordProp m n (goArg t) | TARecordProp m n t <- ps]
+            a -> a
+          goCons :: EffCons -> EffCons
+          goCons = \case
+            EffCons (ECons n as) -> EffCons (ECons n (map goArg as))
+            e@(EVar _) -> e
+          goRow :: EffRow -> EffRow
+          goRow = \case
+            RClosed cs -> RClosed (map goCons cs)
+            ROpen cs v -> ROpen (map goCons cs) v
+            RVar v -> RVar v
           go :: Typ -> Typ
           go = \case
-            TVar (Bound n _) -> Map.findWithDefault (TVar (Bound n 0)) n subst
-            TVar v -> TVar v
+            TVar v -> maybe (TVar v) typeArgToTyp (Map.lookup v subst)
             TArray t r -> TArray (go t) (goRow r)
             TPair l r fx -> TPair (go l) (go r) (goRow fx)
             TFunct (Funct i o fxs) -> TFunct (Funct (go i) (go o) (goRow fxs))
             TRecord props fx -> TRecord [TRecordProp m n (go t) | TRecordProp m n t <- props] (goRow fx)
             TForall ts es rs els rls t -> TForall ts es rs els rls (go t)
             t -> t
-          goRow = \case
-            RClosed cs -> RClosed cs
-            ROpen cs v -> ROpen cs v
-            RVar v -> RVar v
-      in [ (n, Funct (go i) (go o) fxs) | (n, Funct i o fxs) <- ops ]
+      in [ (n, Funct (go i) (go o) (goRow fxs)) | (n, Funct i o fxs) <- ops ]
 
 substituteType :: Scope -> Taste -> TypeArg -> Scope
 substituteType scope taste typ = scope {typeArgSubst = Map.insert taste typ scope.typeArgSubst}
@@ -533,8 +548,25 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
   Nil -> pure  $ InferResult TENil Eff.empty scope
   XVar v -> do
     (bindingT, pending, scope', mut) <- case Scope.findBindingWithRow True scope v of
-      Nothing -> throwTypeCheckErrorWithNotes (UndefinedVariable v)
-        (maybe [] pure (suggestionNote (Scope.bindingNames scope) v))
+      Nothing -> case Scope.findOperations True scope v of
+        -- An operation of a declared effect.  Using it is performing its
+        -- effect, so the use charges that effect (just as reading a `var`
+        -- charges `Read`); the operation's declared type says nothing about
+        -- it, because `effect Doubt ask : Int -> Int` reads as "a call takes
+        -- an Int and gives an Int", not as "and does nothing else".  That is
+        -- what lets a function declare the effect in its row and what `under`
+        -- removes from the body it handles.
+        [] -> throwTypeCheckErrorWithNotes (UndefinedVariable v)
+          (maybe [] pure (suggestionNote (Scope.bindingNames scope <> Scope.operationNames scope) v))
+        [(eff, params, opTyp)] -> do
+          let scheme = Scheme params [] [] Map.empty Map.empty (TFunct opTyp)
+          (t, sc) <- instantiateTypeScheme scope scheme
+          pure (t, Eff.closedOfFlat eff, sc, Val)
+        candidates -> throwTypeCheckError $ InferenceError $ T.concat [
+            "the operation `", v, "` is declared by more than one effect ("
+          , T.intercalate ", " [ "`" <> n <> "`" | (n, _, _) <- candidates ]
+          , "), so a use of it is ambiguous: name its effect in a row, or handle it"
+          ]
       Just (ValueBinding scheme _ mut' row) -> do
         -- The pending row belongs to the delayed computation, so it must be
         -- instantiated together with the scheme: a @val@ binding can be
@@ -905,10 +937,10 @@ inferHandler scope handler = withNewLevel $
         HandlerError $
           T.concat ["`", tasteName v, "` is an effect variable, not an effect, so it cannot be handled"]
     eff@(EffCons eff'@(ECons n effArgs)) -> do
-      decl <- case effectDeclaration scope n of
+      decl@(EffDef _ params declaredOps) <- case effectDeclaration scope n of
         Nothing -> throwTypeCheckError $ HandlerError $ "there is no effect named `" <> n <> "` in scope"
         Just d -> pure d
-      let ops = instantiateOps decl effArgs
+      let ops = instantiateOps params declaredOps effArgs
       let opNames = map fst ops
       -- 2. Создаём подскоуп с операциями
       let blockScope = enterScope scope
@@ -917,7 +949,7 @@ inferHandler scope handler = withNewLevel $
         foldM
           (\sc (name, typ) -> do
             opT <- generalize sc $ TFunct typ
-            Scope.addBinding name opT (XVar name) Val sc
+            pure $ Scope.bindLocal name opT (XVar name) Val sc
           )
           blockScope
           ops
@@ -1141,7 +1173,8 @@ withRowOperations scope typ = do
   addEffectOps (sc, seen) = \case
     EffCons (ECons name args) -> case effectDeclaration sc name of
       Nothing -> pure (sc, seen)
-      Just decl -> foldM (bindOp name) (sc, seen) (instantiateOps decl args)
+      Just (EffDef _ params ops) ->
+        foldM (bindOp name) (sc, seen) (instantiateOps params ops args)
     EVar _ -> pure (sc, seen)
 
   bindOp opEff (sc, seen) (opName, opTyp)
