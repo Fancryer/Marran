@@ -131,7 +131,7 @@ close to anything also stays opaque and fails later at unification.
 | E0015 | a record error (an unknown field, a non-record base, a field whose mutability changes) |
 | E0016 | a handler error (an operation the effect does not declare, a missing or repeated clause) |
 | E0017 | an application or arity error (`with` arguments, an effect parameter list, a non-function head) |
-| E0018 | an inference limitation (an occurs check, an escaping rigid variable, a binding that cannot be generalised) |
+| E0018 | an inference limitation (an occurs check, an escaping rigid variable, a failed instantiation, a forbidden effect in a constrained row, or an operation name provided by two effects in the same row) |
 
 Errors raised by the elaborator (the phase between the parser and the type
 checker) carry a message but no code: they are about the shape of the program

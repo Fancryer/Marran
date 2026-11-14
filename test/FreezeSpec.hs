@@ -257,14 +257,15 @@ fSpec = do
     it "freezes latent effects inside nested function types" $
       runWithScope (\scope -> do
         r <- freshMetaM
-        let typ = TArray $
-              TFunct $ Funct TInt TInt $
-                ROpen [label "Read", label "IO", label "Var"] r
+        let typ = TArray
+              (TFunct $ Funct TInt TInt $
+                ROpen [label "Read", label "IO", label "Var"] r)
+              (RClosed [])
         (scope', frozen) <- Infer.freezeTyp scope typ
         pure (r, scope', frozen)
       ) `expectRight` \(r, scope', frozen) -> do
         frozen `shouldBe`
-          TArray (TFunct $ Funct TInt TInt (ROpen [label "IO"] r))
+          TArray (TFunct $ Funct TInt TInt (ROpen [label "IO"] r)) (RClosed [])
         Map.lookup r (rowLacks scope') `shouldBe` Just mutationEffects
 
     it "changes var record fields to val and freezes their function types" $
@@ -275,12 +276,13 @@ fSpec = do
                   TFunct $ Funct TInt TInt $
                     ROpen [label "Cell", label "IO"] r
               ]
+              (RClosed [])
         (scope', frozen) <- Infer.freezeTyp scope typ
         pure (r, scope', frozen)
       ) `expectRight` (\(r, scope', frozen) -> do
         case frozen of
           TRecord [TRecordProp Val "callback"
-            (TFunct (Funct TInt TInt (ROpen [io] tailVar)))] -> do
+            (TFunct (Funct TInt TInt (ROpen [io] tailVar)))] _ -> do
               io `shouldBe` label "IO"
               tailVar `shouldBe` r
           _ -> expectationFailure $

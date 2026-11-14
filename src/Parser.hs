@@ -92,7 +92,7 @@ import Lexer (
     Keyword (..), LToken (..)
   )
 import Data.Scientific (Scientific)
-import Data.Maybe (fromMaybe, isJust, fromJust)
+import Data.Maybe (fromMaybe, isJust)
 import Control.Monad.Combinators.Expr (makeExprParser, Operator (InfixR, Postfix, Prefix, InfixL))
 import Data.Functor (($>), void)
 import Span (Span(..), mergeSpan)
@@ -372,7 +372,15 @@ tok f = do
         pstateSourcePos = p {sourceColumn = mkPos (unPos (sourceColumn p) + T.length (pretty t))}
       }
     }
-  pure $ fromJust $ f t
+  -- 'satisfy' above accepted the token only because @f@ returned 'Just', so
+  -- the 'Nothing' branch cannot be reached.  It exists so that a mistake in the
+  -- predicate would surface as a parse failure rather than as an exception:
+  -- Megaparsec reports the message below with the position of the token.
+  case f t of
+    Just a -> pure a
+    Nothing -> fail $
+      "internal error: `tok` accepted `" <> T.unpack (pretty t)
+        <> "` but its predicate produced no value"
   -- satisfyMap
   -- where
 
@@ -555,11 +563,25 @@ arrowEffRow =
       ]
 
 typAtom :: Parser Typ
-typAtom =
+typAtom = do
+  base <- typAtomBase
+  -- The pending row of an aggregate, `[T]@R`.  The row is an ordinary effect
+  -- row, so every shape it has elsewhere (a variable, a row alias, a sugared
+  -- list with a tail) is available here too.
+  pending <- optional $ try $ symbol TAt *> effRow
+  pure $ maybe base (TPending base) pending
+
+-- | A type atom, with no pending row attached.
+typAtomBase :: Parser Typ
+typAtomBase =
   choice [
     try $ TGenericAlias <$> name <*> typeApps,
     TFlat <$> name,
-    Ast.TNil <$ nil,
+    -- `nil` consumes `(` before it discovers that the parentheses are not
+    -- empty, and without `try` the choice would not reach the parenthesised
+    -- type below.  The effect was that every `(T1, T2)` annotation failed
+    -- with "unexpected Int" instead of parsing as a pair type.
+    try $ Ast.TNil <$ nil,
     TArray <$> brackets typ,
     try $ TParen <$> parens typ,
     TVar <$> meta,
@@ -724,7 +746,7 @@ letPattern = do
 
 atomLetPattern :: Parser AtomLetPattern
 atomLetPattern = choice [
-    ALPNil <$ nil,
+    try $ ALPNil <$ nil,
     ALPUnderscore <$ symbol TUnderscore,
     ALPParen <$> parens letPattern,
     -- ALPPair <$> letPattern <* commasym <*> letPattern,

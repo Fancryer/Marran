@@ -201,8 +201,10 @@ renderLabel sm lab =
 
 lineAt :: SourceText -> Int -> Text
 lineAt src n
-  | n >= 1 && n <= length (srcLines src) = srcLines src !! (n - 1)
-  | otherwise = mempty
+  | n < 1 = mempty
+  | otherwise = case drop (n - 1) (srcLines src) of
+      l : _ -> l
+      []    -> mempty
 
 -- | Render one diagnostic.  The source map is used to quote the offending
 --   lines; when the span's file is not in the map only the location is printed.

@@ -21,7 +21,7 @@ pSpec = describe "syntax errors" $ do
 
   it "reports an unexpected token with its code and position" $ do
     ls <- parseFailure $ T.unlines
-      [ "funct main () : {Output} ("
+      [ "funct main () : {Output} ()"
       , "  sayn 1"
       ]
     take 5 ls `shouldBe`

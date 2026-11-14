@@ -4,6 +4,7 @@
 --   checked here rather than only in the end-to-end example tests.
 module DiagnosticSpec (dSpec) where
 
+import Data.Maybe (listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Test.Hspec
@@ -37,7 +38,7 @@ dSpec = describe "diagnostic rendering" $ do
 
   it "omits the brackets when there is no code" $ do
     let d = diagnostic SevWarning Nothing "unused binding"
-    head (T.lines (renderDiagnostic sources d)) `shouldBe` "warning: unused binding"
+    take 1 (T.lines (renderDiagnostic sources d)) `shouldBe` ["warning: unused binding"]
 
   it "prints the location of the primary label" $ do
     let d = (diagnostic SevError Nothing "boom") {diagLabels = [primaryLabel plusSpan ""]}
@@ -54,8 +55,8 @@ dSpec = describe "diagnostic rendering" $ do
   it "keeps the line number gutter aligned for wider line numbers" $ do
     let far = Span "demo.marr" 3 3 3 6
         d = (diagnostic SevError Nothing "boom") {diagLabels = [primaryLabel far ""]}
-    T.lines (renderDiagnostic sources d) !! 3
-      `shouldBe` "3 |   sayn (+ true 1)"
+    listToMaybe (drop 3 (T.lines (renderDiagnostic sources d)))
+      `shouldBe` Just "3 |   sayn (+ true 1)"
 
   it "quotes nothing when the file is not in the source map" $ do
     let other = Span "other.marr" 1 1 1 3
@@ -64,6 +65,14 @@ dSpec = describe "diagnostic rendering" $ do
     -- and no caret line: only the header and the location remain.
     T.lines (renderDiagnostic sources d) `shouldBe`
       ["error: boom", " --> other.marr:1:1"]
+
+  it "quotes nothing when the span points past the end of the file" $ do
+    let beyond = Span "demo.marr" 99 1 99 3
+        d = (diagnostic SevError Nothing "boom") {diagLabels = [primaryLabel beyond ""]}
+    -- The file is known but the line is not: the location is still printed and
+    -- no empty source block is invented for it.
+    T.lines (renderDiagnostic sources d) `shouldBe`
+      ["error: boom", " --> demo.marr:99:1"]
 
   it "renders the frames of a stack as notes" $ do
     let stack = [irFrame "sayn (+ true 1)" (Span "demo.marr" 3 3 3 17),
@@ -140,7 +149,7 @@ dSpec = describe "diagnostic rendering" $ do
       -- from the frame below it.
       let stack = [suggestion, irFrame "+ true 1" plusSpan]
           out = renderErrorWith sources (innermost stack) (Just "E0007") "boom" stack
-      T.lines out !! 1 `shouldBe` " --> demo.marr:3:9"
+      listToMaybe (drop 1 (T.lines out)) `shouldBe` Just " --> demo.marr:3:9"
 
   it "gives each kind of type error its own code" $ do
     let codes = map errorCode

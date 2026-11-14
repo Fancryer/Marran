@@ -9,14 +9,19 @@ module Occurs (
 ) where
 import Types (Typ(..), EffRow(..), Taste, EffRow, TRecordProp (..), Funct (..), TypeArg (..), TARecordProp (TARecordProp), EffCons (..), ECons (..))
 
+-- | Does the type (or the pending row of an aggregate) mention this type
+--   variable?
 typeOccursInType :: Taste -> Typ -> Bool
 typeOccursInType x = \case
   TVar y -> x == y
-  TArray t -> typeOccursInType x t
-  TPair l r -> any (typeOccursInType x) [l, r]
+  TArray t r -> typeOccursInType x t || typeOccursInEffRow x r
+  TPair l r fx ->
+    any (typeOccursInType x) [l, r] || typeOccursInEffRow x fx
   TFunct (Funct i o fx) -> any (typeOccursInType x) [i, o] || typeOccursInEffRow x fx
   TForall ts _ _ _ _ typ -> notElem x ts && typeOccursInType x typ
-  TRecord props -> any (\(TRecordProp _ _ typ) -> typeOccursInType x typ) props
+  TRecord props r ->
+    any (\(TRecordProp _ _ typ) -> typeOccursInType x typ) props
+      || typeOccursInEffRow x r
   _ -> False
 
 typeOccursInTypeArg :: Taste -> TypeArg -> Bool
@@ -46,8 +51,8 @@ rowOccursInEffRow x = \case
 typeContainsEffects :: Typ -> Bool
 typeContainsEffects = \case
   TFunct (Funct i o _) -> any typeContainsEffects [i, o]
-  TArray t -> typeContainsEffects t
-  TPair l r -> any typeContainsEffects [l, r]
+  TArray t _ -> typeContainsEffects t
+  TPair l r _ -> any typeContainsEffects [l, r]
   TForall _ es rs _ _ t -> es /= [] || rs /= [] || typeContainsEffects t
-  TRecord props -> any (\(TRecordProp _ _ typ) -> typeContainsEffects typ) props
+  TRecord props _ -> any (\(TRecordProp _ _ typ) -> typeContainsEffects typ) props
   _ -> False

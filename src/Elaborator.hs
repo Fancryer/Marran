@@ -34,7 +34,7 @@ import Control.Monad.Except (ExceptT)
 import Control.Lens.Getter (use)
 import Control.Lens.Setter ((+=))
 import Control.Monad.Error.Class (throwError)
-import Types (Mutability, Taste)
+import Types (Mutability, Taste, EffRow(RClosed))
 import Data.Traversable (for)
 import Data.Maybe (fromMaybe)
 import Data.Map (Map)
@@ -95,14 +95,25 @@ type ElabM a = ExceptT ElaborationError (State ElabState) a
 elabError :: String -> ElabM a
 elabError = throwError . ElaborationError . T.pack
 
+-- | Type variables the elaborator invents.
+--
+--   'Taste' equality compares the numeric id and ignores the name and the
+--   level, so ids must be unique across the two components that invent them.
+--   The type checker numbers its own variables from 1 upwards; the elaborator
+--   therefore uses negative ids, which cannot collide with them.  Without this
+--   separation an elaborator variable and a checker variable could share an id
+--   and be mistaken for one another: the substitution would then hold
+--   `m := m`, and resolving it would not terminate.
 freshBound, freshMeta :: Text -> ElabM Taste
 freshBound name = do
   counter += 1
-  Types.Bound name <$> use counter
+  ident <- use counter
+  pure $ Types.Bound name (-ident)
 
 freshMeta name = do
   counter += 1
-  Types.Meta name <$> use counter <*> pure (-1)
+  ident <- use counter
+  pure $ Types.Meta name (-ident) (-1)
 
 lookupMap :: Lens' ElabEnv (TextMap Taste) -> ElabEnv -> Text -> Maybe Taste
 lookupMap m env x = Map.lookup x $ env ^. m
@@ -471,7 +482,14 @@ builtinTypeNames = ["Int", "Float", "Boolean", "String", "Nil", "Nothing"]
 
 elaborateType' :: RowEnv -> TypEnv -> ElabEnv -> [Text] -> Ast.Typ -> ElabM Types.Typ
 elaborateType' renv tenv env visiting = \case
-  Ast.TFlat n -> case n of
+  Ast.TFlat n
+    -- A type parameter declared by the enclosing `funct [T]` or `type Box[T]`
+    -- shadows a declared alias of the same name, so it is looked up first.
+    -- Without this, the parameter stays an opaque `TFlat` and a scheme that
+    -- quantifies over it quantifies over nothing: `funct id[T] (x T) : T = x`
+    -- then rejects `id 1` with "cannot unify Int with T".
+    | Just bound <- lookupTyp env n -> pure $ Types.TVar bound
+    | otherwise -> case n of
     "Int" -> pure Types.TInt
     "Float" -> pure Types.TFloat
     "Boolean" -> pure Types.TBoolean
@@ -496,19 +514,33 @@ elaborateType' renv tenv env visiting = \case
           Just hint -> elabError $ printf "unknown type '%s'; %s" (T.unpack n) (T.unpack hint)
           Nothing -> pure $ Types.TFlat n
   Ast.TNil -> pure Types.TNil
-  Ast.TArray t -> Types.TArray <$> elaborateType' renv tenv env visiting t
+  Ast.TArray t -> do
+    t' <- elaborateType' renv tenv env visiting t
+    pure $ Types.TArray t' (RClosed [])
   Ast.TParen t -> elaborateType' renv tenv env visiting t
-  Ast.TPair l r -> Types.TPair <$> elaborateType' renv tenv env visiting l <*> elaborateType' renv tenv env visiting r
+  Ast.TPair l r -> do
+    l' <- elaborateType' renv tenv env visiting l
+    r' <- elaborateType' renv tenv env visiting r
+    pure $ Types.TPair l' r' (RClosed [])
   Ast.TFunct (Ast.Funct i o fxs) -> do
       i' <- elaborateType' renv tenv env visiting i
       o' <- elaborateType' renv tenv env visiting o
       fxs' <- elaborateEffRow' renv tenv env fxs
       pure $ Types.TFunct $ Types.Funct i' o' fxs'
-  Ast.TRecord (Ast.RecordTyp props) ->
-    Types.TRecord <$>
-      mapM (\(Ast.RecordTypProp c n t) ->
+  Ast.TRecord (Ast.RecordTyp props) -> do
+    props' <- mapM (\(Ast.RecordTypProp c n t) ->
         Types.TRecordProp (elaborateMutability c) n <$> elaborateType' renv tenv env visiting t)
       props
+    pure $ Types.TRecord props' (RClosed [])
+  Ast.TPending base row -> do
+    base' <- elaborateType' renv tenv env visiting base
+    row' <- elaborateEffRow' renv tenv env row
+    case base' of
+      Types.TArray t _ -> pure $ Types.TArray t row'
+      Types.TPair l r _ -> pure $ Types.TPair l r row'
+      Types.TRecord props _ -> pure $ Types.TRecord props row'
+      _ -> elabError
+        "the pending row `@R` may only be written on an array, a pair or a record type"
   Ast.TForall (Ast.TypeParams ts) (Ast.EffParams es rs) t -> do
     ts' <- traverse (\n -> (n, ) <$> freshBound n) ts
     es' <- traverse (\n -> (n, ) <$> freshBound n) es
@@ -552,7 +584,13 @@ elaborateTypeArg tenv env = elaborateTypeArg' tenv env []
 
 elaborateTypeArg' :: TypEnv -> ElabEnv -> [Text] -> Ast.TypeArg -> ElabM Types.TypeArg
 elaborateTypeArg' tenv env visiting = \case
-  Ast.TAFlat n -> case n of
+  Ast.TAFlat n
+    -- A type parameter declared by the enclosing `funct [T]` or `effect E[T]`
+    -- shadows a declared alias of the same name, so it is looked up first.
+    -- Without this, `effect Loop[T] ... break : `T -> ()` keeps `T` opaque and
+    -- a `loop[T]` program is rejected with "cannot unify `T with a meta".
+    | Just bound <- lookupTyp env n -> pure $ Types.TAVar bound
+    | otherwise -> case n of
     "Int" -> pure Types.TAInt
     "Float" -> pure Types.TAFloat
     "Boolean" -> pure Types.TABoolean
@@ -627,6 +665,7 @@ substTypeInTyp subst = \case
     Ast.TRecord $ Ast.RecordTyp $
       map (\(Ast.RecordTypProp q n t) ->
         Ast.RecordTypProp q n (substTypeInTyp subst t)) props
+  Ast.TPending t r -> Ast.TPending (substTypeInTyp subst t) r
   Ast.TForall (Ast.TypeParams ts) es t ->
     let subst' = filter (\(name, _) -> name `notElem` ts) subst
     in Ast.TForall (Ast.TypeParams ts) es (substTypeInTyp subst' t)
@@ -702,6 +741,8 @@ typToTypeArg = \case
   Ast.TRecord (Ast.RecordTyp props) ->
     Ast.TARecord . Ast.RecordTypeArg <$>
       traverse (\(Ast.RecordTypProp q n t) -> Ast.RecordTypeArgProp q n <$> typToTypeArg t) props
+  Ast.TPending {} ->
+    Left "The pending row `@R` of an aggregate is not allowed in type-argument position"
   Ast.TForall {} ->
     Left "Forall types are not allowed in type arguments"
   Ast.TVar t -> pure $ Ast.TAMeta t

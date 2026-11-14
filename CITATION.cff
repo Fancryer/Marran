@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use this artifact, please cite the paper and the archived release."
+message: "If you use this software, please cite the repository."
 title: "Environment Snapshots in Mårran: Taming Mutation under Non-Strict Evaluation"
 type: software
 authors:
@@ -8,21 +8,18 @@ authors:
     alias: "Fancryer"
     orcid: "https://orcid.org/0009-0003-1304-0984"
     affiliation: "University of Electronic Science and Technology of China"
-version: 0.1.0.1
-doi: "10.5281/zenodo.24128912"
-date-released: "2026-11-12"
+version: 0.2.0.0
+date-released: "2026-11-14"
 license: BSD-3-Clause
-repository-code: https://github.com/Fancryer/snapshots
-url: https://doi.org/10.5281/zenodo.24128912
+repository-code: https://github.com/Fancryer/Marran
 abstract: >-
   Mårran is an experimental statically typed programming language exploring the
   interaction between non-strict evaluation, controlled mutation and algebraic
   effects. A binding qualifier imm evaluates a delayed computation in a snapshot
   of the environment, in which data is copied and reachable code is frozen so
   that it neither creates nor observes mutable state. This artifact contains the
-  implementation, the type-and-effect inference engine, the test suite, the
-  Criterion benchmark harness and the Lean 4 development that accompanies the
-  paper.
+  implementation, the type-and-effect inference engine, the interpreter, the
+  test suite and the Criterion benchmark harness.
 keywords:
   - programming languages
   - non-strict evaluation

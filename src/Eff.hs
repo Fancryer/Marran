@@ -58,12 +58,15 @@ extractEffects = \case
 rowHasEffect :: EffRow -> EffCons -> Bool
 rowHasEffect r = (`elem` extractEffects r)
 
+-- | Every effect that a type mentions: in its components, in its pending
+--   row and in the latent row of an arrow.
 extractTypeEffects :: Typ -> [EffCons]
 extractTypeEffects = \case
-  TArray t -> extractTypeEffects t
-  TPair l r -> extractTypeEffects l <> extractTypeEffects r
+  TArray t r -> extractTypeEffects t <> extractEffects r
+  TPair l r fx -> extractTypeEffects l <> extractTypeEffects r <> extractEffects fx
   TFunct (Funct i o r) -> extractTypeEffects i <> extractTypeEffects o <> extractEffects r
-  TRecord props -> Utils.uniqPreserveOrder $ concatMap (extractTypeEffects . tTyp) props
+  TRecord props r ->
+    Utils.uniqPreserveOrder $ concatMap (extractTypeEffects . tTyp) props <> extractEffects r
   TForall _ _ _ _ _ t -> extractTypeEffects t
   _ -> []
 
@@ -89,7 +92,8 @@ unionEffRows r1 r2 =
     (_, ROpen _ v) -> ROpen combinedEffects v
     -- Оба закрытые
     (RClosed _, RClosed _) -> RClosed combinedEffects
-    (RVar _, RVar _) -> error "Cannot union two abstract row variables"
+    (RVar v1, RVar v2) ->
+      if v1 == v2 then RVar v1 else ROpen [] v1
     (RVar v, r) -> ROpen (extractEffects r) v
     (r, RVar v) -> ROpen (extractEffects r) v
 

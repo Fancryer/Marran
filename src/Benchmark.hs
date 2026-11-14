@@ -395,21 +395,19 @@ generateTree d b =
     totalNodes =
       sum widths
 
-    levelEdges level =
-      let
-        parentOffset = offsets !! level
-        childOffset = offsets !! (level + 1)
-        parentWidth = widths !! level
-      in
-        [ (parentOffset + parent, childOffset + parent * b + child)
-        | parent <- [0 .. parentWidth - 1]
-        , child <- [0 .. b - 1]
-        ]
-
+    -- The rows of the tree are walked together instead of indexed: a node of
+    -- level @l@ is the parent of the @b@ nodes that follow it at level @l + 1@,
+    -- and every later level starts where the previous one ends.  Zipping the
+    -- three lists means no lookup can run past the end of a level, whatever
+    -- @depth@ and @branching@ are.
     allEdges =
       concat
-        [ levelEdges level
-        | level <- [0 .. d - 1]
+        [ [ (parentOffset + parent, childOffset + parent * b + child)
+          | parent <- [0 .. parentWidth - 1]
+          , child <- [0 .. b - 1]
+          ]
+        | (parentOffset, (parentWidth, childOffset)) <-
+            take d (zip offsets (zip widths (drop 1 offsets)))
         ]
 
   in

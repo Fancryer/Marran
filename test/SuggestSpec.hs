@@ -6,7 +6,12 @@
 --   as the hits.
 module SuggestSpec (sSpec) where
 
+import qualified Data.Map as Map
+import Data.Maybe (fromMaybe, listToMaybe)
+import qualified Data.Text as T
 import Test.Hspec
+import Test.Hspec.QuickCheck (prop)
+import Test.QuickCheck (Gen, elements, forAll, listOf, (===))
 
 import Suggest
 
@@ -31,6 +36,18 @@ sSpec = describe "suggestions" $ do
 
     it "is symmetric" $
       distance "make" "kcae" `shouldBe` distance "kcae" "make"
+
+    prop "agrees with the table implementation it replaced" $
+      forAll shortName $ \xs ->
+        forAll shortName $ \ys ->
+          distance (T.pack xs) (T.pack ys)
+            === referenceDistance (T.pack xs) (T.pack ys)
+
+    prop "never exceeds the length of the longer string" $
+      forAll shortName $ \xs ->
+        forAll shortName $ \ys ->
+          distance (T.pack xs) (T.pack ys)
+            <= max (length xs) (length ys)
 
   describe "threshold" $ do
     it "allows one edit for a short name" $
@@ -86,3 +103,45 @@ sSpec = describe "suggestions" $ do
 
     it "produces no note when there is no candidate" $
       suggestionNote ["counter"] "zzzz" `shouldBe` Nothing
+
+-- | Short names over a tiny alphabet: the alphabet is small enough that
+--   transpositions and tie cases actually occur, and the names are short
+--   enough for the quadratic oracle below.
+shortName :: Gen String
+shortName = listOf (elements "abc")
+
+-- | The table implementation that 'distance' used before it was rewritten
+--   without indexing, kept as an oracle: it is a direct transcription of the
+--   recurrence and shares no code with the version under test.
+--
+--   The table is a lazy map, so the entries can refer to each other; every
+--   lookup is of an entry the table already contains.
+referenceDistance :: T.Text -> T.Text -> Int
+referenceDistance a b = at n m
+  where
+    as = T.unpack a
+    bs = T.unpack b
+    n = length as
+    m = length bs
+
+    charAt xs i = listToMaybe (drop i xs)
+
+    table = Map.fromList [ ((i, j), entry i j) | i <- [0 .. n], j <- [0 .. m] ]
+
+    at i j = fromMaybe 0 (Map.lookup (i, j) table)
+
+    entry 0 j = j
+    entry i 0 = i
+    entry i j
+      | charAt as (i - 1) == charAt bs (j - 1) = at (i - 1) (j - 1)
+      | transposed = 1 + at (i - 2) (j - 2)
+      | otherwise = 1 + minimum [
+            at (i - 1) j
+          , at i (j - 1)
+          , at (i - 1) (j - 1)
+          ]
+      where
+        transposed =
+          i > 1 && j > 1
+            && charAt as (i - 1) == charAt bs (j - 2)
+            && charAt as (i - 2) == charAt bs (j - 1)

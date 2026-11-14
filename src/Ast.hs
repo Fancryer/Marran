@@ -177,6 +177,7 @@ data Typ =
   | TPair Typ Typ
   | TFunct Funct
   | TRecord RecordTyp
+  | TPending Typ EffRow     -- ^ @T@R@: the pending row of an aggregate
   | TForall TypeParams EffParams Typ
   | TVar Text
   | TGenericAlias Text TypeApps
@@ -198,6 +199,7 @@ instance Pretty Typ where
     TPair l r -> T.concat [pretty l, ", ", pretty r]
     TFunct f -> pretty f
     TRecord r -> pretty r
+    TPending t r -> T.concat [pretty t, "@", pretty r]
     TForall ts es t -> T.concat ["forall ", pretty ts, pretty es, " ==> ", pretty t]
     TVar v -> T.append "`" v
     TGenericAlias t tas -> T.append t $ pretty tas

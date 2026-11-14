@@ -25,6 +25,7 @@ module TypedIR(
   FunctDecl(..),
   Handler(..),
   Scope(..),
+  ValueBinding(..),
   TERecordProp(..),
   TopLevelStat(..),
   HandlerClause,
@@ -64,7 +65,22 @@ import Span (Span, noSpan, mergeSpan, mergeSpans)
 import Data.Set (Set)
 
 type TypeScope  = TextMap Typ
-type ValueScope = TextMap (TypeScheme, Expr, Mutability)
+
+-- | A value binding in the scope.  The pending row is the effect of forcing
+--   the delayed computation the name stands for (T-Var in the paper): the
+--   declaration row plus the mention row for a @val@ binding, the row variable
+--   that bounds every assignment for a @var@ binding, and the frozen row for
+--   an @imm@ binding.  It is kept next to the scheme rather than inside it
+--   because a function declaration has no pending row of its own: calling the
+--   function is what pays its latent row.
+data ValueBinding = ValueBinding {
+    vbScheme :: TypeScheme,
+    vbExpr   :: Expr,
+    vbMut    :: Mutability,
+    vbRow    :: EffRow
+  } deriving Show
+
+type ValueScope = TextMap ValueBinding
 type EffScope   = TextMap EffDef
 
 type TypeSubst    = TasteMap Typ
@@ -103,12 +119,12 @@ data TypedExprNode =
   | TEStringNode Text
   | TENilNode
   | TEXVarNode Text Typ
-  | TEArrayNode Typ [TypedExpr]
-  | TEPairNode TypedExpr TypedExpr
+  | TEArrayNode Typ EffRow [TypedExpr]
+  | TEPairNode EffRow TypedExpr TypedExpr
   | TEXLambdaNode Lambda
   | TENLambdaNode NativeLambdaSign
   | TEApplyNode TypedExpr TypedExpr
-  | TERecordNode (Maybe TypedExpr) [TERecordProp]
+  | TERecordNode (Maybe TypedExpr) [TERecordProp] EffRow
   | TEHandleNode Handler Typ
   | TEParenNode Block
   | TEResumeNode TypedExpr Typ
@@ -141,13 +157,13 @@ pattern TEXVar :: Text -> Typ -> TypedExpr
 pattern TEXVar n t <- MkTypedExpr _ (TEXVarNode n t) where
   TEXVar n t = MkTypedExpr noSpan (TEXVarNode n t)
 
-pattern TEArray :: Typ -> [TypedExpr] -> TypedExpr
-pattern TEArray t es <- MkTypedExpr _ (TEArrayNode t es) where
-  TEArray t es = MkTypedExpr noSpan (TEArrayNode t es)
+pattern TEArray :: Typ -> EffRow -> [TypedExpr] -> TypedExpr
+pattern TEArray t r es <- MkTypedExpr _ (TEArrayNode t r es) where
+  TEArray t r es = MkTypedExpr noSpan (TEArrayNode t r es)
 
-pattern TEPair :: TypedExpr -> TypedExpr -> TypedExpr
-pattern TEPair l r <- MkTypedExpr _ (TEPairNode l r) where
-  TEPair l r = MkTypedExpr (mergeSpan (teSpan l) (teSpan r)) (TEPairNode l r)
+pattern TEPair :: EffRow -> TypedExpr -> TypedExpr -> TypedExpr
+pattern TEPair r l e <- MkTypedExpr _ (TEPairNode r l e) where
+  TEPair r l e = MkTypedExpr (mergeSpan (teSpan l) (teSpan e)) (TEPairNode r l e)
 
 pattern TEXLambda :: Lambda -> TypedExpr
 pattern TEXLambda l <- MkTypedExpr _ (TEXLambdaNode l) where
@@ -161,10 +177,10 @@ pattern TEApply :: TypedExpr -> TypedExpr -> TypedExpr
 pattern TEApply f x <- MkTypedExpr _ (TEApplyNode f x) where
   TEApply f x = MkTypedExpr (mergeSpan (teSpan f) (teSpan x)) (TEApplyNode f x)
 
-pattern TERecord :: Maybe TypedExpr -> [TERecordProp] -> TypedExpr
-pattern TERecord a ps <- MkTypedExpr _ (TERecordNode a ps) where
-  TERecord a ps =
-    MkTypedExpr (mergeSpans (maybe [] (\x -> [teSpan x]) a <> map (teSpan . terExpr) ps)) (TERecordNode a ps)
+pattern TERecord :: Maybe TypedExpr -> [TERecordProp] -> EffRow -> TypedExpr
+pattern TERecord a ps r <- MkTypedExpr _ (TERecordNode a ps r) where
+  TERecord a ps r =
+    MkTypedExpr (mergeSpans (maybe [] (\x -> [teSpan x]) a <> map (teSpan . terExpr) ps)) (TERecordNode a ps r)
 
 pattern TEHandle :: Handler -> Typ -> TypedExpr
 pattern TEHandle h t <- MkTypedExpr _ (TEHandleNode h t) where
@@ -207,13 +223,13 @@ instance Show TypedExpr where
     TEString s -> show s
     TENil -> "Nil"
     TEXVar v t -> "(XVar " <> show v <> " " <> show t <> ")"
-    TEArray t entries -> "(Array " <> show t <> " (" <> unwords (map show entries) <> "))"
-    TEPair l r -> "(Pair " <> show l <> " " <> show r <> ")"
+    TEArray t r entries -> "(Array " <> show t <> " " <> show r <> " (" <> unwords (map show entries) <> "))"
+    TEPair r l e -> "(Pair " <> show r <> " " <> show l <> " " <> show e <> ")"
     TEXLambda lam -> "(XLambda " <> show lam <> ")"
     TENLambda lam -> "(NLambda " <> show lam <> ")"
     TEApply f x -> "(Apply " <> show f <> " " <> show x <> ")"
-    TERecord Nothing props -> "(Record " <> show props <> ")"
-    TERecord (Just anchor) props -> "(Record-extend " <> show anchor <> " | " <> show props <> ")"
+    TERecord Nothing props _ -> "(Record " <> show props <> ")"
+    TERecord (Just anchor) props r -> "(Record-extend " <> show r <> " " <> show anchor <> " | " <> show props <> ")"
     TEHandle handler t -> "(Handle " <> show handler <> " " <> show t <> ")"
     TEParen (stats, expr) -> "(Paren " <> unwords (map show stats) <> " " <> show expr <> ")"
     TEResume expr t -> "(Resume " <> show expr <> " " <> show t <> ")"
@@ -229,13 +245,13 @@ instance Pretty TypedExpr where
     TEString s -> "'" <> s <> "'"
     TENil -> "()"
     TEXVar n _ -> n
-    TEArray _ es -> T.concat ["[", T.concat $ map pretty es ,"]"]
-    TEPair l r -> T.concat ["(", pretty l, ", ", pretty r, ")"]
+    TEArray _ _ es -> T.concat ["[", T.concat $ map pretty es ,"]"]
+    TEPair _ l r -> T.concat ["(", pretty l, ", ", pretty r, ")"]
     TEXLambda l -> pretty l
     TENLambda _ -> "!closure!"
     TEApply f e -> pretty f <> " " <> pretty e
-    TERecord Nothing ps -> T.concat ["${", T.intercalate "; " $ map pretty ps, "}"]
-    TERecord (Just anchor) ps -> T.concat ["${", pretty anchor, " | ", T.intercalate "; " $ map pretty ps, "}"]
+    TERecord Nothing ps _ -> T.concat ["${", T.intercalate "; " $ map pretty ps, "}"]
+    TERecord (Just anchor) ps _ -> T.concat ["${", pretty anchor, " | ", T.intercalate "; " $ map pretty ps, "}"]
     TEHandle h _ -> pretty h
     TEParen b -> "(" <> pretty b <> ")"
     TEResume e t -> "resume " <> pretty e
@@ -446,15 +462,19 @@ typeOfTypedExpr = \case
   TEString _ -> Right TString
   TENil -> Right TNil
   TEXVar _ t -> Right t
-  TEArray t _ -> Right t
-  TEPair l r -> TPair <$> typeOfTypedExpr l <*> typeOfTypedExpr r
+  -- The payload of the node is the element type, not the type of the array.
+  -- Returning it directly made `[5]` have type `Int`, so no array could be
+  -- given the annotation `[Int]`; only the empty array slipped through,
+  -- because its element type `Nothing` unifies with anything.
+  TEArray t r _ -> Right (TArray t r)
+  TEPair r l e -> TPair <$> typeOfTypedExpr l <*> typeOfTypedExpr e <*> pure r
   TEXLambda (TypedIR.Lambda _ _ _ argT retT fxs _) -> Right . TFunct $ Funct argT retT fxs
   TENLambda (NativeLambdaSign _ argT retT fxs) -> Right . TFunct $ Funct argT retT fxs
   TEApply f _ ->
     typeOfTypedExpr f >>= \case
       TFunct (Funct _ ret' _) -> pure ret'
       r -> Left $ "typeOfTypedExpr [TEApply]| Apply of non-function: " <> T.pack (show r)
-  TERecord _ props -> Right $ TRecord [TRecordProp mut name t | TERecordProp mut name t _ <- props]
+  TERecord _ props r -> Right $ TRecord [TRecordProp mut name t | TERecordProp mut name t _ <- props] r
   -- TEWith _ _ _ t -> t
   TEHandle _ t -> Right t
   TEParen block -> typeOfTypedBlock block
@@ -462,7 +482,7 @@ typeOfTypedExpr = \case
   TELet _ _ body -> typeOfTypedExpr body
   TEPropAccess expr field ->
     typeOfTypedExpr expr >>= \case
-      TRecord props ->
+      TRecord props _ ->
         case find ((field ==) . tName) props of
           Just (TRecordProp _ _ t) -> Right t
           Nothing -> Left $ "Field " <> field <> " not found"

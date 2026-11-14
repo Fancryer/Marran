@@ -36,14 +36,14 @@ import Types(
     Block,
     Stat(..),
     pattern Bind, pattern Assign, pattern Expr,
-    atStatSpan, statSpan,
+    statSpan,
     Expr(..),
     blockSpan,
     pattern Int, pattern Float, pattern Boolean, pattern String, pattern Nil,
     pattern XVar, pattern Array, pattern Pair, pattern XLambda, pattern NLambda,
     pattern Apply, pattern Record, pattern With, pattern Handle, pattern Paren,
     pattern Resume, pattern Let, pattern PropAccess, pattern IfElse,
-    exprSpan, exprNode,
+    exprSpan,
     Handler(..),
     Lambda,
     Lambda(..),
@@ -60,7 +60,6 @@ import Types(
     ERecordProp(..),
     TRecordProp(..),
     LetPattern(..),
-    TRecordProp(..),
     LetPattern(LPParam),
     LambdaParam(LambdaParam),
     AtomLetPattern(ALPNil, ALPUnderscore, ALPPair, ALPRecord),
@@ -69,7 +68,8 @@ import Types(
     TopLevelStat(..),
     effName,
     FunctDecl(..),
-    pureTFunc, tfunc, ECons (..), countArgs, monoScheme
+    tfunc, ECons (..), countArgs, monoScheme, EffDef(..),
+    typeArgToTyp
   )
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -79,27 +79,30 @@ import Unify (
     TypeCheckM,
     TypeCheckError(..),
     unifyTypes,
+    unifyArgType,
+    subsumesType,
     applyTypeSubst,
     freshMetaTypeM,
-    unifyEffRows,
     freshMetaM,
+    freshMetaRowM,
     removeConsFromRow,
     retTypeOf,
     applyEffRowSubst,
     withNewLevel,
-    currentLevel, subsumesEffRow, throwTypeCheckError, throwTypeCheckErrorWithNotes, withErrorStack, applyEffConsSubst, addEffLacks, addRowLacks, addRowLacksToRow
+    currentLevel, subsumesEffRow, throwTypeCheckError, throwTypeCheckErrorWithNotes, withErrorStack, applyEffConsSubst, addEffLacks, addRowLacks, addRowLacksToRow, unifyTypeArgLists
   )
 import qualified Eff
 import qualified Scope
 import Control.Monad (foldM, when, forM)
 import Scope (enterScope)
-import Utils (uniqPreserveOrder, mapFst, Pretty (pretty), mapSnd)
+import Utils (uniqPreserveOrder, Pretty (pretty))
 import qualified Data.Text as T
-import Data.List (sort, nub, find, nubBy)
+import Data.List (nub, find)
 import Text.Printf (printf)
 import Data.Maybe (isNothing, fromMaybe, catMaybes)
 import TypedIR (
     Scope(..),
+    ValueBinding(..),
     TypedExpr(..),
     Block,
     Lambda(..),
@@ -116,15 +119,12 @@ import TypedIR (
     pattern TEXLambda, pattern TENLambda, pattern TEApply, pattern TERecord,
     pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
     pattern TEPropAccess, pattern TEIfElse,
-    atTypedSpan, teSpan,
+    atTypedSpan,
     pattern Bind, pattern Rebind, pattern Expr,
-    atTypedStatSpan, tStatSpan
+    atTypedStatSpan
   )
 import Data.Text (Text)
-import Control.Lens (use, (^.))
-import Eff (rowHasEffect)
-import Control.Monad.IO.Class (liftIO)
-import Debug.Trace (trace)
+import Control.Lens (use)
 import ErrorContext (IrFrame (IrFrame), ErrorFrame (..))
 import Suggest (suggestionNote)
 import Span (Span)
@@ -142,10 +142,12 @@ isTypeMonomorphic :: Scope -> Typ -> Bool
 isTypeMonomorphic scope = \case
   TForall{} -> False
   TVar v -> maybe False (isTypeMonomorphic scope) $ Map.lookup v $ typeSubst scope
-  TArray t -> isTypeMonomorphic scope t
-  TPair l r -> isTypeMonomorphic scope l && isTypeMonomorphic scope r
+  TArray t r -> isTypeMonomorphic scope t && isEffRowMonomorphic scope r
+  TPair l r fx ->
+    isTypeMonomorphic scope l && isTypeMonomorphic scope r && isEffRowMonomorphic scope fx
   TFunct (Funct i o fxs) -> all (isTypeMonomorphic scope) [i, o] && isEffRowMonomorphic scope fxs
-  TRecord props -> all (isTypeMonomorphic scope . tTyp) props
+  TRecord props r ->
+    all (isTypeMonomorphic scope . tTyp) props && isEffRowMonomorphic scope r
   _ -> True
 
 isTypeArgMonomorphic :: Scope -> TypeArg -> Bool
@@ -176,11 +178,14 @@ substituteTypedExpr scope = \case
   TEString s -> pure $ TEString s
   TENil -> pure TENil
   TEXVar v t -> TEXVar v <$> applyTypeSubst scope t
-  TEArray t es -> do
+  TEArray t r es -> do
     t' <- applyTypeSubst scope t
+    r' <- applyEffRowSubst scope r
     es' <- mapM (substituteTypedExpr scope) es
-    pure $ TEArray t' es'
-  TEPair l r -> TEPair <$> substituteTypedExpr scope l <*> substituteTypedExpr scope r
+    pure $ TEArray t' r' es'
+  TEPair r l e -> do
+    r' <- applyEffRowSubst scope r
+    TEPair r' <$> substituteTypedExpr scope l <*> substituteTypedExpr scope e
   TEXLambda lam -> do
     argT' <- applyTypeSubst scope lam.lArgT
     retT' <- applyTypeSubst scope lam.lRetT
@@ -188,10 +193,11 @@ substituteTypedExpr scope = \case
     block' <- substituteBlock scope lam.lBlock
     pure $ TEXLambda (lam {TypedIR.lArgT = argT', TypedIR.lRetT = retT', TypedIR.lFxs = fxs', TypedIR.lBlock = block'})
   TEApply f x -> TEApply <$> substituteTypedExpr scope f <*> substituteTypedExpr scope x
-  TERecord m props -> do
+  TERecord m props r -> do
     m' <- mapM (substituteTypedExpr scope) m
     props' <- mapM (substituteRecordProp scope) props
-    pure $ TERecord m' props'
+    r' <- applyEffRowSubst scope r
+    pure $ TERecord m' props' r'
   TEParen block -> TEParen <$> substituteBlock scope block
   TEResume e t -> TEResume <$> substituteTypedExpr scope e <*> applyTypeSubst scope t
   TELet pat bound body -> do
@@ -287,6 +293,40 @@ countResumeInExpr = \case
 countResumeInLambda :: Types.Lambda -> ResumeInfo
 countResumeInLambda l = countResumeInBlock l.lBlock
 
+-- | The effect declared by this name, with its parameters and operations.
+--   'Scope.findEffOps' returns the operations with the effect's own type
+--   parameters still in them; a use site such as @Loop[Int]@ must replace
+--   those with the arguments it supplies.
+effectDeclaration :: Scope -> Text -> Maybe EffDef
+effectDeclaration = Scope.findEff True
+
+-- | Replace the type parameters of an effect with the arguments of one use.
+--
+--   The declared parameter names are recovered from the operation types: an
+--   effect's operations only ever mention the effect's own parameters as
+--   `Bound` variables, so matching by name is exact.
+instantiateOps :: EffDef -> [TypeArg] -> [(Text, Funct)]
+instantiateOps (EffDef _ params ops) args
+  | null params && null args = ops
+  | length params /= length args = ops
+  | otherwise =
+      let subst = Map.fromList (zip params (map typeArgToTyp args))
+          go :: Typ -> Typ
+          go = \case
+            TVar (Bound n _) -> Map.findWithDefault (TVar (Bound n 0)) n subst
+            TVar v -> TVar v
+            TArray t r -> TArray (go t) (goRow r)
+            TPair l r fx -> TPair (go l) (go r) (goRow fx)
+            TFunct (Funct i o fxs) -> TFunct (Funct (go i) (go o) (goRow fxs))
+            TRecord props fx -> TRecord [TRecordProp m n (go t) | TRecordProp m n t <- props] (goRow fx)
+            TForall ts es rs els rls t -> TForall ts es rs els rls (go t)
+            t -> t
+          goRow = \case
+            RClosed cs -> RClosed cs
+            ROpen cs v -> ROpen cs v
+            RVar v -> RVar v
+      in [ (n, Funct (go i) (go o) fxs) | (n, Funct i o fxs) <- ops ]
+
 substituteType :: Scope -> Taste -> TypeArg -> Scope
 substituteType scope taste typ = scope {typeArgSubst = Map.insert taste typ scope.typeArgSubst}
 
@@ -377,7 +417,7 @@ inferChunk args chunk = do
     ) (globalScope, []) chunk
 
   -- Второй проход: типизируем тела функций и обновляем схемы
-  (scope2, typedFuns) <- foldM (\(sc, acc) (functDecl, retFxs, retTyp) -> do
+  (_scope2, typedFuns) <- foldM (\(sc, acc) (functDecl, retFxs, retTyp) -> do
       let funScope = enterScope sc
       scopeWithArgs <- foldM (\sc' (argName, argTyp) ->
           Scope.addBinding argName (monoScheme argTyp) (XVar argName) Val sc'
@@ -394,8 +434,9 @@ inferChunk args chunk = do
           InferResult typedBlock blockFxs finalScope <- inferBlock scopeWithArgs functDecl.fBlock
           blockTyp <- typeOfTypedBlockIn finalScope typedBlock
 
-          -- Унифицируем тип результата
-          scopeUnified <- unifyTypes finalScope blockTyp retTyp
+          -- Унифицируем тип результата.  The annotation of an aggregate is an
+          -- upper bound, so a value with a smaller pending row fits.
+          scopeUnified <- subsumesType finalScope blockTyp retTyp
 
           -- Унифицируем эффекты
           let actualFxs = blockFxs
@@ -439,7 +480,10 @@ inferChunk args chunk = do
               finalEffLacks
               fullTypFinal'
 
-          updatedValues = Map.insert functDecl.fName (finalScheme, XVar functDecl.fName, Val) (values sc)
+          -- A function name is not a delayed computation: its latent row is
+          -- paid at application, not by looking the name up.  Its pending row
+          -- is therefore empty.
+          updatedValues = Map.insert functDecl.fName (ValueBinding finalScheme (XVar functDecl.fName) Val Eff.empty) (values sc)
 
           finalArgs = zip (map fst functDecl.fArgs) finalArgTypes
 
@@ -488,15 +532,25 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
   String s -> pure  $ InferResult (TEString s) Eff.empty scope
   Nil -> pure  $ InferResult TENil Eff.empty scope
   XVar v -> do
-    (bindingT, scope', mut) <- case Scope.findBinding True scope v of
+    (bindingT, pending, scope', mut) <- case Scope.findBindingWithRow True scope v of
       Nothing -> throwTypeCheckErrorWithNotes (UndefinedVariable v)
         (maybe [] pure (suggestionNote (Scope.bindingNames scope) v))
-      Just (scheme, _, mut') -> do
-        (t, sc) <- instantiateTypeScheme scope scheme
-        pure (t, sc, mut')
-    let finalFxs = if mut == Var then Eff.closedOfFlat "Read" else Eff.empty
+      Just (ValueBinding scheme _ mut' row) -> do
+        -- The pending row belongs to the delayed computation, so it must be
+        -- instantiated together with the scheme: a @val@ binding can be
+        -- polymorphic in the row of the thunk it stores.
+        (t, row', sc) <- instantiateTypeSchemeWithRow scope scheme row
+        pure (t, row', sc, mut')
+    let finalFxs =
+          if mut == Var
+            then Eff.unionEffRows pending (Eff.closedOfFlat "Read")
+            else pending
     pure  $ InferResult (TEXVar v bindingT) finalFxs scope'
-  Array [] -> pure $ InferResult (TEArray TNothing []) Eff.empty scope
+  -- T-Array (the paper gives no separate rule; the annotation is an upper
+  -- bound of the component rows, like T-Pair and T-Rec).  The row is a fresh
+  -- variable so that the annotation is as permissive as possible: it is only
+  -- required to bound the rows of the components and their mentions.
+  Array [] -> pure $ InferResult (TEArray TNothing (RClosed []) []) Eff.empty scope
   Array (x:xs) -> do
     -- Типизируем первый элемент
     InferResult hEntry fxs scope1 <- inferExpr scope x
@@ -511,29 +565,57 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
         pure (accEntries <> [tEntry], Eff.unionEffRows accFxs tFxs, sc''))
       ([hEntry], fxs, scope1)
       xs
-    wrapInferResultWithCell $ InferResult (TEArray hType typedEntries) finalFxs finalScope
+    -- Men(Γ,tᵢ): a snapshot of a component reaches whatever its code mentions.
+    men <- mentionRow finalScope (Set.unions (map fvTyped typedEntries))
+    pending <- freshMetaRowM
+    finalScope' <- subsumesEffRow finalScope (Eff.unionEffRows finalFxs men) pending
+    wrapInferResultWithCell $
+      InferResult (TEArray hType pending typedEntries) finalFxs finalScope'
   Pair l r -> do
     InferResult l' lRow scope' <- inferExpr scope l
     InferResult r' rRow scope'' <- inferExpr scope' r
-    let pair = TEPair l' r'
+    men <- mentionRow scope'' (Set.union (fvTyped l') (fvTyped r'))
+    pending <- applyEffRowSubst scope'' =<< freshMetaRowM
+    scope''' <- subsumesEffRow scope'' (Eff.unionEffRows (Eff.unionEffRows lRow rRow) men) pending
+    let pair = TEPair pending l' r'
     pure $
       InferResult
         pair
         (wrapTypedExprWithCell pair $ Eff.unionEffRows lRow rRow)
-        scope''
+        scope'''
   XLambda lam -> do
     InferResult lam' fxs scope' <- inferLambda scope lam
     wrapInferResultWithCell $ InferResult (TEXLambda lam') fxs scope'
   Apply callee arg -> do
     InferResult calleeT calleeFxs calleeScope <- inferExpr scope callee
     calleeT' <- typeOfTypedExprIn calleeScope calleeT
+
+    -- A callee whose type is already known and is not a function is an
+    -- application error, not a unification error: reporting it as a failed
+    -- unification would leak inference variables (`m6 -> { | `m8} `m7`) into
+    -- a message about `n 2` where `n : Int`.
+    calleeResolved0 <- applyTypeSubst calleeScope calleeT'
+    case calleeResolved0 of
+      TFunct _ -> pure ()
+      TForall{} -> pure ()
+      TVar{} -> pure ()
+      other -> throwTypeCheckError $ ApplicationError $ T.concat [
+          "`", pretty callee, "` has type `", pretty other,
+          "`, which is not a function, so it cannot be applied"
+        ]
+
     expectedFromT <- freshMetaTypeM
     expectedToT <- freshMetaTypeM
     expectedCalleeT <- TFunct . Funct expectedFromT expectedToT . ROpen [] <$> freshMetaM
     scope' <- unifyTypes calleeScope calleeT' expectedCalleeT
-    InferResult argT argFxs argScope <- inferExpr scope' arg
+    -- T-App: the parameter's row names the effects the argument may perform,
+    -- so their operations are in scope while the argument is checked.
+    argScope0 <- withRowOperations scope' expectedFromT
+    InferResult argT argFxs argScope <- inferExpr argScope0 arg
     argT' <- typeOfTypedExprIn argScope argT
-    scope'' <- unifyTypes argScope argT' expectedFromT
+    -- T-App: the argument's row must be included in the parameter's latent
+    -- row, not equal to it.
+    scope'' <- unifyArgType argScope argT' expectedFromT
 
     -- Эффект вызова (T-App): латентный ряд callee ПОСЛЕ унификации
     -- берётся собственный ряд callee (а не ожидаемый: унификация открытых рядов
@@ -543,7 +625,16 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
       TFunct (Funct _ _ row) -> applyEffRowSubst scope'' row
       _ -> throwTypeCheckError $ ApplicationError "the left side of an application is not a function"
 
-    -- Объединяем все эффекты: вычисление callee, вычисление arg, и эффект из типа функции
+    -- T-App (paper): @R₂ ∪ Men(Γ,t₂) ⊆ R@.  The row of the argument is
+    -- charged right here -- it is part of 'finalFxs' below -- so the call site
+    -- already pays for it, and the parameter's latent row need not be widened
+    -- to a bound of the *variable* the argument reads: for `line unit q`, where
+    -- `unit` is a `var`, requiring `ρ_unit ∪ {Read} ⊆ {Read}` would close the
+    -- variable's pending row and make the later `unit := ...` illegal.  What
+    -- the callee must be able to pay for, though, is an argument it may force
+    -- later, and that is exactly what 'unifyArgType' checks: if the argument is
+    -- itself a delayed computation, its latent row is included in the
+    -- parameter's arrow row.
     let finalFxs = Eff.unionEffRowsList [argFxs, resultRow, calleeFxs]
 
     wrapInferResultWithCell $ InferResult (TEApply calleeT argT) finalFxs scope''
@@ -552,11 +643,11 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
       (TENLambda n)
       Eff.empty
       scope
-  With expr ts es rs -> do
-    InferResult exprExpr exprFxs exprScope <- inferExpr scope expr
+  With withExpr ts es rs -> do
+    InferResult exprExpr exprFxs exprScope <- inferExpr scope withExpr
 
     typeOfTypedExprUnsafe exprExpr >>= \case
-      TForall tvars evars rvars effLacks rowLacks _ -> do
+      TForall tvars evars rvars boundEffLacks boundRowLacks _ -> do
         let typesLength = length ts
             tvarsLength = length tvars
             fxsLength = length es
@@ -583,7 +674,7 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
           (\sc (evar, fxArg) ->
             maybe (pure sc)
               (addRowLacksToRow sc (RClosed [fxArg]))
-              (Map.lookup evar effLacks))
+              (Map.lookup evar boundEffLacks))
           scope1
           (zip evars es)
 
@@ -592,7 +683,7 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
           (\sc (rvar, rowArg) ->
             maybe (pure sc)
               (addRowLacksToRow sc rowArg)
-              (Map.lookup rvar rowLacks))
+              (Map.lookup rvar boundRowLacks))
           scope2
           (zip rvars rs)
 
@@ -613,14 +704,14 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
   Paren b -> do
     InferResult b' fxs scope' <- inferBlock scope b
     wrapInferResultWithCell $ InferResult (TypedIR.TEParen b') fxs scope'
-  Resume expr ->
+  Resume resumeExpr ->
     case Scope.findBinding True scope "resume" of
       Nothing -> throwTypeCheckError $ EffectError "Resume used outside of a handler clause!"
       Just (resumeTypScheme, _, _) -> do
         (resumeTyp, scope') <- instantiateTypeScheme scope resumeTypScheme
         case resumeTyp of
           TFunct (Funct expectedI expectedO expectedFxs) -> do
-            InferResult argExpr argFxs argScope <- inferExpr scope' expr
+            InferResult argExpr argFxs argScope <- inferExpr scope' resumeExpr
             argT <- typeOfTypedExprUnsafe argExpr
             scope'' <- unifyTypes argScope argT expectedI
             wrapInferResultWithCell $
@@ -634,8 +725,14 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
     InferResult whtT whtFxs scope1 <- inferExpr scope wht
     -- 2. Получаем тип вычисленного выражения.
     whT' <- typeOfTypedExprIn scope1 whtT
-    -- 3. Создаём bindings из паттерна.
-    (lpT, scope2) <- inferLetPattern scope1 lp
+    -- 3. Создаём bindings из паттерна.  Every name of the pattern is an alias
+    -- of the value the right-hand side computes — the interpreter hands out
+    -- its address — so forcing such a name costs the row of the right-hand
+    -- side, exactly like forcing a `val` binding.  Without this a closure over
+    -- a `let` name claimed `{}` while forcing it read a `var` through the
+    -- alias.
+    men <- mentionRow scope1 (fvTyped whtT)
+    (lpT, scope2) <- inferLetPattern (Eff.unionEffRows whtFxs men) scope1 lp
     -- 4. Проверяем соответствие типа паттерна типу RHS.
     scope3 <- unifyTypes scope2 lpT whT'
     -- 5. Типизируем тело с уже доступными bindings.
@@ -647,24 +744,29 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
         scope4
   PropAccess e n -> do
     InferResult t fxs scope' <- inferExpr scope e
-    -- T-Prop: чтение изменяемого поля (var) даёт Read
+    -- T-Prop: the pending row of the record is what forcing a field may do, so
+    -- reading a field charges it; a `var` field additionally performs `Read`.
     let readIf m = if m == Var then Eff.closedOfFlat "Read" else Eff.empty
+        withPending pending row = Eff.unionEffRows row pending
     case t of
-      TERecord _ props ->
+      TERecord _ props pending ->
         case find (\(TERecordProp _ n' _ _) -> n == n') props of
-          Just (TERecordProp mutP _ _ e') ->
-            wrapInferResultWithCell $ InferResult e' (Eff.unionEffRows fxs (readIf mutP)) scope'
+          Just (TERecordProp mutP _ _ e') -> do
+            pending' <- applyEffRowSubst scope' pending
+            wrapInferResultWithCell $ InferResult e'
+              (withPending pending' (Eff.unionEffRows fxs (readIf mutP))) scope'
           Nothing -> throwTypeCheckErrorWithNotes
             (RecordError $ "this record has no field `" <> n <> "`")
             (maybe [] pure (suggestionNote (map (\(TERecordProp _ n' _ _) -> n') props) n))
       _ -> do
         recT <- typeOfTypedExprUnsafe t
         case recT of
-          TRecord rprops ->
+          TRecord rprops pending -> do
+            pending' <- applyEffRowSubst scope' pending
             case find ((n ==) . tName) rprops of
               Just rp ->
                 wrapInferResultWithCell $
-                  InferResult (TEPropAccess t n) (Eff.unionEffRows fxs (readIf (tMut rp))) scope'
+                  InferResult (TEPropAccess t n) (withPending pending' (Eff.unionEffRows fxs (readIf (tMut rp)))) scope'
               Nothing -> throwTypeCheckErrorWithNotes
                 (RecordError $ "this record has no field `" <> n <> "`")
                 (maybe [] pure (suggestionNote (map tName rprops) n))
@@ -685,11 +787,17 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
       (Eff.unionEffRows pFxs $ Eff.unionEffRows tFxs fFxs)
       iScope
 
-inferLetPattern :: Scope -> LetPattern -> TypeCheckM (Typ, Scope)
-inferLetPattern scope = \case
+-- | Bind the names of a @let@ pattern at the type they must have.
+--
+--   The first argument is the pending row of the right-hand side: a @let@ name
+--   is an alias of the value the right-hand side computes (the interpreter
+--   binds the same address), so forcing it costs that row, just as forcing a
+--   @val@ costs the row stored in its binding.
+inferLetPattern :: EffRow -> Scope -> LetPattern -> TypeCheckM (Typ, Scope)
+inferLetPattern row scope = \case
   LPParam (LambdaParam name t) -> do
     t' <- maybe freshMetaTypeM pure t
-    scope' <- Scope.addBinding name (monoScheme t') (XVar name) Val scope
+    scope' <- Scope.addBindingWithRow name (monoScheme t') (XVar name) Val row scope
     pure (t', scope')
 
   LPATom a ->
@@ -697,25 +805,30 @@ inferLetPattern scope = \case
       ALPNil -> pure (TNil, scope)
       ALPUnderscore -> (, scope) <$> freshMetaTypeM
       ALPPair l r -> do
-        (l', scope') <- inferLetPattern scope l
-        (r', scope'') <- inferLetPattern scope' r
-        pure (TPair l' r', scope'')
+        (l', scope') <- inferLetPattern row scope l
+        (r', scope'') <- inferLetPattern row scope' r
+        -- The pattern type is unified with the right-hand side, so its
+        -- annotation must not force an empty row: a pair whose components
+        -- read a `var` has a non-empty one.
+        pending <- freshMetaRowM
+        pure (TPair l' r' pending, scope'')
       ALPRecord props -> do
         (recordProps, scope') <- foldM inferProp ([], scope) props
-        pure (TRecord recordProps, scope')
+        pending <- freshMetaRowM
+        pure (TRecord recordProps pending, scope')
         where
           inferProp :: ([TRecordProp], Scope) -> LetPatternRecordProp -> TypeCheckM ([TRecordProp], Scope)
           inferProp (accProps, scope') (LetPatternRecordProp m (LambdaParam name t) alp) = do
             t' <- maybe freshMetaTypeM pure t
             -- Имя свойства становится доступным в текущем Scope.
-            scope'' <- Scope.addBinding name (monoScheme t') (XVar name) m scope'
+            scope'' <- Scope.addBindingWithRow name (monoScheme t') (XVar name) m row scope'
             -- При наличии вложенного паттерна проверяем его
             -- совместимость с типом свойства.
             scope''' <-
               case alp of
                 Nothing -> pure scope''
                 Just nested -> do
-                  (nestedT, nestedScope) <- inferLetPattern scope'' (LPATom nested)
+                  (nestedT, nestedScope) <- inferLetPattern row scope'' (LPATom nested)
                   unifyTypes nestedScope t' nestedT
 
             pure (accProps <> [TRecordProp m name t'], scope''')
@@ -727,24 +840,31 @@ inferRecord scope Nothing props = withNewLevel $ do
       InferResult exprT exprFxs sc' <- inferExpr sc expr
       exprT' <- typeOfTypedExprUnsafe exprT
       (propT, sc'') <- case typOpt of
-        Just annot -> (annot, ) <$> unifyTypes sc' exprT' annot
+        -- A field annotation may be an aggregate with its own pending row,
+        -- which is an upper bound like every other annotation of an aggregate.
+        Just annot -> (annot, ) <$> subsumesType sc' exprT' annot
         Nothing -> pure (exprT', sc')
       pure (accProps <> [TERecordProp mut name propT exprT], Eff.unionEffRows accFxs exprFxs, sc'')
     ) ([], Eff.empty, scope) props
-  wrapInferResultWithCell $ InferResult (TERecord Nothing recProps) finalFxs finalScope
+  -- T-Rec: the annotation bounds the component rows and their mentions; a
+  -- `var` field additionally makes the construction create a cell.
+  men <- mentionRow finalScope (Set.unions (map (fvTyped . terExpr) recProps))
+  pending <- freshMetaRowM
+  finalScope' <- subsumesEffRow finalScope (Eff.unionEffRows finalFxs men) pending
+  wrapInferResultWithCell $ InferResult (TERecord Nothing recProps pending) finalFxs finalScope'
 
 inferRecord scope (Just anchor) props = withNewLevel $ do
   InferResult anchorExpr anchorFxs scope1 <- inferExpr scope anchor
   anchorTyp <- typeOfTypedExprUnsafe anchorExpr
   case anchorTyp of
-    TRecord baseProps -> do
+    TRecord baseProps basePending -> do
       -- Накапливаем TERecordProp в отдельном аккумуляторе
       (recProps, propFxs, finalScope) <- foldM
         (\(accProps, accFxs, sc) (ERecordProp mut name typOpt expr) -> do
           InferResult exprExpr exprFxs sc' <- inferExpr sc expr
           exprTyp <- typeOfTypedExprUnsafe exprExpr
           (propT, sc'') <- case typOpt of
-            Just annot -> (annot,) <$> unifyTypes sc' exprTyp annot
+            Just annot -> (annot,) <$> subsumesType sc' exprTyp annot
             Nothing -> pure (exprTyp, sc')
           -- Проверяем мутабельность и существование поля в скоупе
           case find ((name ==) . tName) baseProps of
@@ -764,7 +884,16 @@ inferRecord scope (Just anchor) props = withNewLevel $ do
               -- Новое поле
               pure (accProps <> [TERecordProp mut name propT exprExpr], Eff.unionEffRows accFxs exprFxs, sc'')
         ) ([], anchorFxs, scope1) props
-      wrapInferResultWithCell $ InferResult (TERecord (Just anchorExpr) recProps) propFxs finalScope
+      -- T-Rec: the record being built gets its own annotation; the base's
+      -- pending row is a bound too, since the new record still shares the
+      -- base's fields.
+      men <- mentionRow finalScope (Set.unions (map (fvTyped . terExpr) recProps))
+      basePending' <- applyEffRowSubst finalScope basePending
+      pending <- freshMetaRowM
+      finalScope' <- subsumesEffRow finalScope
+        (Eff.unionEffRows (Eff.unionEffRows propFxs men) basePending') pending
+      wrapInferResultWithCell $
+        InferResult (TERecord (Just anchorExpr) recProps pending) propFxs finalScope'
     _ -> throwTypeCheckError $ RecordError "a record can only be built from another record, but this base is not one"
 
 inferHandler :: Scope -> Types.Handler -> InferM TypedExpr
@@ -775,10 +904,11 @@ inferHandler scope handler = withNewLevel $
       throwTypeCheckError $
         HandlerError $
           T.concat ["`", tasteName v, "` is an effect variable, not an effect, so it cannot be handled"]
-    eff@(EffCons eff'@(ECons n _)) -> do
-      ops <- case Scope.findEffOps True scope n of
+    eff@(EffCons eff'@(ECons n effArgs)) -> do
+      decl <- case effectDeclaration scope n of
         Nothing -> throwTypeCheckError $ HandlerError $ "there is no effect named `" <> n <> "` in scope"
-        Just ops -> pure ops
+        Just d -> pure d
+      let ops = instantiateOps decl effArgs
       let opNames = map fst ops
       -- 2. Создаём подскоуп с операциями
       let blockScope = enterScope scope
@@ -802,7 +932,15 @@ inferHandler scope handler = withNewLevel $
       blockT' <- typeOfTypedExprUnsafe blockExpr
 
       -- 4. Проверяем и типизируем handler clauses
-      let handlerRow = Unify.removeConsFromRow eff blockFxs
+      --
+      --   The row of the body is removed of the handled effect, but its
+      --   occurrences are still inference variables here: a recursive call
+      --   instantiates `Loop[`T]` with a fresh argument and only unification
+      --   binds it back to the enclosing `T`.  Comparing the unresolved row
+      --   with the handled effect would therefore miss the occurrence and leave
+      --   the effect in the handler's row.
+      blockFxsResolved <- applyEffRowSubst blockScope' blockFxs
+      (_handlerScope, handlerRow) <- removeHandledEffect blockScope' eff blockFxsResolved
 
       case handler of
         Types.Handler _ _ clauses _then -> do
@@ -869,42 +1007,69 @@ inferHandler scope handler = withNewLevel $
                         t <- generalize sc1 $ TFunct $ Funct r' blockT' handlerRow
                         sc2 <- Scope.addBinding "resume" t (XVar "resume") Val sc1
                         -- Типизируем lambda, где resume уже известен
-                        InferResult typedLambda lamFxs sc3 <- inferLambda sc2 lam
+                        InferResult typedLambda _lamFxs sc3 <- inferLambda sc2 lam
 
-                        let lamFunct = Funct typedLambda.lArgT typedLambda.lRetT typedLambda.lFxs
-
+                        -- The clause's own row is checked below against the
+                        -- row of the whole handler, not against the latent row
+                        -- of the operation: a clause of `Loop` may perform
+                        -- `Loop` again (a recursive call, or `break` from
+                        -- inside `continue`).  A fresh row variable keeps
+                        -- 'unifyTypes' from forcing the clause to be pure.
+                        freeRow <- freshMetaM
+                        let lamFunct = Funct typedLambda.lArgT typedLambda.lRetT (RVar freeRow)
                             lamTyp = TFunct lamFunct
 
                         -- Проверяем совместимость с типом операции
                         sc4 <- unifyTypes sc3 lamTyp opTypForClause
 
-                        sc5 <- unifyEffRows sc4 lamFxs handlerRow
-
-                        pure (acc <> [(name, typedLambda, OneResume, countArgs lamFunct)], sc5)
+                        pure (acc <> [(name, typedLambda, OneResume, countArgs lamFunct)], sc4)
 
                       NoResume -> do
                         -- Типизируем lambda без resume
                         let clauseScope = enterScope opScopeForClause
 
-                        InferResult typedLam lamFxs sc1 <-
+                        InferResult typedLam _lamFxs sc1 <-
                           inferLambda clauseScope lam
 
-                        let lamFunct = Funct typedLam.lArgT typedLam.lRetT typedLam.lFxs
+                        freeRow <- freshMetaM
+                        let lamFunct = Funct typedLam.lArgT typedLam.lRetT (RVar freeRow)
                             lamTyp = TFunct lamFunct
                         -- Проверяем совместимость с типом операции
                         sc2 <- unifyTypes sc1 lamTyp opTypForClause
-                        sc3 <- unifyEffRows sc2 lamFxs handlerRow
-                        pure (acc <> [(name, typedLam, NoResume, countArgs lamFunct)], sc3)
+                        pure (acc <> [(name, typedLam, NoResume, countArgs lamFunct)], sc2)
               )
               ([], blockScope')
               ops
 
           -- 5. Типизируем then
-          InferResult typedThen thenFxs thenScope <-
+          InferResult typedThen _thenFxs thenScope0 <-
             inferLambda finalScope _then
 
+          -- The `then` clause receives the value of the body and produces the
+          -- value of the whole handler expression, so both sides must agree
+          -- with the body's type.  Without these unifications the clause could
+          -- return a value of any type and its parameter could be used at any
+          -- type; the handler is statically typed as the body, so the runtime
+          -- would then carry a value that its type does not describe.
+          thenScope1 <- unifyTypes thenScope0 typedThen.lArgT blockT'
+          thenScope2 <- unifyTypes thenScope1 typedThen.lRetT blockT'
+
+          -- A clause runs when its operation is performed, so its effects
+          -- belong to the handler expression.  Checking them here against the
+          -- *body's* row would reject every clause that does more than the
+          -- body; the function's own declared row is the right bound, and it
+          -- is checked once, at the end of the body.
+          --
+          -- `inferLambda` returns the empty evaluation row (T-Lam); the
+          -- effects of running the clause are in its latent row.  The row of
+          -- `then` was previously taken from the former, so a handler whose
+          -- `then` read, rebound or created state reported none of it.
+          thenRow <- applyEffRowSubst thenScope2 typedThen.lFxs
+          clauseRows <- mapM
+            (applyEffRowSubst thenScope2)
+            [row | (_, lam, _, _) <- typedClauses, let row = lam.lFxs]
           let finalHandlerRow =
-                Eff.unionEffRows handlerRow thenFxs
+                Eff.unionEffRowsList (handlerRow : thenRow : clauseRows)
 
               typedHandler =
                 TypedIR.Handler
@@ -917,25 +1082,107 @@ inferHandler scope handler = withNewLevel $
             InferResult
               (TypedIR.TEHandle typedHandler blockT')
               finalHandlerRow
-              thenScope
+              thenScope2
+
+-- | Remove the effect a handler handles from the row of its body.
+--
+--   The occurrence in the body is matched by name and then unified with the
+--   handled effect, not compared with it: @Loop[`T]@ in the signature and
+--   @Loop[`m11]@ in a recursive call are the same effect only after @`m11@ has
+--   been bound to @`T@.  A syntactic comparison leaves the effect in the
+--   handler's row, so a recursive handler does not terminate its own effect.
+removeHandledEffect :: Scope -> EffCons -> EffRow -> TypeCheckM (Scope, EffRow)
+removeHandledEffect scope handled row = case handled of
+  EVar _ -> pure (scope, Unify.removeConsFromRow handled row)
+  EffCons (ECons name args) -> go scope row
+    where
+      go sc = \case
+        RClosed cons -> do
+          (sc', kept) <- foldM step (sc, []) cons
+          pure (sc', RClosed kept)
+        ROpen cons v -> do
+          (sc', kept) <- foldM step (sc, []) cons
+          pure (sc', ROpen kept v)
+        r@(RVar _) -> pure (sc, r)
+
+      step (sc, kept) cons@(EffCons (ECons name' args'))
+        | name' == name = do
+            sc' <- unifyTypeArgLists sc args' args
+            pure (sc', kept)
+        | otherwise = pure (sc, kept <> [cons])
+      step (sc, kept) cons = pure (sc, kept <> [cons])
+
+-- | Bind the operations of the effects named in a type's latent row.
+--
+--   A parameter such as @do () -> {Loop[`T]; ...Main} `T@ tells the caller that
+--   its argument may perform @Loop@, so @break@ and @continue@ must be visible
+--   while that argument is checked.  The effect is declared at the top level,
+--   but its operations are only bound inside an `under` block, and the argument
+--   is not inside one; the expected type is what licenses the names here.
+withRowOperations :: Scope -> Typ -> TypeCheckM Scope
+withRowOperations scope typ = do
+  t <- applyTypeSubst scope typ
+  case t of
+    TFunct (Funct _ _ row) -> do
+      row' <- applyEffRowSubst scope row
+      fst <$> foldM addEffectOps (scope, Map.empty) (rowEffects row')
+    _ -> pure scope
+ where
+  rowEffects = \case
+    RClosed cs -> cs
+    ROpen cs _ -> cs
+    RVar _ -> []
+
+  -- The second component remembers which effect declared each operation bound
+  -- for this row.  Two effects of one row may declare the same operation name;
+  -- binding the first silently and then running whichever handler is innermost
+  -- would check the call against one effect and run it in the other, so the
+  -- duplicate is reported here.
+  addEffectOps (sc, seen) = \case
+    EffCons (ECons name args) -> case effectDeclaration sc name of
+      Nothing -> pure (sc, seen)
+      Just decl -> foldM (bindOp name) (sc, seen) (instantiateOps decl args)
+    EVar _ -> pure (sc, seen)
+
+  bindOp opEff (sc, seen) (opName, opTyp)
+    | Just other <- Map.lookup opName seen
+    , other /= opEff =
+        throwTypeCheckError $ InferenceError $ T.concat
+          [ "the operation `", opName, "` is provided by both effects `", other
+          , "` and `", opEff, "`, so a use of it is ambiguous"
+          ]
+    | Scope.hasBinding False sc opName = pure (sc, Map.insert opName opEff seen)
+    | otherwise = do
+        opT <- generalize sc (TFunct opTyp)
+        sc' <- Scope.addBinding opName opT (XVar opName) Val sc
+        pure (sc', Map.insert opName opEff seen)
 
 inferLambda :: Scope -> Types.Lambda -> InferM TypedIR.Lambda
 inferLambda scope lam = withNewLevel $ do
   let scope1 = enterScope scope
   argT' <- maybe freshMetaTypeM pure lam.lArgT
-  scope2 <- Scope.addBinding lam.lArg (monoScheme argT') (XVar lam.lArg) Val scope1
   retT' <- maybe freshMetaTypeM pure lam.lRetT
+
+  -- T-Lam binds the parameter as (Val, T_1, R): forcing the argument costs
+  -- whatever the arrow's latent row licenses, because at a call site the
+  -- argument cell is created with exactly that row (W1 in the paper).  A use
+  -- of the parameter inside the body therefore pays R, and the body's row must
+  -- stay inside R.
+  rowFxs <- if lam.lFxs == RClosed [] then ROpen [] <$> freshMetaM else pure lam.lFxs
+  scope2 <- Scope.addBindingWithRow lam.lArg (monoScheme argT') (XVar lam.lArg) Val rowFxs scope1
+
   InferResult blockT blockFxs0 scope3 <- inferBlock scope2 lam.lBlock
   -- модель (T-Lam): упоминание переменной, несущей состояние, попадает в латентный ряд
   men <- mentionRow scope3 (Set.delete lam.lArg (fvTypedBlock blockT))
   let blockFxs = Eff.unionEffRows blockFxs0 men
   blockT' <- typeOfTypedBlockIn scope3 blockT
-  scope4 <- unifyTypes scope3 retT' blockT'
+  -- The annotated result type is a promise; an aggregate body with a smaller
+  -- pending row keeps it.
+  scope4 <- subsumesType scope3 blockT' retT'
 
-  rowFxs <- if lam.lFxs == RClosed [] then ROpen [] <$> freshMetaM else pure lam.lFxs
-
-  -- Затем применяем подстановки
-  scope5 <- unifyEffRows scope4 rowFxs blockFxs
+  -- T-Lam: R' ∪ Men ⊆ R.  Inclusion, not equality: an annotated row may be
+  -- wider than the body needs, and the parameter's pending row is that same R.
+  scope5 <- subsumesEffRow scope4 blockFxs rowFxs
   fxs'' <- applyEffRowSubst scope5 rowFxs
 
   argT'' <- applyTypeSubst scope5 argT'
@@ -955,12 +1202,20 @@ inferLambda scope lam = withNewLevel $ do
     (Scope.keepSubst scope5 scope)
 
 instantiateTypeScheme :: Scope -> TypeScheme -> TypeCheckM (Typ, Scope)
-instantiateTypeScheme scope scheme = do
+instantiateTypeScheme scope scheme =
+  (\(typ, _, scope') -> (typ, scope')) <$>
+    instantiateTypeSchemeWithRow scope scheme Eff.empty
+
+-- | Instantiate a scheme and, at the same time, a row that belongs to the
+--   binding but is not part of its type (the pending row of a @val@ binding).
+--   The row shares the scheme's row variables, so it has to be freshened with
+--   the same mapping; otherwise a postponed effect would stay attached to the
+--   definition-site variable after every use of a polymorphic binding.
+instantiateTypeSchemeWithRow :: Scope -> TypeScheme -> EffRow -> TypeCheckM (Typ, EffRow, Scope)
+instantiateTypeSchemeWithRow scope scheme extraRow = do
   let tvars = _ts scheme
       evars = _es scheme
       rvars = _rs scheme
-      els = _effLacks scheme
-      rls = _rowLacks scheme
       typ = _a scheme
 
   freshTypes <- mapM (const freshMetaM) tvars
@@ -994,8 +1249,9 @@ instantiateTypeScheme scope scheme = do
     (zip evars freshEffects)
 
   typ' <- applyTypeSubst scope''' typ
+  row' <- applyEffRowSubst scope''' extraRow
 
-  pure (typ', scope''')
+  pure (typ', row', scope''')
 
 inferBlock :: Scope -> Types.Block -> InferM TypedIR.Block
 inferBlock outer (stats, expr) = withNewLevel $ do
@@ -1047,24 +1303,44 @@ inferStatNode scope stat =
     inferredTyp <- typeOfTypedExprUnsafe inferredTypedExpr
 
     -- 2. Prepare binding
-    (exprForBinding, typForBinding, fxsForBinding, scope2) <-
+    (exprForBinding, typForBinding, fxsForBinding, bindingRow, scope2) <-
       case m of
         Imm -> do
           let frozenExpr = freeze inferredTypedExpr
 
+          -- The snapshot copies the current values of the free variables.  A
+          -- later assignment may extend their pending rows, so freezing must
+          -- not constrain those rows (see 'environmentRowVars'); otherwise
+          -- `var x = 5; imm y = ... x ...; x := + x 1` would be rejected.
+          excluded <- environmentRowVars scope1
+
           -- Freeze the inferred type, including latent function effects.
           inferredTyp' <- applyTypeSubst scope1 inferredTyp
-          (scope', frozenTyp) <- freezeTyp scope1 inferredTyp'
+          (scope', frozenTyp) <- freezeTypExcept excluded scope1 inferredTyp'
 
           -- Remove explicit mutation effects and constrain the remaining
-          -- effect variables and row tails.
+          -- effect variables and row tails that belong to the frozen value.
           inferredFxs' <- applyEffRowSubst scope' inferredFxs
-          (scope'', frozenFxs) <- freezeRowMutIn scope' inferredFxs'
+          (scope'', frozenFxs) <- freezeRowMutInExcept excluded scope' inferredFxs'
 
-          -- The snapshot itself reads the state of captured variables.
+          -- The snapshot itself reads the state of captured variables.  The
+          -- frozen binding itself no longer reads anything, so its pending
+          -- row is the frozen row, not the row of the snapshot statement.
           men <- mentionRow scope'' (fvTyped inferredTypedExpr)
-          pure (frozenExpr, frozenTyp, Eff.unionEffRows frozenFxs men, scope'')
-        _ -> pure (inferredTypedExpr, inferredTyp, inferredFxs, scope1)
+          pure (frozenExpr, frozenTyp, Eff.unionEffRows frozenFxs men, frozenFxs, scope'')
+        Val -> do
+          -- T-ValBind: the binding remembers what forcing its thunk may do.
+          -- It is not paid here; every use of the name pays it (T-Var).
+          men <- mentionRow scope1 (fvTyped inferredTypedExpr)
+          pure (inferredTypedExpr, inferredTyp, inferredFxs, Eff.unionEffRows inferredFxs men, scope1)
+        Var -> do
+          -- T-VarBind: the row variable bounds the declaration and every
+          -- later assignment.  It starts open so that a rebinding may extend
+          -- it; the declaration itself only adds a lower bound.
+          men <- mentionRow scope1 (fvTyped inferredTypedExpr)
+          rho <- ROpen [] <$> freshMetaM
+          scope' <- subsumesEffRow scope1 (Eff.unionEffRows inferredFxs men) rho
+          pure (inferredTypedExpr, inferredTyp, inferredFxs, rho, scope')
 
     -- 3. Handle annotation
     (expectedTyp, schemeForScope, scope3) <-
@@ -1072,7 +1348,9 @@ inferStatNode scope stat =
         Just anno -> do
           let scheme = monoScheme anno
           (annoInst, scope') <- instantiateTypeScheme scope2 scheme
-          scope'' <- unifyTypes scope' typForBinding annoInst
+          -- An annotation on an aggregate is an upper bound, just as it is in
+          -- the return type of a function.
+          scope'' <- subsumesType scope' typForBinding annoInst
           (annoInst, , scope'') <$> generalize scope'' anno
 
         Nothing -> do
@@ -1092,7 +1370,7 @@ inferStatNode scope stat =
         else pure schemeForScope
 
     -- 6. Add binding to Scope
-    scope5 <- Scope.addBinding n finalScheme (XVar n) m scope4
+    scope5 <- Scope.addBindingWithRow n finalScheme (XVar n) m bindingRow scope4
 
     -- 7. Final effects
     let finalFxs = fxsForBinding
@@ -1103,30 +1381,20 @@ inferStatNode scope stat =
         finalFxs
         scope5
   Types.Assign n e -> do
-    (scheme, _, mut) <- case Scope.findBinding True scope n of
+    (scheme, mut, pending) <- case Scope.findBindingWithRow True scope n of
       Nothing -> throwTypeCheckErrorWithNotes (UndefinedVariable n)
         (maybe [] pure (suggestionNote (Scope.bindingNames scope) n))
-      Just found -> pure found
+      Just (ValueBinding scheme _ mut' row) -> pure (scheme, mut', row)
     when (mut /= Var) $ throwTypeCheckError $ ImmutableVariableAssignment n
     (varT, scope') <- instantiateTypeScheme scope scheme
     InferResult eT eFxs scope'' <- inferExpr scope' e
-    let finalFxs = Eff.unionEffRows eFxs $ Eff.closedOfFlat "Rebind"
     eT' <- typeOfTypedExprUnsafe eT
-    InferResult (TypedIR.Rebind n eT) finalFxs <$> unifyTypes scope'' varT eT'
-
--- | Name the variables that blocked a generalisation, for the diagnostic.
-describeStuck :: ([Taste], [Taste], [Taste]) -> Text
-describeStuck (ts, es, rs) =
-  T.intercalate ", " $ filter (not . T.null)
-    [ labelled "type variable" ts
-    , labelled "effect variable" es
-    , labelled "row variable" rs
-    ]
-  where
-    labelled kind xs =
-      case xs of
-        [] -> ""
-        _ -> kind <> "s " <> T.intercalate ", " (map (("`" <>) . tasteName) xs)
+    -- T-Rebind: the right-hand side is delayed, so its row and its mention row
+    -- must fit into the pending row chosen for the variable.
+    men <- mentionRow scope'' (fvTyped eT)
+    scopeRow <- subsumesEffRow scope'' (Eff.unionEffRows eFxs men) pending
+    let finalFxs = Eff.unionEffRows eFxs $ Eff.closedOfFlat "Rebind"
+    InferResult (TypedIR.Rebind n eT) finalFxs <$> unifyTypes scopeRow varT eT'
 
 generalize :: Scope -> Typ -> TypeCheckM TypeScheme
 generalize scope typ = do
@@ -1146,25 +1414,8 @@ generalize scope typ = do
       evars = filter isGeneralizable allEvars
       rvars = filter isGeneralizable allRvars
 
-      nonGeneralizableTvars = filter (not . isGeneralizable) allTvars
-      nonGeneralizableEvars = filter (not . isGeneralizable) allEvars
-      nonGeneralizableRvars = filter (not . isGeneralizable) allRvars
-
       generalizedRows = Map.filterWithKey (\k _ -> k `elem` rvars) scope.rowLacks
       generalizedEffects = Map.filterWithKey (\k _ -> k `elem` evars) scope.effLacks
-
-  when (any (/= []) [
-      nonGeneralizableTvars,
-      nonGeneralizableEvars,
-      nonGeneralizableRvars
-    ]) $
-      throwTypeCheckError $ InferenceError $
-        "Cannot generalize this binding: " <>
-        describeStuck (nonGeneralizableTvars, nonGeneralizableEvars, nonGeneralizableRvars) <>
-        ". Its type mentions type or effect variables that are still free at " <>
-        "the level where the binding was defined, so it cannot be made " <>
-        "polymorphic. Add a type annotation that fixes them, or move the " <>
-        "binding out of the inner scope."
 
   pure Scheme {
     _ts = tvars,
@@ -1178,15 +1429,19 @@ generalize scope typ = do
 collectTvarsFromType :: [Taste] -> Typ -> [Taste]
 collectTvarsFromType except typ =
   uniqPreserveOrder $ case typ of
-    TArray t -> collectTvarsFromType except t
-    TPair l r -> collectTvarsFromType except l <> collectTvarsFromType except r
+    TArray t r -> collectTvarsFromType except t <> collectTvarsFromEffRow except r
+    TPair l r fx ->
+      collectTvarsFromType except l
+        <> collectTvarsFromType except r
+        <> collectTvarsFromEffRow except fx
     TFunct (Funct i o fxs) ->
       collectTvarsFromType except i
       <> collectTvarsFromType except o
       <> collectTvarsFromEffRow except fxs
-    TForall vars _ _ els rls t -> collectTvarsFromType (uniqPreserveOrder $ vars <> except) t
-    TRecord props ->
+    TForall vars _ _ _ _ t -> collectTvarsFromType (uniqPreserveOrder $ vars <> except) t
+    TRecord props fx ->
       concatMap (collectTvarsFromType except . tTyp) props
+        <> collectTvarsFromEffRow except fx
     TVar v -> ([v | v `notElem` except])
     _ -> []
 
@@ -1216,11 +1471,16 @@ collectTvarsFromEffCons except e =
 collectEvarsFromType :: [Taste] -> Typ -> [Taste]
 collectEvarsFromType except typ =
   uniqPreserveOrder $ case typ of
-    TArray t -> collectEvarsFromType except t
-    TPair l r -> collectEvarsFromType except l <> collectEvarsFromType except r
+    TArray t r -> collectEvarsFromType except t <> collectEvarsFromEffRow except r
+    TPair l r fx ->
+      collectEvarsFromType except l
+        <> collectEvarsFromType except r
+        <> collectEvarsFromEffRow except fx
     TFunct (Funct i o fxs) -> collectEvarsFromType except i <> collectEvarsFromType except o <> collectEvarsFromEffRow except fxs
-    TForall _ fxs _ els rls t -> collectEvarsFromType (uniqPreserveOrder $ fxs <> except) t
-    TRecord props -> concatMap (collectEvarsFromType except . tTyp) props
+    TForall _ fxs _ _ _ t -> collectEvarsFromType (uniqPreserveOrder $ fxs <> except) t
+    TRecord props fx ->
+      concatMap (collectEvarsFromType except . tTyp) props
+        <> collectEvarsFromEffRow except fx
     _ -> []
 
 collectEvarsFromEffRow :: [Taste] -> EffRow -> [Taste]
@@ -1239,13 +1499,19 @@ collectEvarsFromEffCons except e =
 collectRvarsFromType :: [Taste] -> Typ -> [Taste]
 collectRvarsFromType except typ =
   uniqPreserveOrder $ case typ of
-    TArray t -> collectRvarsFromType except t
-    TPair l r -> collectRvarsFromType except l <> collectRvarsFromType except r
+    TArray t r ->
+      collectRvarsFromType except t <> collectRvarsFromEffRow except r
+    TPair l r fx ->
+      collectRvarsFromType except l
+        <> collectRvarsFromType except r
+        <> collectRvarsFromEffRow except fx
     TFunct (Funct i o fxs) ->
       concatMap (collectRvarsFromType except) [i, o] <>
       collectRvarsFromEffRow except fxs
-    TForall _ _ rows els rls t -> collectRvarsFromType (uniqPreserveOrder $ rows <> except) t
-    TRecord props -> concatMap (collectRvarsFromType except . tTyp) props
+    TForall _ _ rows _ _ t -> collectRvarsFromType (uniqPreserveOrder $ rows <> except) t
+    TRecord props fx ->
+      concatMap (collectRvarsFromType except . tTyp) props
+        <> collectRvarsFromEffRow except fx
     _ -> []
 
 collectRvarsFromEffRow :: [Taste] -> EffRow -> [Taste]
@@ -1258,46 +1524,87 @@ collectRvarsFromEffRow except fx =
 -- | Свободные переменные типизированного выражения (для анализа выхода состояния из блока).
 --   Привязки let учитываются консервативно (не вычитаются).
 -- | Тип несёт изменяемое состояние (модель: St_T): var-поле записи, латентный ряд стрелки
---   с Read/Rebind или хвост ряда, не обобщённый схемой (неизвестные эффекты).
+--   с Read/Rebind, pending row агрегата с Read/Rebind или хвост ряда, не обобщённый схемой
+--   (неизвестные эффекты).
 --   У стрелки учитывается только её собственный ряд, а не тип результата: функция,
 --   которая создаёт состояние (make), само состояние не держит.
 bearsState :: [Taste] -> Typ -> Bool
 bearsState quantified = go
   where
     go = \case
-      TArray t -> go t
-      TPair l r -> go l || go r
-      TFunct (Funct _ _ row) -> rowUses row
-      TRecord props -> any (\p -> tMut p == Var || go (tTyp p)) props
-      -- переменная типа может быть конкретизирована типом, несущим состояние
-      TVar _ -> True
+      TArray t r -> go t || effRowBearsState quantified r
+      TPair l r fx -> go l || go r || effRowBearsState quantified fx
+      TFunct (Funct _ _ row) -> effRowBearsState quantified row
+      TRecord props fx ->
+        any (\p -> tMut p == Var || go (tTyp p)) props
+          || effRowBearsState quantified fx
+      -- An inference variable may still be instantiated with a type that
+      -- carries state, so it is assumed to.  A rigid variable (bound by a
+      -- signature, or a skolem) cannot: nothing can make it a state type, so
+      -- it does not make its user perform `Read`.
+      TVar Meta{} -> True
+      TVar _ -> False
       _ -> False
-    rowUses = \case
-      RClosed cs -> any isUse cs
-      ROpen cs v -> any isUse cs || v `notElem` quantified
-      RVar v -> v `notElem` quantified
+
+-- | Does this row name a read or a rebind?
+--
+--   Only an explicit effect counts.  An unresolved tail is not evidence: a
+--   parameter's pending row *is* the latent row of the arrow being inferred
+--   (T-Lam), so reading openness as "may still become Read" would make every
+--   parameter of every lambda state-bearing on its own account, and a pure
+--   `{(n) = + n 1}` would be forced to declare `Read`.  A row that a later
+--   assignment extends belongs to a @var@ binding, which is already
+--   state-bearing through its mutability.
+effRowBearsState :: [Taste] -> EffRow -> Bool
+effRowBearsState _quantified = \case
+  RClosed cs -> any isUse cs
+  ROpen cs _ -> any isUse cs
+  RVar _ -> False
+  where
     isUse = \case
       EffCons (ECons n _) -> n == "Read" || n == "Rebind"
       _ -> False
 
--- | Несёт ли переменная состояние (модель: St): var-привязка или тип, несущий состояние
+-- | The row tails the current substitution has produced for a scheme's row
+--   variables.
+--
+--   Instantiation replaces every quantified tail with a fresh metavariable, so
+--   a type read back through the scope mentions the copies, not the variables
+--   the scheme still records.  Without this translation a row-polymorphic
+--   builtin (`sayn : a -> {Output | ρ} ()`) would look like it carried an
+--   unknown, possibly state-bearing tail.
+instantiatedRowTails :: Scope -> [Taste] -> TypeCheckM [Taste]
+instantiatedRowTails scope = fmap concat . mapM tails
+  where
+    tails v = do
+      r <- applyEffRowSubst scope (RVar v)
+      pure $ case r of
+        RVar w -> [w]
+        ROpen _ w -> [w]
+        _ -> []
+
+-- | Несёт ли переменная состояние (модель: St): var-привязка, тип, несущий
+--   состояние, или pending row, в котором есть Read/Rebind.
 varBearsState :: Scope -> Text -> TypeCheckM Bool
 varBearsState scope n =
-  case Scope.findBinding True scope n of
+  case Scope.findBindingWithRow True scope n of
     Nothing -> pure False
-    Just (Scheme _ _ rvs _ _ t, _, m) -> do
+    Just (ValueBinding (Scheme _ _ rvs _ _ t) _ m row) -> do
       t' <- applyTypeSubst scope t
-      pure $ m == Var || bearsState rvs t'
+      row' <- applyEffRowSubst scope row
+      freshTails <- instantiatedRowTails scope rvs
+      let quantified = rvs <> freshTails
+      pure $ m == Var || bearsState quantified t' || effRowBearsState quantified row'
 
 -- | Выражение не создаёт и не меняет состояние: freeze на нём тождествен
 --   (нет var-операторов, присваиваний и var-полей)
 isFrozenExpr :: TypedExpr -> Bool
 isFrozenExpr = \case
-  TEArray _ es -> all isFrozenExpr es
-  TEPair l r -> isFrozenExpr l && isFrozenExpr r
+  TEArray _ _ es -> all isFrozenExpr es
+  TEPair _ l r -> isFrozenExpr l && isFrozenExpr r
   TEXLambda lam -> isFrozenBlock lam.lBlock
   TEApply f x -> isFrozenExpr f && isFrozenExpr x
-  TERecord me props ->
+  TERecord me props _ ->
     maybe True isFrozenExpr me
       && all (\(TERecordProp m _ _ e) -> m /= Var && isFrozenExpr e) props
   TEHandle (TypedIR.Handler _ block clauses mlam) _ ->
@@ -1329,11 +1636,11 @@ mentionRow scope names = do
 fvTyped :: TypedExpr -> Set.Set Text
 fvTyped = \case
   TEXVar n _ -> Set.singleton n
-  TEArray _ es -> Set.unions (map fvTyped es)
-  TEPair l r -> Set.union (fvTyped l) (fvTyped r)
+  TEArray _ _ es -> Set.unions (map fvTyped es)
+  TEPair _ l r -> Set.union (fvTyped l) (fvTyped r)
   TEXLambda lam -> Set.delete lam.lArg (fvTypedBlock lam.lBlock)
   TEApply f x -> Set.union (fvTyped f) (fvTyped x)
-  TERecord me props ->
+  TERecord me props _ ->
     Set.unions $ maybe [] (pure . fvTyped) me <> [fvTyped e | TERecordProp _ _ _ e <- props]
   TEHandle (TypedIR.Handler _ block clauses mlam) _ ->
     Set.unions $ [fvTypedBlock block, fvTypedBlock mlam.lBlock]
@@ -1360,6 +1667,14 @@ fvTypedBlock (stats, expr) = go Set.empty stats
 -- | Может ли значение этого типа держать изменяемое состояние (замыкание, запись,
 --   структура с такими компонентами). Значения базовых типов состояния не держат,
 --   поэтому из блока с результатом Int или () состояние наружу не уходит.
+--
+--   This is @St_T@ of the paper: an aggregate holds state when a component does
+--   or when its pending row names `Read`/`Rebind`, a record also when it has a
+--   `var` field, and an arrow only through its own latent row (a function that
+--   *creates* state holds none).  Every type variable counts, because it may be
+--   instantiated by a type that does; 'bearsState' can be more generous about a
+--   parameter, whose row is the arrow's latent row, but the capture rule of a
+--   block result must stay conservative.
 canHoldState :: Typ -> Bool
 canHoldState = \case
   TInt -> False
@@ -1368,8 +1683,13 @@ canHoldState = \case
   TString -> False
   TNil -> False
   TNothing -> False
-  TArray t -> canHoldState t
-  TPair l r -> canHoldState l || canHoldState r
+  TArray t r -> canHoldState t || effRowBearsState [] r
+  TPair l r fx -> canHoldState l || canHoldState r || effRowBearsState [] fx
+  TRecord props r ->
+    any (\p -> tMut p == Var || canHoldState (tTyp p)) props
+      || effRowBearsState [] r
+  TFunct (Funct _ _ row) -> effRowBearsState [] row
+  TVar _ -> True
   _ -> True
 
 -- | Имена, достижимые из результата блока (модель: reach): свободные переменные результата,
@@ -1385,16 +1705,13 @@ reachNames stats result = grow (fvTyped result)
       TypedIR.Rebind n e | Set.member n acc -> Set.union acc (fvTyped e)
       _ -> acc
 
-introducesLocalState :: TypedIR.Block -> Bool
-introducesLocalState (stats, _) = any (\case TypedIR.Bind Var _ _ -> True; _ -> False) stats
-
 createsCell :: TypedExpr -> Bool
 createsCell = \case
   TEParen _ -> False  -- Var/Cell блока учитывает inferBlock (phi)
-  TEArray _ es -> any createsCell es
-  TEPair l r -> createsCell l || createsCell r
+  TEArray _ _ es -> any createsCell es
+  TEPair _ l r -> createsCell l || createsCell r
   TEXLambda _ -> False  -- латентный ряд тела несёт Var/Cell
-  TERecord me props ->
+  TERecord me props _ ->
     maybe False createsCell me ||
     any (\(TERecordProp m _ _ e) -> m == Var || createsCell e) props
   TEHandle _ _ -> False
@@ -1404,26 +1721,19 @@ createsCell = \case
   TEPropAccess e _ -> createsCell e
   _ -> False
 
-handlerCreatesCell :: TypedIR.Handler -> Bool
-handlerCreatesCell = \case
-  TypedIR.Handler _ block clauses mlam ->
-    introducesLocalState block ||
-    any (\(_, l, _, _) -> introducesLocalState l.lBlock) clauses ||
-    introducesLocalState mlam.lBlock
-
 freeze :: TypedExpr -> TypedExpr
 freeze = \case
-  TEArray t es -> TEArray t $ map freeze es
-  TEPair l r -> TEPair (freeze l) $ freeze r
+  TEArray t r es -> TEArray t r $ map freeze es
+  TEPair r l e -> TEPair r (freeze l) $ freeze e
   TEXLambda l -> TEXLambda l {TypedIR.lBlock = freezeBlock l.lBlock}
   TEApply c e -> TEApply (freeze c) $ freeze e
-  TERecord a ps ->
+  TERecord a ps r ->
     let a' = freeze <$> a
         mapTERecordProp :: TERecordProp -> TERecordProp
         mapTERecordProp p = p {terExpr = freeze p.terExpr, terMut = freezeMutability p.terMut}
         ps' = map mapTERecordProp ps
     in
-    TERecord a' ps'
+    TERecord a' ps' r
   TEHandle h t -> TEHandle (freezeHandler h) t
   TEParen b -> TEParen $ freezeBlock b
   TEResume e t -> TEResume (freeze e) t
@@ -1435,44 +1745,144 @@ freeze = \case
 -- | Заморозка типа: var-поля записей становятся val, из рядов стрелок убираются
 --   Var, Read, Rebind, Cell (модель: freeze на типах)
 freezeTyp :: Scope -> Typ -> TypeCheckM (Scope, Typ)
-freezeTyp scope = \case
-  TArray t -> do mapSnd TArray <$> freezeTyp scope t
+freezeTyp = freezeTypExcept Set.empty
 
-  TPair l r -> do
-    (scope', l') <- freezeTyp scope l
-    mapSnd (TPair l') <$> freezeTyp scope' r
+-- | Freeze a type without constraining the row variables in @excluded@.
+--
+--   A snapshot copies the current values of its free variables; it does not
+--   promise anything about their future assignments.  The pending row of a
+--   live @var@ is an upper bound that a later rebinding may extend, so
+--   constraining such a variable to lack @Mut@ would make the snapshot reject
+--   a program whose later assignment is perfectly legal.  The caller therefore
+--   excludes the row and effect variables that the environment controls (see
+--   'environmentRowVars'); their rows are kept as upper bounds in the frozen
+--   type, which is conservative but sound.  Variables that the frozen value
+--   owns (quantified tails, rows created inside the expression) are still
+--   constrained.
+freezeTypExcept :: Set Taste -> Scope -> Typ -> TypeCheckM (Scope, Typ)
+freezeTypExcept excluded scope = \case
+  TArray t r -> do
+    (scope', t') <- freezeTypExcept excluded scope t
+    (scope'', r') <- freezeRowMutInExcept excluded scope' r
+    pure (scope'', TArray t' r')
+
+  TPair l r fx -> do
+    (scope', l') <- freezeTypExcept excluded scope l
+    (scope'', r') <- freezeTypExcept excluded scope' r
+    (scope''', fx') <- freezeRowMutInExcept excluded scope'' fx
+    pure (scope''', TPair l' r' fx')
 
   TFunct (Funct i o fxs) -> do
-    (scope', i') <- freezeTyp scope i
-    (scope'', o') <- freezeTyp scope' o
-    (scope''', fxs') <- freezeRowMutIn scope'' fxs
+    (scope', i') <- freezeTypExcept excluded scope i
+    (scope'', o') <- freezeTypExcept excluded scope' o
+    (scope''', fxs') <- freezeRowMutInExcept excluded scope'' fxs
     pure (scope''', TFunct (Funct i' o' fxs'))
 
-  TRecord props -> mapSnd TRecord <$> foldM freezeProp (scope, []) props
+  TRecord props r -> do
+    (scope', props') <- foldM freezeProp (scope, []) props
+    (scope'', r') <- freezeRowMutInExcept excluded scope' r
+    pure (scope'', TRecord props' r')
 
   TForall ts es rs els rls t -> do
     let scope' = scope {
       effLacks = foldr Map.delete scope.effLacks es,
       rowLacks = foldr Map.delete scope.rowLacks rs
     }
-    (scope'', t') <- freezeTyp scope' t
-    let els' = Map.unionWith Set.union els $ Map.restrictKeys scope''.effLacks (Set.fromList es)
-        rls' = Map.unionWith Set.union rls $ Map.restrictKeys scope''.rowLacks (Set.fromList rs)
-    pure (scope, TForall ts es rs els' rls' t')
+    (scope'', t') <- freezeTypExcept excluded scope' t
+    let quantifiedEs = Set.fromList es
+        quantifiedRs = Set.fromList rs
+        els' = Map.unionWith Set.union els $
+          Map.restrictKeys scope''.effLacks quantifiedEs
+        rls' = Map.unionWith Set.union rls $
+          Map.restrictKeys scope''.rowLacks quantifiedRs
+        -- Constraints on variables that this forall does not bind belong to
+        -- the surrounding scope.  Dropping them would leave a tail in the
+        -- frozen body free to be instantiated with `Read` later, so they are
+        -- kept; the constraints on the quantified variables have already
+        -- moved into 'els'' and 'rls''.
+        scopeOut = scope'' {
+          effLacks = Map.withoutKeys scope''.effLacks quantifiedEs,
+          rowLacks = Map.withoutKeys scope''.rowLacks quantifiedRs
+        }
+    pure (scopeOut, TForall ts es rs els' rls' t')
 
   t -> pure (scope, t)
   where
     freezeProp (sc, acc) p = do
-      (sc', typ') <- freezeTyp sc (tTyp p)
+      (sc', typ') <- freezeTypExcept excluded sc (tTyp p)
       pure (sc', acc <> [p {tMut = freezeMutability (tMut p), tTyp = typ'}])
 
-freezeRowMut :: EffRow -> EffRow
-freezeRowMut row = foldl (flip removeConsFromRow) row $ Set.map Eff.label mutationEffects
-
 freezeRowMutIn :: Scope -> EffRow -> TypeCheckM (Scope, EffRow)
-freezeRowMutIn scope row = do
+freezeRowMutIn = freezeRowMutInExcept Set.empty
+
+freezeRowMutInExcept :: Set Taste -> Scope -> EffRow -> TypeCheckM (Scope, EffRow)
+freezeRowMutInExcept excluded scope row = do
   let frozenRow = foldl (flip removeConsFromRow) row $ map Eff.label (Set.toList mutationEffects)
-  (, frozenRow) <$> addRowLacksToRow scope frozenRow mutationEffects
+  (, frozenRow) <$> addRowLacksToRowExcept excluded scope frozenRow mutationEffects
+
+-- | The row and effect variables whose instantiation the environment controls:
+--   they occur in the pending rows or in the types of the bindings currently
+--   in scope.  A rebinding may extend those rows after a snapshot, so freezing
+--   must treat them as upper bounds rather than as tails it can constrain.
+environmentRowVars :: Scope -> TypeCheckM (Set Taste)
+environmentRowVars scope = do
+  rows <- mapM (applyEffRowSubst scope) (visibleRows scope)
+  let typVars = concatMap (rowVarsInTyp . _a . vbScheme) (visibleBindings scope)
+  pure $ Set.fromList $ filter isMeta $ concatMap rowVarsInRow rows <> typVars
+  where
+    isMeta Meta{} = True
+    isMeta _ = False
+
+    visibleBindings :: Scope -> [ValueBinding]
+    visibleBindings sc =
+      Map.elems sc.values <> maybe [] visibleBindings sc.parent
+
+    visibleRows :: Scope -> [EffRow]
+    visibleRows sc =
+      [vbRow b | b <- visibleBindings sc]
+
+rowVarsInRow :: EffRow -> [Taste]
+rowVarsInRow = \case
+  RClosed cs -> concatMap rowVarsInCons cs
+  ROpen cs v -> v : concatMap rowVarsInCons cs
+  RVar v -> [v]
+
+rowVarsInCons :: EffCons -> [Taste]
+rowVarsInCons = \case
+  EVar v -> [v]
+  EffCons (ECons _ _) -> []
+
+rowVarsInTyp :: Typ -> [Taste]
+rowVarsInTyp = \case
+  TArray t r -> rowVarsInTyp t <> rowVarsInRow r
+  TPair l r fx -> rowVarsInTyp l <> rowVarsInTyp r <> rowVarsInRow fx
+  TFunct (Funct i o row) -> rowVarsInTyp i <> rowVarsInTyp o <> rowVarsInRow row
+  TRecord props r -> concatMap (rowVarsInTyp . tTyp) props <> rowVarsInRow r
+  TForall _ _ _ _ _ t -> rowVarsInTyp t
+  _ -> []
+
+addRowLacksToRowExcept :: Set Taste -> Scope -> EffRow -> Set Text -> TypeCheckM Scope
+addRowLacksToRowExcept excluded scope row forbidden =
+  case row of
+    RClosed cons -> foldM addEffectLacks scope cons
+    ROpen cons tailVar -> do
+      scope' <- foldM addEffectLacks scope cons
+      if tailVar `Set.member` excluded
+        then pure scope'
+        else addRowLacks scope' tailVar forbidden
+    RVar variable ->
+      if variable `Set.member` excluded
+        then pure scope
+        else addRowLacks scope variable forbidden
+  where
+    addEffectLacks sc effect =
+      case effect of
+        -- Explicit mutation effects have already been removed from the row;
+        -- any other label is ordinary and does not need a lacks constraint.
+        EffCons (ECons _ _) -> pure sc
+        EVar variable
+          | variable `Set.member` excluded -> pure sc
+          | otherwise -> addEffLacks sc variable forbidden
 
 mutationEffects :: Set Text
 mutationEffects = Set.fromList ["Read", "Var", "Rebind", "Cell"]

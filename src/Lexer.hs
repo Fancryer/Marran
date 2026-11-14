@@ -53,7 +53,9 @@ stripUnderscore :: String -> String
 stripUnderscore = filter (/= '_')
 
 parseDecInt :: String -> Integer
-parseDecInt = read . stripUnderscore
+parseDecInt =
+  foldl (\acc d -> acc * 10 + fromIntegral (digitToInt d)) 0
+  . stripUnderscore
 
 parseHexInt :: String -> Integer
 parseHexInt =
@@ -90,9 +92,15 @@ parseExponent :: String -> Int
 parseExponent [] = 0
 parseExponent (_:rest) =
   case rest of
-    '-':ds -> negate (read ds)
-    '+':ds -> read ds
-    ds     -> read ds
+    '-':ds -> negate (parseDecDigits ds)
+    '+':ds -> parseDecDigits ds
+    ds     -> parseDecDigits ds
+
+-- | The digits of an exponent.  They are produced by @some digit@, so the input
+--   is known to be decimal; reading them with a fold keeps the function total
+--   instead of relying on 'read'.
+parseDecDigits :: String -> Int
+parseDecDigits = foldl (\acc d -> acc * 10 + digitToInt d) 0
 
 intLiteral :: Lexer Integer
 intLiteral = lexeme $ parseDecInt <$> intDigitPart

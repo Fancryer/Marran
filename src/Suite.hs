@@ -14,6 +14,8 @@ module Suite (
   , rejectedProgram
   , runSuite
   , runProgram
+  , runProgramWithInput
+  , runSourceWithInput
   , programPath
   ) where
 
@@ -79,33 +81,68 @@ programPath name = do
 --   captured and returned; the result is 'Left' on a parse, elaboration or
 --   type error.
 runProgram :: FilePath -> IO (Either String String)
-runProgram name =
+runProgram name = runProgramWithInput name ""
+
+-- | 'runProgram' with a fixed standard input.
+--
+--   A program that reads input (such as a loop driven by @read_int@) needs a
+--   deterministic answer stream; the test harness redirects @stdin@ from a
+--   temporary file for the duration of the run.
+runProgramWithInput :: FilePath -> String -> IO (Either String String)
+runProgramWithInput name input =
   programPath name >>= \case
     Nothing -> pure $ Left $ "program not found: " ++ name ++ ".marr"
     Just path -> do
       src <- T.pack <$> readFile path
-      -- The source map is what lets the renderer quote the offending lines; the
-      -- name of the file in the map must match the one recorded in the spans.
-      let sources = insertSource (T.pack path) src emptySourceMap
-      case elaborate <$> parseFromTextNamed path chunk src of
-        Left e -> pure $ Left e
-        Right elabAction ->
-          case evalState (runExceptT elabAction) (ElabState 0) of
-            Left e -> pure . Left . T.unpack $
-              renderDiagnostic sources (diagnostic SevError Nothing (pretty e))
-            Right c' ->
-              case evalTypeCheckM (inferChunk [] c') (TypeCheckState (0, 0, 0) 0 []) of
-                Left (stack, err) ->
-                  pure . Left . T.unpack $
-                    renderErrorWith sources (innermost stack) (errorCode err) (pretty err) stack
-                Right ic -> do
-                  r <- captureStdoutWith (interpret ic [])
-                  case r of
-                    (Left err, _) -> pure . Left . T.unpack $
-                      renderDiagnostic sources ((diagnostic SevError Nothing (pretty err)) {
-                        diagLabels = [primaryLabel (ieSpan err) ""]
-                      })
-                    (Right _, out) -> pure $ Right out
+      runSourceWithInput path input src
+
+-- | 'runProgramWithInput' for source text.  The path only names the source in
+--   diagnostics; this is what lets a test keep a small program next to the
+--   assertion instead of in a separate file.
+runSourceWithInput :: FilePath -> String -> T.Text -> IO (Either String String)
+runSourceWithInput path input src = do
+  -- The source map is what lets the renderer quote the offending lines; the
+  -- name of the file in the map must match the one recorded in the spans.
+  let sources = insertSource (T.pack path) src emptySourceMap
+  case elaborate <$> parseFromTextNamed path chunk src of
+    Left e -> pure $ Left e
+    Right elabAction ->
+      case evalState (runExceptT elabAction) (ElabState 0) of
+        Left e -> pure . Left . T.unpack $
+          renderDiagnostic sources (diagnostic SevError Nothing (pretty e))
+        Right c' ->
+          case evalTypeCheckM (inferChunk [] c') (TypeCheckState (0, 0, 0) 0 []) of
+            Left (stack, err) ->
+              pure . Left . T.unpack $
+                renderErrorWith sources (innermost stack) (errorCode err) (pretty err) stack
+            Right ic -> do
+              r <- captureStdoutWith (withStdin input (interpret ic []))
+              case r of
+                (Left err, _) -> pure . Left . T.unpack $
+                  renderDiagnostic sources ((diagnostic SevError Nothing (pretty err)) {
+                    diagLabels = [primaryLabel (ieSpan err) ""]
+                  })
+                (Right _, out) -> pure $ Right out
+
+-- | Run an action with @stdin@ reading from the given string.
+withStdin :: String -> IO a -> IO a
+withStdin input action
+  | null input = action
+  | otherwise = do
+      tmp <- getTemporaryDirectory
+      (path, h) <- openTempFile tmp "marran-in.txt"
+      hPutStr h input
+      hClose h
+      hin <- openFile path ReadMode
+      saved <- hDuplicate stdin
+      hDuplicateTo hin stdin
+      -- Windows will not delete the file while a duplicate of it is still the
+      -- process's standard input, so the console is restored before cleanup.
+      result <- action `finally` hDuplicateTo saved stdin
+      hClose saved
+      hClose hin
+      removeFile path
+      pure result
 
 -- | Run an action with @stdout@ redirected to a temporary file and return what
 --   was written to it.

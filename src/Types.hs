@@ -80,7 +80,9 @@ module Types (
   handlerCons,
   effName,
   countArgs,
-  monoScheme
+  monoScheme,
+  typeArgToTyp,
+  typToTypeArg
 ) where
 import Data.List (intercalate)
 import Data.Text (Text)
@@ -139,10 +141,10 @@ data Typ =
   | TNil
   | TNothing
   | TFlat Text
-  | TArray Typ
-  | TPair Typ Typ
+  | TArray Typ EffRow
+  | TPair Typ Typ EffRow
   | TFunct Funct                -- arg -> row ret
-  | TRecord [TRecordProp]
+  | TRecord [TRecordProp] EffRow
   | TForall
     [Taste] [Taste] [Taste]
     (TasteMap (Set Text))
@@ -160,10 +162,12 @@ instance Pretty Typ where
     TNil -> "()"
     TNothing -> "Nothing"
     TFlat n -> n
-    TArray t -> "[" <> pretty t <> "]"
-    TPair l r -> "(" <> pretty l <> ", " <> pretty r <> ")"
+    TArray t r -> "[" <> pretty t <> "]" <> prettyPending r
+    TPair l r fx ->
+      "(" <> pretty l <> ", " <> pretty r <> ")" <> prettyPending fx
     TFunct f -> pretty f
-    TRecord props -> "#{" <> T.intercalate "; " (map pretty props) <>  "}"
+    TRecord props r ->
+      "#{" <> T.intercalate "; " (map pretty props) <>  "}" <> prettyPending r
     TForall ts es rs els rls t -> T.concat [
         "forall ",
         "[", T.unwords $ map tasteName ts, "]",
@@ -180,8 +184,17 @@ instance Pretty Typ where
 
     TVar n -> "`" <> tasteName n
 
-data Funct = Funct Typ Typ EffRow deriving (Show, Ord, Eq)
+-- | The pending row of an aggregate type, printed only when it is not empty.
+--
+--   The paper writes it as @[T]@R@; the empty row is omitted to keep messages
+--   short, and a row variable or an open row is always visible because it may
+--   still grow.
+prettyPending :: EffRow -> Text
+prettyPending = \case
+  RClosed [] -> ""
+  r -> "@" <> pretty r
 
+data Funct = Funct Typ Typ EffRow deriving (Show, Ord, Eq)
 instance Pretty Funct where
   pretty (Funct i o fxs) = pretty i <> " -> " <> pretty fxs <> " " <> pretty o
 
@@ -726,6 +739,50 @@ metaLevel = \case
 isSkolem :: Taste -> Bool
 isSkolem Skolem {} = True
 isSkolem _ = False
+
+-- | A type argument seen as a type.
+--
+--   A parameter of a parameterised effect, @effect Loop[T] ... break : T -> ()@,
+--   is a type in the operation signatures but a type argument in the effect
+--   row @Loop[T]@.  The two live in different constructors ('T'Var' against
+--   @TAVar@), so a substitution has to cross between them; these two functions
+--   are that crossing.
+typeArgToTyp :: TypeArg -> Typ
+typeArgToTyp = \case
+  TAInt -> TInt
+  TAFloat -> TFloat
+  TABoolean -> TBoolean
+  TAString -> TString
+  TANil -> TNil
+  TANothing -> TNothing
+  TAFlat n -> TFlat n
+  TAArray t -> TArray (typeArgToTyp t) (RClosed [])
+  TAPair l r -> TPair (typeArgToTyp l) (typeArgToTyp r) (RClosed [])
+  TAFunct i o -> TFunct (Funct (typeArgToTyp i) (typeArgToTyp o) (RClosed []))
+  TARecord props -> TRecord [TRecordProp m n (typeArgToTyp t) | TARecordProp m n t <- props] (RClosed [])
+  TAVar v -> TVar v
+
+-- | A type seen as a type argument, when it has a type-argument shape.
+--   A function type with an effect row has none: effect arguments carry
+--   pure arrows only, so such a type cannot appear in an effect row.  An
+--   aggregate with a non-empty pending row has none either, for the same
+--   reason.
+typToTypeArg :: Typ -> Maybe TypeArg
+typToTypeArg = \case
+  TInt -> Just TAInt
+  TFloat -> Just TAFloat
+  TBoolean -> Just TABoolean
+  TString -> Just TAString
+  TNil -> Just TANil
+  TNothing -> Just TANothing
+  TFlat n -> Just (TAFlat n)
+  TArray t (RClosed []) -> TAArray <$> typToTypeArg t
+  TPair l r (RClosed []) -> TAPair <$> typToTypeArg l <*> typToTypeArg r
+  TFunct (Funct i o (RClosed [])) -> TAFunct <$> typToTypeArg i <*> typToTypeArg o
+  TRecord props (RClosed []) ->
+    TARecord <$> traverse (\(TRecordProp m n t) -> TARecordProp m n <$> typToTypeArg t) props
+  TVar v -> Just (TAVar v)
+  _ -> Nothing
 
 handlerCons :: Handler -> EffCons
 -- handlerCons (NativeHandler cons _ _ _) = cons

@@ -24,6 +24,9 @@ import Test.Hspec.QuickCheck (prop)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
+nilRow :: EffRow
+nilRow = RClosed []
+
 testScope :: TypeCheckM Scope
 testScope = globalScope []
 
@@ -40,14 +43,14 @@ uSpec = do
       runWithScope
         (\sc -> do
           a <- freshMetaTypeM
-          unifyTypes sc a (TArray a))
+          unifyTypes sc a (TArray a nilRow))
         shouldBeLeft
 
     it "rejects a type variable unified with a pair containing itself" $
       runWithScope
         (\sc -> do
           a <- freshMetaTypeM
-          unifyTypes sc a (TPair a TInt))
+          unifyTypes sc a (TPair a TInt nilRow))
         shouldBeLeft
 
     it "rejects a type variable occurring inside a function type" $
@@ -146,6 +149,68 @@ uSpec = do
             (ROpen [eff "Output"] r)
             (RClosed [eff "Output"]))
         shouldBeLeft
+
+  describe "Aggregate subsumption" $ do
+    it "accepts an array whose row is smaller than the annotation" $
+      runWithScope
+        (\sc -> subsumesType sc (TArray TInt nilRow) (TArray TInt (closedRow ["Read"])))
+        shouldBeRight
+
+    it "rejects an array whose row is larger than the annotation" $
+      runWithScope
+        (\sc -> subsumesType sc (TArray TInt (closedRow ["Read"])) (TArray TInt nilRow))
+        shouldBeLeft
+
+    it "accepts a pair with a smaller row and unifies its components" $
+      runWithScope
+        (\sc -> do
+          a <- freshMetaTypeM
+          s <- subsumesType sc
+            (TPair TInt a nilRow)
+            (TPair TInt TBoolean (closedRow ["Read"]))
+          applyTypeSubst s a)
+        (\case
+          Right typ -> typ `shouldBe` TBoolean
+          Left (_, err) -> expectationFailure $
+            "Unexpected type-check error: " ++ show err)
+
+    it "subsumes the row of a record and of its fields" $
+      runWithScope
+        (\sc -> subsumesType sc
+          (TRecord [TRecordProp Val "f" (TArray TInt nilRow)] nilRow)
+          (TRecord [TRecordProp Val "f" (TArray TInt (closedRow ["Read"]))] (closedRow ["Read"])))
+        shouldBeRight
+
+    it "rejects a record whose field is not subsumed" $
+      runWithScope
+        (\sc -> subsumesType sc
+          (TRecord [TRecordProp Val "f" (TArray TInt (closedRow ["Read"]))] nilRow)
+          (TRecord [TRecordProp Val "f" (TArray TInt nilRow)] nilRow))
+        shouldBeLeft
+
+    it "rejects records whose fields differ in mutability" $
+      runWithScope
+        (\sc -> subsumesType sc
+          (TRecord [TRecordProp Var "f" TInt] nilRow)
+          (TRecord [TRecordProp Val "f" TInt] nilRow))
+        shouldBeLeft
+
+    it "rejects records with different field sets" $
+      runWithScope
+        (\sc -> subsumesType sc
+          (TRecord [TRecordProp Val "f" TInt] nilRow)
+          (TRecord [TRecordProp Val "g" TInt] nilRow))
+        shouldBeLeft
+
+    it "falls back to unification for a non-aggregate" $
+      runWithScope
+        (\sc -> subsumesType sc TInt TInt)
+        shouldBeRight
+
+    it "rejects a non-aggregate that does not unify" $
+      runWithScope
+        (\sc -> subsumesType sc TInt TBoolean)
+        shouldBeLeft
   
   describe "Forall substitution" $ do
     it "does not substitute a type variable bound by TForall" $
@@ -165,14 +230,14 @@ uSpec = do
         (\sc -> do
           let a = bound 1
               b = meta 2
-              typ = TForall [a] [] [] Map.empty Map.empty (TPair (TVar a) (TVar b))
+              typ = TForall [a] [] [] Map.empty Map.empty (TPair (TVar a) (TVar b) nilRow)
           sc' <- unifyTypes sc (TVar b) TInt
           applyTypeSubst sc' typ)
         (\case
           Right typ ->
             typ `shouldBe`
               TForall [bound 1] [] [] Map.empty Map.empty
-                (TPair (TVar (bound 1)) TInt)
+                (TPair (TVar (bound 1)) TInt nilRow)
           Left (_, err) ->
             expectationFailure $ "Unexpected error: " <> show err)
     
@@ -197,12 +262,12 @@ uSpec = do
         (\sc -> do
           a <- freshBoundM
           b <- freshMetaM
-          let typ = TForall [a] [] [] Map.empty Map.empty (TPair (TVar a) (TVar b))
+          let typ = TForall [a] [] [] Map.empty Map.empty (TPair (TVar a) (TVar b) nilRow)
           sc' <- unifyTypes sc (TVar b) TInt
           applyTypeSubst sc' typ)
         (\case
           Right (TForall [a] [] [] _ _ body) ->
-            body `shouldBe` TPair (TVar a) TInt
+            body `shouldBe` TPair (TVar a) TInt nilRow
           Right typ ->
             expectationFailure $ "Unexpected type: " <> show typ
           Left (_, err) ->
@@ -385,7 +450,7 @@ uSpec = do
             (do
               sc' <- testScope
               sc'' <- unifyTypes sc' (TVar a) TInt
-              once <- applyTypeSubst sc'' (TArray (TVar a))
+              once <- applyTypeSubst sc'' (TArray (TVar a) nilRow)
               twice <- applyTypeSubst sc'' once
               pure (once, twice))
             sc of
@@ -412,9 +477,9 @@ uSpec = do
           b <- freshMetaTypeM
           sc' <- unifyTypes sc a b
           sc'' <- unifyTypes sc' b TInt
-          applyTypeSubst sc'' (TArray a))
+          applyTypeSubst sc'' (TArray a nilRow))
         (\case
-          Right typ -> typ `shouldBe` TArray TInt
+          Right typ -> typ `shouldBe` TArray TInt nilRow
           Left (_, err) -> expectationFailure $
             "Unexpected type-check error: " <> show err)
   
@@ -426,9 +491,9 @@ uSpec = do
           b <- freshMetaTypeM
           sc' <- unifyTypes sc a TInt
           sc'' <- unifyTypes sc' b TBoolean
-          applyTypeSubst sc'' (TPair a b))
+          applyTypeSubst sc'' (TPair a b nilRow))
         (\case
-          Right typ -> typ `shouldBe` TPair TInt TBoolean
+          Right typ -> typ `shouldBe` TPair TInt TBoolean nilRow
           Left (_, err) -> expectationFailure $
             "Unexpected type-check error: " <> show err)
 
@@ -443,9 +508,9 @@ uSpec = do
           sc'' <- unifyTypes sc' b TInt
           sc''' <- unifyTypes sc'' c d
           sc'''' <- unifyTypes sc''' d TBoolean
-          applyTypeSubst sc'''' (TPair a c))
+          applyTypeSubst sc'''' (TPair a c nilRow))
         (\case
-          Right typ -> typ `shouldBe` TPair TInt TBoolean
+          Right typ -> typ `shouldBe` TPair TInt TBoolean nilRow
           Left (_, err) -> expectationFailure $
             "Unexpected type-check error: " <> show err)
 
@@ -455,9 +520,9 @@ uSpec = do
           a <- freshMetaTypeM
           b <- freshMetaTypeM
           sc' <- unifyTypes sc a TInt
-          applyTypeSubst sc' (TPair a b))
+          applyTypeSubst sc' (TPair a b nilRow))
         (\case
-          Right (TPair TInt (TVar b)) ->
+          Right (TPair TInt (TVar b) _) ->
             case b of
               Meta{} -> pure ()
               _ -> expectationFailure "Expected an unresolved meta variable"
@@ -633,8 +698,8 @@ uSpec = do
           withNewLevel $ do
             s <- freshSkolemTypeM
             unifyTypes sc
-              (TArray m)
-              (TArray s))
+              (TArray m nilRow)
+              (TArray s nilRow))
         shouldBeLeft
 
   describe "Skolem escape in effect rows and constructors" $ do
@@ -666,13 +731,13 @@ uSpec = do
           a <- freshMetaTypeM
           b <- freshMetaTypeM
           c <- freshMetaTypeM
-          sc1 <- unifyTypes sc a (TArray b)
-          sc2 <- unifyTypes sc1 b (TPair TInt c)
+          sc1 <- unifyTypes sc a (TArray b nilRow)
+          sc2 <- unifyTypes sc1 b (TPair TInt c nilRow)
           sc3 <- unifyTypes sc2 c TBoolean
           applyTypeSubst sc3 a)
         (\case
           Right typ ->
-            typ `shouldBe` TArray (TPair TInt TBoolean)
+            typ `shouldBe` TArray (TPair TInt TBoolean nilRow) nilRow
           Left (_, err) -> expectationFailure $
             "Unexpected type-check error: " ++ show err)
 
@@ -685,9 +750,9 @@ uSpec = do
           sc1 <- unifyTypes sc a c
           sc2 <- unifyTypes sc1 b c
           sc3 <- unifyTypes sc2 c TInt
-          applyTypeSubst sc3 (TPair a b))
+          applyTypeSubst sc3 (TPair a b nilRow))
         (\case
-          Right typ -> typ `shouldBe` TPair TInt TInt
+          Right typ -> typ `shouldBe` TPair TInt TInt nilRow
           Left (_, err) -> expectationFailure $
             "Unexpected type-check error: " ++ show err)
   
@@ -1114,6 +1179,11 @@ open = ROpen
 eff :: Text -> EffCons
 eff name = EffCons (ECons name [])
 
+-- | A closed row from effect names, for the tests that do not care about
+--   constructors with arguments.
+closedRow :: [Text] -> EffRow
+closedRow = RClosed . map eff
+
 
 shouldBeRight :: Either e a -> Expectation
 shouldBeRight result =
@@ -1167,7 +1237,7 @@ typeUnificationTests = do
 
   it "binds a metavariable to a compound type" $
     runWithScope
-      (\sc -> unifyTypes sc (TVar (meta 1)) (TPair TInt TString))
+      (\sc -> unifyTypes sc (TVar (meta 1)) (TPair TInt TString nilRow))
       shouldBeRight
 
   it "rejects incompatible primitive types" $
@@ -1206,7 +1276,7 @@ typeUnificationTests = do
       (\sc ->
         unifyTypes sc
           (TVar (meta 1))
-          (TArray (TVar (meta 1))))
+          (TArray (TVar (meta 1)) nilRow))
       shouldBeLeft
 
   it "performs the occurs check through function types" $
@@ -1403,17 +1473,17 @@ substitutionTests = do
         sc1 <- unifyTypes sc (TVar (meta 1)) TInt
         sc2 <- unifyTypes sc1 (TVar (meta 2)) TString
         applyTypeSubst sc2
-          (TPair (TVar (meta 1)) (TArray (TVar (meta 2)))))
-      (shouldReturnType (TPair TInt (TArray TString)))
+          (TPair (TVar (meta 1)) (TArray (TVar (meta 2)) nilRow) nilRow))
+      (shouldReturnType (TPair TInt (TArray TString nilRow) nilRow))
 
   it "resolves substitutions in record fields" $
     runWithScope
       (\sc -> do
         sc1 <- unifyTypes sc (TVar (meta 1)) TInt
         applyTypeSubst sc1
-          (TRecord [TRecordProp Val "value" (TVar (meta 1))]))
+          (TRecord [TRecordProp Val "value" (TVar (meta 1))] nilRow))
       (shouldReturnType
-        (TRecord [TRecordProp Val "value" TInt]))
+        (TRecord [TRecordProp Val "value" TInt] nilRow))
 
   it "does not modify unrelated metavariables" $
     runWithScope
@@ -1455,8 +1525,8 @@ substitutionTests = do
     runWithScope
       (\sc -> do
         sc1 <- unifyTypes sc (TVar (meta 1)) TInt
-        applyTypeSubst sc1 (TArray (TVar (meta 1))))
-      (shouldReturnType (TArray TInt))
+        applyTypeSubst sc1 (TArray (TVar (meta 1)) nilRow))
+      (shouldReturnType (TArray TInt nilRow))
 
   it "applies substitutions inside function effect rows" $
     runWithScope
@@ -1504,10 +1574,10 @@ levelAndSkolemTests = describe "levels and skolem escape" $ do
         outerMeta <- freshMetaTypeM
         withNewLevel $ do
           innerMeta <- freshMetaTypeM
-          sc' <- unifyTypes sc outerMeta (TArray innerMeta)
+          sc' <- unifyTypes sc outerMeta (TArray innerMeta nilRow)
           applyTypeSubst sc' outerMeta)
       (\case
-          Right (TArray (TVar (Meta _ _ level))) ->
+          Right (TArray (TVar (Meta _ _ level)) _) ->
             level `shouldBe` 0
           Right typ ->
             expectationFailure $

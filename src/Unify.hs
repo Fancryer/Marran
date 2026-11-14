@@ -22,7 +22,10 @@ module Unify (
   applyEffRowSubst,
   applyEffConsSubst,
   unifyTypes,
+  unifyArgType,
+  subsumesType,
   unifyTypeArgs,
+  unifyTypeArgLists,
   subsumesEffRow,
   unifyEffCons,
   unifyEffRows,
@@ -58,11 +61,13 @@ import Types (
     TRecordProp(..),
     Funct(..),
     TypeArg(..),
+    typeArgToTyp,
+    typToTypeArg,
     TARecordProp(TARecordProp), ECons (..), tasteName
   )
 import qualified Data.Map as Map hiding (map)
 import qualified Data.IntMap ()
-import Data.List (find, nubBy, (\\), isSubsequenceOf)
+import Data.List (find, nubBy, sortOn, (\\))
 import GHC.OldList (sort)
 import Eff (unionEffRows)
 import Occurs (typeOccursInType, typeOccursInTypeArg)
@@ -75,7 +80,7 @@ import Data.Bifunctor (bimap)
 import Text.Printf (printf)
 import qualified Data.Text as T
 import Data.Text (Text)
-import Control.Lens (makeLenses, use, Field1 (_1), Field2 (_2), Field3 (_3), (-=), (+=), (%=), (.=))
+import Control.Lens (makeLenses, use, Field1 (_1), Field2 (_2), Field3 (_3), (-=), (+=), (.=))
 import TypedIR (Scope(..))
 import Utils (Pretty(..))
 import ErrorContext (ErrorStack, ErrorFrame (..))
@@ -198,11 +203,14 @@ lowerTasteTo target = \case
 skolemEscapesType :: Int -> Typ -> Bool
 skolemEscapesType target = \case
   TVar (Skolem _ _ lvl) -> lvl > target
-  TArray t -> skolemEscapesType target t
-  TPair l r -> skolemEscapesType target l || skolemEscapesType target r
+  TArray t r -> skolemEscapesType target t || skolemEscapesRow target r
+  TPair l r fx ->
+    any (skolemEscapesType target) [l, r] || skolemEscapesRow target fx
   TFunct (Funct i o row) ->
     skolemEscapesType target i || skolemEscapesType target o || skolemEscapesRow target row
-  TRecord props -> any (\(TRecordProp _ _ t) -> skolemEscapesType target t) props
+  TRecord props r ->
+    any (\(TRecordProp _ _ t) -> skolemEscapesType target t) props
+      || skolemEscapesRow target r
   TForall _ _ _ _ _ t -> skolemEscapesType target t
   _ -> False
 
@@ -234,12 +242,12 @@ skolemEscapesRow target = \case
 lowerTypeTo :: Int -> Typ -> Typ
 lowerTypeTo target = \case
   TVar t -> TVar $ lowerTasteTo target t
-  TArray t -> TArray $ lowerTypeTo target t
-  TPair l r -> TPair (lowerTypeTo target l) $ lowerTypeTo target r
+  TArray t r -> TArray (lowerTypeTo target t) $ lowerRowTo target r
+  TPair l r fx -> TPair (lowerTypeTo target l) (lowerTypeTo target r) $ lowerRowTo target fx
   TFunct (Funct i o row) ->
     TFunct $ Funct (lowerTypeTo target i) (lowerTypeTo target o) $ lowerRowTo target row
-  TRecord props ->
-      TRecord [TRecordProp m n $ lowerTypeTo target t | TRecordProp m n t <- props]
+  TRecord props r ->
+      TRecord [TRecordProp m n $ lowerTypeTo target t | TRecordProp m n t <- props] $ lowerRowTo target r
   TForall ts es rs els rls t -> TForall ts es rs els rls $ lowerTypeTo target t
   t -> t
 
@@ -268,10 +276,13 @@ lowerRowTo target = \case
 bindMetaType :: Scope -> Taste -> Typ -> TypeCheckM Scope
 bindMetaType scope m@(Meta _ _ lvlM) t = do
   let t' = lowerTypeTo lvlM t
-  if skolemEscapesType lvlM t' then throwTypeCheckError $ InferenceError "a rigid type variable would escape its scope; add a type annotation"
-  else
-    pure scope{typeSubst = Map.insert m t' $ typeSubst scope}
-bindMetaType _ s@Skolem{} _ = throwTypeCheckError $ InferenceError "this type involves a rigid type variable and cannot be inferred; add a type annotation"
+  if t' == TVar m
+    -- Unifying a variable with itself is a no-op; inserting it would also make
+    -- 'applyTypeSubst' loop, so the substitution stays acyclic here.
+    then pure scope
+  else if skolemEscapesType lvlM t' then throwTypeCheckError $ InferenceError "a rigid type variable would escape its scope; add a type annotation"
+  else pure scope{typeSubst = Map.insert m t' $ typeSubst scope}
+bindMetaType _ Skolem{} _ = throwTypeCheckError $ InferenceError "this type involves a rigid type variable and cannot be inferred; add a type annotation"
 bindMetaType _ b@Bound{} _ =
   throwTypeCheckError $ InferenceError $ "bindMetaType | Cannot solve a bound variable " <> tasteName b
 
@@ -280,8 +291,7 @@ bindMetaTypeArg scope m@(Meta _ _ lvlM) t = do
   let t' = lowerTypeArgTo lvlM t
   if skolemEscapesTypeArg lvlM t' then
     throwTypeCheckError $ InferenceError "Skolem escapes type arg"
-  else
-    pure scope{typeArgSubst = Map.insert m t' $ typeArgSubst scope}
+  else pure scope{typeArgSubst = Map.insert m t' $ typeArgSubst scope}
 bindMetaTypeArg _ Skolem{} _ = throwTypeCheckError $ InferenceError "Cannot solve a skolem variable"
 bindMetaTypeArg _ b@Bound{} _ =
   throwTypeCheckError $ InferenceError $ "bindMetaTypeArg | Cannot solve a bound variable " <> tasteName b
@@ -340,35 +350,68 @@ bindEffVar _ b@Bound{} _ =
   throwTypeCheckError $
     InferenceError $ "Cannot solve a bound variable " <> tasteName b
 
+-- | Resolve a type through the current substitution.
+--
+--   The substitution is acyclic by construction ('bindMetaType' refuses to bind
+--   a variable to itself), but it is a chain, so the walk is bounded: a cycle
+--   that slipped through would otherwise hang the checker rather than being
+--   reported.
 applyTypeSubst :: Scope -> Typ -> TypeCheckM Typ
-applyTypeSubst scope = \case
-  t@(TVar m) ->
-    case Map.lookup m (typeSubst scope) of
-      Just t' -> applyTypeSubst scope t'
-      Nothing -> pure t
-  TArray t -> TArray <$> applyTypeSubst scope t
-  TPair l r -> TPair <$> applyTypeSubst scope l <*> applyTypeSubst scope r
-  TFunct (Funct i o fxs) ->
-    TFunct <$> (Funct <$> applyTypeSubst scope i <*> applyTypeSubst scope o <*> applyEffRowSubst scope fxs)
-  TRecord props -> do
-    props' <- traverse (\(TRecordProp mut name typ) ->
-        TRecordProp mut name <$> applyTypeSubst scope typ
-      ) props
-    pure $ TRecord props'
-  TForall ts es rs els rls t -> do
-    let scope' = scope {
-        typeSubst = foldr Map.delete scope.typeSubst ts,
-        effSubst = foldr Map.delete scope.effSubst es,
-        rowSubst = foldr Map.delete scope.rowSubst rs
-      }
-    TForall ts es rs els rls <$> applyTypeSubst scope' t
-  t -> pure t
+applyTypeSubst scope = go (0 :: Int)
+ where
+  go fuel ty = case ty of
+   TVar m -> do
+    -- A type variable can reach a type position through an effect row: a
+    -- parameter of a parameterised effect is a `TVar` in the operation
+    -- signatures and a `TAVar` in the row, and the two substitutions are
+    -- separate.  Looking in the other one keeps a single variable
+    -- consistently instantiated on both sides.
+    let resolved = case Map.lookup m (typeSubst scope) of
+          Just t' -> Just t'
+          Nothing -> typeArgToTyp <$> Map.lookup m (typeArgSubst scope)
+    case resolved of
+      Just t' -> if fuel > 200
+        then throwTypeCheckError $ InferenceError
+            (T.concat ["the type substitution does not terminate at `", tasteName m, "`"])
+        else go (fuel + 1) t'
+      Nothing -> pure ty
+   TArray t r -> do
+     t' <- go fuel t
+     TArray t' <$> applyEffRowSubst scope r
+   TPair l r fx -> do
+     l' <- go fuel l
+     r' <- go fuel r
+     TPair l' r' <$> applyEffRowSubst scope fx
+   TFunct (Funct i o fxs) ->
+     TFunct <$> (Funct <$> go fuel i <*> go fuel o <*> applyEffRowSubst scope fxs)
+   TRecord props r -> do
+     props' <- traverse (\(TRecordProp mut name typ) ->
+         TRecordProp mut name <$> go fuel typ
+       ) props
+     r' <- applyEffRowSubst scope r
+     pure $ TRecord props' r'
+   TForall ts es rs els rls t -> do
+     let scope' = scope {
+         typeSubst = foldr Map.delete scope.typeSubst ts,
+         effSubst = foldr Map.delete scope.effSubst es,
+         rowSubst = foldr Map.delete scope.rowSubst rs
+       }
+     TForall ts es rs els rls <$> applyTypeSubst scope' t
+   t -> pure t
 
 applyTypeArgSubst :: Scope -> TypeArg -> TypeCheckM TypeArg
 applyTypeArgSubst scope = \case
-  t@(TAVar m) -> case Map.lookup m (typeArgSubst scope) of
-    Just t' -> applyTypeArgSubst scope t'
-    Nothing -> pure t
+  t@(TAVar m) -> do
+    -- Mirrors 'applyTypeSubst': a variable bound as a type is still the same
+    -- variable when it appears in an effect row as a type argument.
+    let fromType = Map.lookup m (typeSubst scope) >>= typToTypeArg
+        bound = case Map.lookup m (typeArgSubst scope) of
+          Just t' -> Just t'
+          Nothing -> fromType
+    case bound of
+      Just t'
+        | t' /= t -> applyTypeArgSubst scope t'
+      _ -> pure t
   TAArray t -> TAArray <$> applyTypeArgSubst scope t
   TAPair l r -> TAPair <$> applyTypeArgSubst scope l <*> applyTypeArgSubst scope r
   TAFunct i o -> TAFunct <$> applyTypeArgSubst scope i <*> applyTypeArgSubst scope o
@@ -378,6 +421,79 @@ applyTypeArgSubst scope = \case
       ) props
     pure $ TARecord props'
   t -> pure t
+
+-- | Unify the type of an argument with the type its parameter expects.
+--
+--   T-App requires the row of the argument to be *included* in the latent row
+--   of the parameter (@R2 ∪ Men(Γ, t2) ⊆ R@), not equal to it: the row of a
+--   lambda whose body observes a mutable binding contains `Read`, and such a
+--   lambda is a valid argument wherever a computation of the enclosing row is
+--   expected.  Equality would reject it, so the two latent rows are related by
+--   inclusion and everything else is unified as usual.
+unifyArgType :: Scope -> Typ -> Typ -> TypeCheckM Scope
+unifyArgType scope actual expected = do
+  a <- applyTypeSubst scope actual
+  e <- applyTypeSubst scope expected
+  case (a, e) of
+    (TFunct (Funct i1 o1 r1), TFunct (Funct i2 o2 r2)) -> do
+      s1 <- unifyTypes scope i1 i2
+      s2 <- unifyTypes s1 o1 o2
+      subsumesEffRow s2 r1 r2
+    _ -> subsumesType scope actual expected
+
+-- | Check that a value of type @actual@ fits a declared type @declared@.
+--
+--   The pending row of an aggregate is an upper bound of the rows of its
+--   components (T-Pair and T-Rec say so explicitly, and an array is read the
+--   same way): a value whose row is smaller than the annotation fits, because
+--   every use of the aggregate charges the declared row and therefore charges
+--   enough.  A larger row would charge too little at use and is rejected.
+--
+--   Everything else is an ordinary unification.  The paper has no subtyping,
+--   so a parameter type, a field type and the latent row of an arrow must
+--   match exactly; only an aggregate's own annotation is relaxed.  The
+--   relaxation is recursive, because a component may itself be an aggregate
+--   with its own annotation: @[[Int]@{Read}]@ accepts @[[1]]@.
+subsumesType :: Scope -> Typ -> Typ -> TypeCheckM Scope
+subsumesType scope actual declared = do
+  a <- applyTypeSubst scope actual
+  d <- applyTypeSubst scope declared
+  case (a, d) of
+    (TArray ta ra, TArray td rd) -> do
+      s <- subsumesType scope ta td
+      subsumesEffRow s ra rd
+    (TPair la ra fa, TPair ld rd fd) -> do
+      s1 <- subsumesType scope la ld
+      s2 <- subsumesType s1 ra rd
+      subsumesEffRow s2 fa fd
+    (TRecord pa fa, TRecord pd fd) -> do
+      s <- subsumesRecords scope pa pd
+      subsumesEffRow s fa fd
+    _ -> unifyTypes scope actual declared
+
+-- | 'unifyRecords' with the component types related by 'subsumesType'.
+--
+--   The structural checks are the ones of 'unifyRecords': the two records must
+--   have the same fields, with the same mutability and no duplicates.  Only
+--   the field types are relaxed, because a field may itself be an aggregate
+--   with its own pending row.
+subsumesRecords :: Scope -> [TRecordProp] -> [TRecordProp] -> TypeCheckM Scope
+subsumesRecords scope props1 props2 = do
+  let byName = sortOn tName
+      zipped = zip (byName props1) (byName props2)
+  if wellFormed props1 && wellFormed props2 && sameShape zipped
+    then foldM (\sc (p1, p2) -> subsumesType sc (tTyp p1) (tTyp p2)) scope zipped
+    else throwTypeCheckError $ TypeUnificationError
+      (TRecord props1 (RClosed [])) (TRecord props2 (RClosed []))
+  where
+    -- No duplicate field names, which 'unifyRecords' also rejects.
+    wellFormed props = length (nubBy sameName props) == length props
+    sameName p q = tName p == tName q
+    -- The two records name the same fields, in the same order once sorted,
+    -- with the same mutability.
+    sameShape zipped =
+      length props1 == length props2
+        && all (\(p1, p2) -> tName p1 == tName p2 && tMut p1 == tMut p2) zipped
 
 unifyTypes :: Scope -> Typ -> Typ -> TypeCheckM Scope
 unifyTypes scope t1 t2 = do
@@ -394,32 +510,42 @@ unifyTypes scope t1 t2 = do
         throwTypeCheckError $ TypeUnificationError t1' t'
       else
         bindMetaType scope x t'
+    -- A meta on either side is solvable, so this comes before the failure
+    -- case: `unifyTypes s (TVar bound) (TVar meta)` must bind the meta, not
+    -- reject a rigid variable that merely happens to be on the left.  The
+    -- swap is guarded by `Meta`: swapping two rigid variables would match
+    -- this branch again and loop.
+    (_, TVar Meta{}) -> unifyTypes scope t2' t1'
     (TVar _, _) -> throwTypeCheckError $ TypeUnificationError t1' t2'
-    (_, TVar _) -> unifyTypes scope t2' t1'
     (TFlat x, TFlat y) | x == y -> pure scope
-    (TArray l1, TArray l2) -> unifyTypes scope l1 l2
-    (TPair l1 r1, TPair l2 r2) -> do
+    (TArray l1 r1, TArray l2 r2) -> do
       scope' <- unifyTypes scope l1 l2
-      unifyTypes scope' r1 r2
+      unifyEffRows scope' r1 r2
+    (TPair l1 r1 f1, TPair l2 r2 f2) -> do
+      scope' <- unifyTypes scope l1 l2
+      scope'' <- unifyTypes scope' r1 r2
+      unifyEffRows scope'' f1 f2
     (TFunct (Funct i1 o1 e1), TFunct (Funct i2 o2 e2)) -> do
       scope' <- unifyTypes scope i2 i1
       scope'' <- unifyTypes scope' o1 o2
       unifyEffRows scope'' e1 e2
-    (TRecord props1, TRecord props2) -> unifyRecords scope props1 props2
+    (TRecord props1 f1, TRecord props2 f2) -> do
+      scope' <- unifyRecords scope props1 props2
+      unifyEffRows scope' f1 f2
     _ -> throwTypeCheckError $ TypeUnificationError t1' t2'
 
 unifyRecords :: Scope -> [TRecordProp] -> [TRecordProp] -> TypeCheckM Scope
 unifyRecords scope props1 props2 = if length props1 /= length props2 then
-  throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
+  throwTypeCheckError $ TypeUnificationError (TRecord props1 (RClosed [])) (TRecord props2 (RClosed []))
 else
   let props1' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props1 in
   let props2' = sort $ nubBy (\p1 p2 -> tName p1 == tName p2) props2 in
   if length props1 /= length props1' || length props2 /= length props2' then
-    throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
+    throwTypeCheckError $ TypeUnificationError (TRecord props1 (RClosed [])) (TRecord props2 (RClosed []))
   else
     let zipped = zip props1' props2' in
     if any (\(p1, p2) -> tMut p1 /= tMut p2 || tName p1 /= tName p2) zipped then
-      throwTypeCheckError $ TypeUnificationError (TRecord props1) (TRecord props2)
+      throwTypeCheckError $ TypeUnificationError (TRecord props1 (RClosed [])) (TRecord props2 (RClosed []))
     else do
       foldM (
         \sc (typ1, typ2) -> do
@@ -456,55 +582,87 @@ normalizeEffRow = \case
   ROpen cs v -> ROpen (sort cs) v
   r -> r
 
+-- | Split the effects of a row into those the required row provides and those
+--   it does not.
+--
+--   An effect is matched by name, and its type arguments are unified: two
+--   occurrences of `Loop` are the same effect only after their arguments have
+--   been made equal.  A syntactic comparison is wrong here — `Loop[m22]` in a
+--   recursive call and `Loop[T]` in the signature are the same effect, but they
+--   are not the same syntax, so comparing them reports a spurious "performs
+--   effects that the declared row does not allow".
+matchEffCons :: Scope -> [EffCons] -> [EffCons] -> TypeCheckM (Scope, [EffCons])
+matchEffCons = go []
+  where
+    go acc sc [] _required = pure (sc, reverse acc)
+    go acc sc (cons : rest) required =
+      case break (sameName cons) required of
+        (_, []) -> go (cons : acc) sc rest required
+        (_, found : _) -> do
+          -- The required row is a set of effects: two occurrences of the same
+          -- effect in the actual row (one per recursive call, say) match the
+          -- same entry, so a matched entry stays available.
+          sc' <- unifyEffCons sc cons found
+          go acc sc' rest required
+
+    sameName a b = case (a, b) of
+      (EffCons (ECons n _), EffCons (ECons m _)) -> n == m
+      (EVar v, EVar w) -> v == w
+      _ -> False
+
 subsumesEffRow :: Scope -> EffRow -> EffRow -> TypeCheckM Scope
 subsumesEffRow scope r1 r2 = do
   r1' <- normalizeEffRow <$> applyEffRowSubst scope r1
   r2' <- normalizeEffRow <$> applyEffRowSubst scope r2
   case (r1', r2') of
-    -- Закрытый vs закрытый
-    (RClosed cs1, RClosed cs2) ->
-      if cs1 `isSubsequenceOf` cs2
-        then pure scope
+    (RClosed cs1, RClosed cs2) -> do
+      (scope', extra) <- matchEffCons scope cs1 cs2
+      if null extra
+        then pure scope'
         else throwTypeCheckError $ EffectRowsUnificationError
           (T.concat [
             "the body performs effects that the declared row does not allow: ",
-            T.intercalate ", " $ map pretty (cs1 \\ cs2)])
+            T.intercalate ", " $ map pretty extra])
           r1' r2'
 
-    -- Закрытый фактический, открытый ожидаемый: лишние эффекты уходят в хвост
     (RClosed cs1, ROpen cs2 v) -> do
-      let extra = cs1 \\ cs2
+      (scope', extra) <- matchEffCons scope cs1 cs2
       if null extra
-        then pure scope
+        then pure scope'
         else do
           r <- freshMetaM
-          bindRowVar scope v (ROpen extra r)
+          bindRowVar scope' v (ROpen extra r)
 
-    -- Открытый фактический, закрытый ожидаемый
     (ROpen cs1 v1, RClosed cs2) -> do
-      -- Если открытая часть пуста, хвост связывается со всем закрытым рядом
       if null cs1 then
         bindRowVar scope v1 (RClosed cs2)
       else do
-        -- Проверяем, что все эффекты из открытой части есть в закрытом
-        let isSubset = cs1 `isSubsequenceOf` cs2
-        if not isSubset then
+        (scope', extra) <- matchEffCons scope cs1 cs2
+        if not (null extra) then
           throwTypeCheckError $ EffectRowsUnificationError
             (T.concat [
               "this effect row is open but performs effects that the required row does not allow: ",
-              T.intercalate ", " $ map pretty (cs1 \\ cs2)])
+              T.intercalate ", " $ map pretty extra])
             (ROpen cs1 v1)
             (RClosed cs2)
         else
-          -- Все эффекты уже есть в закрытом, хвост становится пустым
-          bindRowVar scope v1 (RClosed [])
+          bindRowVar scope' v1 (RClosed [])
 
-    -- Открытый vs открытый
-    (ROpen cs1 v1, ROpen cs2 v2) -> unifyOpenOpen scope cs1 v1 cs2 v2
+    (ROpen cs1 v1, ROpen cs2 v2) -> subsumesOpenOpen scope cs1 v1 cs2 v2
 
-    -- Переменная ряда с чем-то
+    -- A bare tail is already contained in the same tail with any explicit
+    -- effects: v ⊆ {cs | v}.  Conversely, {cs | v} ⊆ v forces v to grow.
+    (RVar v1, ROpen _ v2) | v1 == v2 -> pure scope
+    (ROpen cs1 v1, RVar v2) | v1 == v2 ->
+      case cs1 of
+        [] -> pure scope
+        extra -> do
+          r <- freshMetaM
+          bindRowVar scope v1 (mkOpenRow extra r)
+
     (RVar v, row) -> bindRowVar scope v row
     (row, RVar v) -> bindRowVar scope v row
+
 
 unifyEffRows :: Scope -> EffRow -> EffRow -> TypeCheckM Scope
 unifyEffRows scope r1 r2 = do
@@ -565,6 +723,28 @@ unifyOpenOpen scope l1 v1 l2 v2
       r <- freshMetaM
       scope1 <- bindRowVar scope v1 (mkOpenRow (l2 \\ l1) r)
       bindRowVar scope1 v2 (mkOpenRow (l1 \\ l2) r)
+
+-- | Subsumption of two open rows that may share a tail.
+--
+--   @{cs1 | v} ⊆ {cs2 | v}@ cannot hold for a fixed @v@ unless
+--   @cs1 \\ cs2@ is empty.  The row variable of a @var@ binding, however, is
+--   an upper bound that every assignment may extend, so the right solution is
+--   to grow the shared tail: @v := {cs1 \\ cs2 | v'}@.  Afterwards both sides
+--   denote @{cs1 ∪ cs2 | v'}@, as required.
+--
+--   This is deliberately separate from 'unifyOpenOpen': there the two rows
+--   must denote the same set, so a shared tail with different explicit
+--   effects is a genuine unification failure.  Here it is a constraint that
+--   the variable is allowed to satisfy by absorbing the new effects.
+subsumesOpenOpen :: Scope -> [EffCons] -> Taste -> [EffCons] -> Taste -> TypeCheckM Scope
+subsumesOpenOpen scope cs1 v1 cs2 v2
+  | v1 == v2 =
+      case cs1 \\ cs2 of
+        [] -> pure scope
+        extra -> do
+          r <- freshMetaM
+          bindRowVar scope v1 (mkOpenRow extra r)
+  | otherwise = unifyOpenOpen scope cs1 v1 cs2 v2
 
 unifyRowVarWithEffRow :: Scope -> Taste -> EffRow -> TypeCheckM Scope
 unifyRowVarWithEffRow scope v = \case
@@ -635,8 +815,9 @@ unifyTypeArgs scope t1 t2 = do
       else
         bindMetaTypeArg scope x t'
 
+    -- Mirrors 'unifyTypes': a meta is solvable on either side.
+    (_, TAVar Meta{}) -> unifyTypeArgs scope t2' t1'
     (TAVar _, _) -> throwTypeCheckError $ TypeArgUnificationError t1' t2'
-    (_, TAVar _) -> unifyTypeArgs scope t2' t1'
     (TAInt, TAInt) -> pure scope
     (TAFloat, TAFloat) -> pure scope
     (TABoolean, TABoolean) -> pure scope
@@ -684,9 +865,6 @@ retTypeOf (TFunct (Funct _ o _)) = go o
     go t = Just t
 
 retTypeOf _ = Nothing
-
-mutationEffects :: Set Text
-mutationEffects = Set.fromList ["Read", "Var", "Rebind", "Cell"]
 
 checkEffectNameLacks :: Set Text -> Text -> TypeCheckM ()
 checkEffectNameLacks forbidden name =

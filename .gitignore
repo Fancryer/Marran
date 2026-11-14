@@ -7,3 +7,5 @@ dist-newstyle/
 .idea/
 *.csv
 todo.md
+tools/*.exe
+Marran-artifact-*.tar.gz

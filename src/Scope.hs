@@ -9,6 +9,7 @@ module Scope (
   keepSubst,
   isTopLevel,
   findBinding,
+  findBindingWithRow,
   findType,
   findEff,
   findHandler,
@@ -18,6 +19,7 @@ module Scope (
   hasEff,
   hasHandler,
   addBinding,
+  addBindingWithRow,
   addType,
   addEffect,
   addHandler,
@@ -36,21 +38,23 @@ import Types (
     Funct(..),
     TypeScheme,
 
-    EffRow(RClosed, RVar, ROpen),
+    EffRow(RClosed, ROpen, RVar),
     Scheme(Scheme),
-    pureFunct,
-    Expr(..), NativeLambdaSign (..), tfunc, monoScheme,
-    pattern NLambda, pattern Array, pattern String
+    Expr(..), NativeLambdaSign (..), tfunc, monoScheme, _a,
+    Taste,
+    pattern NLambda
   )
-import TypedIR (Scope(..))
+import TypedIR (Scope(..), ValueBinding(..))
+import Control.Monad (foldM, unless)
+import qualified Data.Text as T
+import qualified Builtins
 import qualified Data.Map as Map
-import Data.Map (Map)
 import Control.Monad.Except (Except, throwError)
-import Unify (TypeCheckM, TypeCheckError (SameScopeBindingShadowing), freshBoundM, freshMetaM, throwTypeCheckError)
+import Unify (TypeCheckM, TypeCheckError (SameScopeBindingShadowing, InferenceError), freshBoundM, freshMetaM, throwTypeCheckError)
 import qualified Data.Maybe as Maybe
 import Data.Text (Text)
 import qualified Eff
-import Eff (elabel, label)
+import Eff (label)
 
 enterScope :: Scope -> Scope
 enterScope scope = Scope
@@ -89,9 +93,15 @@ isTopLevel canBeGlobal sc = case sc.parent of
 
 findBinding :: Bool -> Scope -> Text -> Maybe (TypeScheme, Expr, Mutability)
 findBinding uptop sc name =
+  (\(ValueBinding scheme expr mut _) -> (scheme, expr, mut)) <$>
+    findBindingWithRow uptop sc name
+
+-- | Like 'findBinding', but also returns the pending row of the binding.
+findBindingWithRow :: Bool -> Scope -> Text -> Maybe ValueBinding
+findBindingWithRow uptop sc name =
   case (Map.lookup name sc.values, uptop, sc.parent) of
     (s@(Just _), _, _) -> s
-    (Nothing, True, Just p) -> findBinding True p name
+    (Nothing, True, Just p) -> findBindingWithRow True p name
     _ -> Nothing
 
 findType :: Bool -> Scope -> Text -> Maybe Typ
@@ -159,11 +169,18 @@ namesOf field = go
       in here <> filter (`notElem` here) outer
 
 addBinding :: Text -> TypeScheme -> Expr -> Mutability -> Scope -> TypeCheckM Scope
-addBinding name typ expr mut scope =
+addBinding name typ expr mut = addBindingWithRow name typ expr mut Eff.empty
+
+-- | Add a binding together with its pending row.  Most callers (declarations,
+--   builtins, operation names) have no delayed computation to force and use
+--   'addBinding'; the statement checker uses this one for @val@, @var@ and
+--   @imm@ bindings.
+addBindingWithRow :: Text -> TypeScheme -> Expr -> Mutability -> EffRow -> Scope -> TypeCheckM Scope
+addBindingWithRow name typ expr mut row scope =
   if hasBinding False scope name then
     throwTypeCheckError $ SameScopeBindingShadowing $ "Cannot shadow a `" <> name <> "` binding in the same scope!"
   else
-    pure $ scope {values = Map.insert name (typ, expr, mut) scope.values}
+    pure $ scope {values = Map.insert name (ValueBinding typ expr mut row) scope.values}
 
 addType :: Text -> Typ -> Scope -> TypeCheckM Scope
 addType name typ scope =
@@ -186,9 +203,22 @@ addHandler sig scope =
   else
     pure $ scope {handlerSig = Just sig}
 
+-- | The initial scope.
+--
+--   The type of every builtin lives here; the interpreter gives the same
+--   names their values and operations.  'Builtins.builtins' is the list the
+--   two sides are checked against, so a name that is added on one side only is
+--   reported while the scope is built rather than when a program first calls
+--   it.
 globalScope :: [Text] -> TypeCheckM Scope
-globalScope args = do
-  let scope = Scope
+globalScope _args = do
+  boundSay <- freshBoundM
+  boundSayn <- freshBoundM
+  boundTrace <- freshBoundM
+  boundForce <- freshBoundM
+  boundWhnf <- freshBoundM
+
+  let emptyScope = Scope
         Map.empty
         Map.empty
         Map.empty
@@ -200,99 +230,113 @@ globalScope args = do
         Map.empty
         Map.empty
         Nothing
-      addPureBinding n t s = addBinding n (monoScheme t) (NLambda s) Val
-  scope' <- addPureBinding
-    "pred"
-    (tfunc TInt TInt)
-    (NativeLambdaSign "x" TInt TInt $ RClosed [])
-    scope
 
-  scope2 <- do
-    boundA <- freshBoundM
-    let tBoundA = TVar boundA
-    addBinding
-      "say"
-      (Scheme [boundA] [] [] Map.empty Map.empty (TFunct $ Funct tBoundA TNil Eff.fxOutput))
-      (NLambda (NativeLambdaSign "x" tBoundA TNil Eff.fxOutput))
-      Val
-      scope'
+      tSay = TVar boundSay
+      tSayn = TVar boundSayn
+      tTrace = TVar boundTrace
+      tForce = TVar boundForce
+      tWhnf = TVar boundWhnf
 
-  scope3 <- do
-    boundA <- freshBoundM
-    let tBoundA = TVar boundA
-    addBinding
-      "sayn"
-      (Scheme [boundA] [] [] Map.empty Map.empty (TFunct $ Funct tBoundA TNil Eff.fxOutput))
-      (NLambda (NativeLambdaSign "x" tBoundA TNil Eff.fxOutput))
-      Val
-      scope2
+      -- A value the interpreter builds directly.
+      native name input output = (name, [], tfunc input output)
 
-  scope4 <- addBinding
-    "args"
-    (monoScheme $ TArray TString)
-    (Array $ map String args)
-    Val
-    scope3
+      -- A parameterised builtin: its type variable is quantified by the
+      -- scheme, so every instantiation gets a fresh one.
+      quantified name tvs typ = (name, tvs, typ)
 
-  scope5 <- addPureBinding
-    "+"
-    (tfunc TInt $ tfunc TInt TInt)
-    (NativeLambdaSign "a" TInt (tfunc TInt TInt) Eff.empty)
-    scope4
+      -- An operation of a built-in effect.  The program sees it as a function
+      -- whose latent row is that single effect.
+      operation name input output effect =
+        (name, [], TFunct $ Funct input output $ RClosed [Eff.label effect])
 
-  scope6 <- addPureBinding
-    "-"
-    (tfunc TInt $ tfunc TInt TInt)
-    (NativeLambdaSign "a" TInt (tfunc TInt TInt) Eff.empty)
-    scope5
+      entries =
+        [ native "pred" TInt TInt
+        , native "not" TBoolean TBoolean
+        , native "+" TInt (tfunc TInt TInt)
+        , native "-" TInt (tfunc TInt TInt)
+        , native "ieq" TInt (tfunc TInt TBoolean)
+        , native ">" TInt (tfunc TInt TBoolean)
+        , native "<" TInt (tfunc TInt TBoolean)
+        , native "and" TBoolean (tfunc TBoolean TBoolean)
+        , quantified "force" [boundForce] $ TFunct $ Funct tForce tForce Eff.empty
+        , quantified "whnf" [boundWhnf] $ TFunct $ Funct tWhnf tWhnf Eff.empty
+        , quantified "say" [boundSay] $ TFunct $ Funct tSay TNil Eff.fxOutput
+        , quantified "sayn" [boundSayn] $ TFunct $ Funct tSayn TNil Eff.fxOutput
+        , quantified "trace" [boundTrace] $ TFunct $ Funct tTrace tTrace Eff.fxOutput
+        , ("args", [], TArray TString (RClosed []))
+        , operation "read_int" TNil TInt "Input"
+        , operation "read_string" TNil TString "Input"
+        , operation "read_float" TNil TFloat "Input"
+        , operation "read_boolean" TNil TBoolean "Input"
+        , ( "random_int"
+          , []
+          , TFunct $ Funct TInt (TFunct $ Funct TInt TInt Eff.fxRandom) Eff.empty
+          )
+        , operation "random_float" TNil TFloat "Random"
+        , operation "random_boolean" TNil TBoolean "Random"
+        , operation "random_string" TInt TString "Random"
+        , operation "time_ms" TNil TInt "Time"
+        , operation "sleep" TInt TNil "Time"
+        ]
 
-  scope7 <- do
-    boundA <- freshBoundM
-    let tBoundA = TVar boundA
-    boundR <- freshMetaM
-    addBinding
-      "force"
-      (Scheme [boundA] [] [] Map.empty Map.empty $ TFunct $ Funct tBoundA tBoundA $ ROpen [] boundR)
-      (NLambda (NativeLambdaSign "a" tBoundA tBoundA $ RVar boundR))
-      Val
-      scope6
-  
-  scope8 <- do
-    addPureBinding
-      "read_int"
-      (TFunct $ Funct TNil TInt $ RClosed [label "Input"])
-      (NativeLambdaSign "a" TNil TInt $ RClosed [label "Input"])
-      scope7
-  
-  scope9 <- do
-    addPureBinding
-      "ieq"
-      (tfunc TInt $ tfunc TInt TBoolean)
-      (NativeLambdaSign "a" TInt (tfunc TInt TBoolean) Eff.empty)
-      scope8
-  
-  scope10 <- do
-    addPureBinding
-      "and"
-      (tfunc TBoolean $ tfunc TBoolean TBoolean)
-      (NativeLambdaSign "a" TBoolean (tfunc TBoolean TBoolean) Eff.empty)
-      scope9
-  
-  scope11 <- addPureBinding
-    ">"
-    (tfunc TInt $ tfunc TInt TBoolean)
-    (NativeLambdaSign "a" TInt (tfunc TInt TBoolean) Eff.empty)
-    scope10
-  
-  scope12 <- addPureBinding
-    "<"
-    (tfunc TInt $ tfunc TInt TBoolean)
-    (NativeLambdaSign "a" TInt (tfunc TInt TBoolean) Eff.empty)
-    scope11
-  
-  addBinding
-    "random_int"
-    (monoScheme $ TFunct $ Funct TInt (TFunct $ Funct TInt TInt Eff.fxRandom) Eff.empty)
-    (NLambda $ NativeLambdaSign "a" TInt (TFunct $ Funct TInt TInt Eff.fxRandom) Eff.empty)
-    Val
-    scope12
+      declared = map (\(n, _, _) -> n) entries
+      undocumented = filter (`notElem` declared) Builtins.names
+      unimplemented = filter (`notElem` Builtins.names) declared
+
+  unless (null undocumented && null unimplemented) $
+    throwTypeCheckError $ InferenceError $ T.concat [
+        "internal error: the builtin table and the type checker disagree",
+        report "the table lists but the checker lacks" undocumented,
+        report "the checker binds but the table lacks" unimplemented
+      ]
+
+  foldM
+    (\sc (name, tvs, typ) -> do
+        (openedTyp, rowVars) <- openArrows typ
+        let scheme = Scheme tvs [] rowVars Map.empty Map.empty openedTyp
+        addBinding name scheme (valueOf name scheme) Val sc)
+    emptyScope
+    entries
+
+  where
+    report what ns =
+      if null ns then "" else "; " <> what <> ": " <> T.intercalate ", " ns
+
+    -- | Give every arrow of a builtin's curried spine a fresh row tail.
+    --
+    --   A builtin performs its own effect and nothing else, but its argument
+    --   is a delayed computation whose forcing may cost more (T-App: the row
+    --   of the argument must be included in the latent row of the parameter).
+    --   With a closed latent row the inclusion can never be satisfied, so
+    --   `sayn (f ())` was rejected whenever `f` read state.  The tail makes a
+    --   builtin polymorphic in the effects of its argument, exactly as an
+    --   inferred row has it; the effects are still charged, so a function that
+    --   declares `{Output}` and passes a reading thunk to `sayn` is rejected
+    --   because `Read` ends up in the call row.
+    openArrows :: Typ -> TypeCheckM (Typ, [Taste])
+    openArrows = go
+      where
+        go ty = case ty of
+          TFunct (Funct i o fxs) -> do
+            -- A meta, not a bound variable: 'applyEffRowSubst' resolves metas
+            -- through 'rowSubst', which is how a scheme's row variables are
+            -- freshened on every instantiation.  A bound variable is rigid and
+            -- would stay in the type, so the tail could never be solved.
+            r <- freshMetaM
+            (o', rs) <- go o
+            -- An explicit open row (an effect with parameters, say) keeps its
+            -- own tail; only a closed one gets a fresh one.
+            let fxs' = case fxs of
+                  RClosed cs -> ROpen cs r
+                  RVar _ -> ROpen [] r
+                  _ -> fxs
+            pure (TFunct (Funct i o' fxs'), r : rs)
+          _ -> pure (ty, [])
+
+    -- The scope keeps a value only so that the checker can tell what a name
+    -- refers to; the interpreter has its own table.  A native signature is
+    -- enough to describe it.
+    valueOf :: Text -> TypeScheme -> Expr
+    valueOf name scheme = case scheme._a of
+      TFunct (Funct i o fxs) -> NLambda (NativeLambdaSign name i o fxs)
+      t -> NLambda (NativeLambdaSign name t t Eff.empty)

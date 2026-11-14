@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["article-artifact", "main"]
+    branches: ["0.2-beta", "main"]
   pull_request:
-    branches: ["article-artifact", "main"]
+    branches: ["0.2-beta", "main"]
   workflow_dispatch:
 
 jobs:

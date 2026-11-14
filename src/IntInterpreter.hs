@@ -30,7 +30,7 @@ import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Span (Span, noSpan)
 import Utils (TextMap, Pretty (..))
 import Data.Foldable (find)
-import Data.List (intercalate)
+import Data.List (intercalate, nub)
 import TypedIR (
     TypedExpr(..),
     pattern TEInt, pattern TEFloat, pattern TEBoolean, pattern TEString,
@@ -40,7 +40,7 @@ import TypedIR (
     pattern TEPropAccess, pattern TEIfElse,
     Lambda(..), Block, TERecordProp(..))
 import Control.Monad.State
-import Control.Monad (foldM, forM, forM_, void, replicateM, foldM_, when)
+import Control.Monad (foldM, forM, forM_, void, unless, when)
 import Infer (freezeMutability, freeze, freezeBlock, freezeLambda)
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -52,10 +52,11 @@ import System.CPUTime (getCPUTime)
 import Control.Concurrent (threadDelay)
 import Resume (ResumeInfo(..))
 import Text.Printf (printf)
-import Data.Traversable (for)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (isJust)
 import System.Environment (lookupEnv)
-import Control.Exception (evaluate)
+import Control.Exception (evaluate, try)
+import System.IO.Error (isEOFError)
+import qualified Builtins
 import qualified Data.IntMap.Strict as IM
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap as IntMap
@@ -198,17 +199,63 @@ modifyEnv :: EnvId -> (Env -> Env) -> Interp EnvId
 modifyEnv eid f = updateEnv eid . f =<< getEnv eid
 
 findBindingEnv :: EnvId -> Text -> Interp (EnvId, Mutability, Address)
-findBindingEnv eid name = go Set.empty eid
+findBindingEnv eid name = do
+  found <- findBindingEnvMaybe eid name
+  case found of
+    Just frame -> pure frame
+    Nothing -> do
+      op <- findStackOperation name
+      case op of
+        Nothing -> rtError $ "`" <> name <> "` is not in scope"
+        Just (eff, arity) -> do
+          env <- gets sEnv
+          clos <- makeEffectClosure env arity eff name
+          a <- alloc (VClosure env Nothing clos)
+          pure (env, Val, a)
+
+findBindingEnvMaybe :: EnvId -> Text -> Interp (Maybe (EnvId, Mutability, Address))
+findBindingEnvMaybe eid name = go Set.empty eid
   where
     go visited eid' = do
       when (Set.member eid' visited) $
         rtError $ "internal error: the environment chain of " <> pretty eid' <> " is cyclic"
       env <- getEnv eid'
       case Map.lookup name env.bindings of
-        Just (m,a) -> pure (eid', m, a)
+        Just (m,a) -> pure $ Just (eid', m, a)
         Nothing -> case env.parent of
           Just p -> go (Set.insert eid' visited) p
-          Nothing -> rtError $ "`" <> name <> "` is not in scope"
+          Nothing -> pure Nothing
+
+-- | An operation of an effect whose handler is currently installed.
+--
+--   Operations are not always lexically visible where they are used: a thunk
+--   created outside a handler and forced inside it — @loop {break 1}@ — closes
+--   over the caller's environment, which has no binding for @break@.  The type
+--   checker admits the call because the effect is named in the expected type,
+--   so the interpreter resolves the name through the handler stack, innermost
+--   handler first, exactly as 'callEffect' selects the clause to run.
+findStackOperation :: Text -> Interp (Maybe (ECons, Int))
+findStackOperation name = do
+  stack <- gets sKstack
+  let matches =
+        [ (h.hEffect, arity)
+        | h <- stack
+        , Just arity <- [Map.lookup name h.hArities]
+        ]
+  case matches of
+    [] -> pure Nothing
+    ((eff, arity) : _)
+      -- The name alone does not say which effect an unbound operation belongs
+      -- to.  If two handlers on the stack provide it, choosing the innermost
+      -- one would silently run the wrong operation; report the ambiguity.
+      | all ((== effectName eff) . effectName . fst) matches ->
+          pure $ Just (eff, arity)
+      | otherwise ->
+          rtError $ T.concat [
+              "the operation `", name, "` is provided by more than one effect on the handler stack (",
+              T.intercalate ", " [ "`" <> effectName e <> "`" | e <- nub (map fst matches) ],
+              "), so it cannot be resolved by name"
+            ]
 
 getCell :: Env -> Text -> Maybe (Mutability, Address)
 getCell e x = Map.lookup x e.bindings
@@ -257,6 +304,10 @@ data InterpState = InterpState
   , sKstack     :: [HandlerFrame]
   , sNextAddr   :: Int
   , sNextEnv    :: Int
+  , sNextCont   :: Int                   -- ^ identifies a handler continuation
+  , sUsedConts  :: Set Int               -- ^ continuations already resumed
+  , sContAddrs  :: Set Int               -- ^ heap addresses holding a continuation
+  , sNextHandler :: Int                  -- ^ identifies an installed handler
   , sCode       :: IntMap Code           -- было Map Address Code
   , sFreezeMemo :: IntMap Address        -- было Map Address Address
   , sTrace      :: Bool
@@ -268,8 +319,14 @@ data InterpState = InterpState
 type Clause = [Address] -> (Address -> Interp Address) -> Interp Address
 
 data HandlerFrame = HandlerFrame {
+  -- | Distinguishes nested handlers of the same effect, so that a captured
+  --   continuation can be checked against the handler that created it.
+  hId         :: Int,
   hEffect     :: ECons,
   hClauses    :: Map Text Clause,
+  -- | Arity of each clause, so that a name reached through the stack can be
+  --   turned into the same curried operation closure a lexical binding holds.
+  hArities    :: Map Text Int,
   hThen       :: Address -> Interp Address
 }
 
@@ -321,7 +378,7 @@ interpret :: IR.Chunk -> [String] -> IO (Either InterpError Value)
 interpret chunk cmdArgs = fst <$> runInterp (do
     root <- newEnv $ Env Map.empty Nothing
     modify $ \st -> st {sEnv = root}
-    _ <- buildInitialEnv
+    _ <- buildInitialEnv cmdArgs
     evalChunk chunk
   ) initialInterpState
 
@@ -354,22 +411,22 @@ globalOps = [
     ]),
     (Eff.elabel "Input", [
       ("read_string", Op 1 $ \_ _ -> do
-        input <- T.pack <$> liftIO getLine
+        input <- readInputLine "read_string"
         case Parser.parseFromText Parser.stringLiteral input of
           Left _ -> rtError $ "`read_string` could not parse the line " <> quoted input
           Right s -> alloc $ VString s),
       ("read_int", Op 1 $ \_ _ -> do
-        input <- T.pack <$> liftIO getLine
+        input <- readInputLine "read_int"
         case Parser.parseFromText Parser.intLiteral input of
           Left _ -> rtError $ "`read_int` could not parse the line " <> quoted input
           Right i -> alloc $ VInt i),
       ("read_float", Op 1 $ \_ _ -> do
-        input <- T.pack <$> liftIO getLine
+        input <- readInputLine "read_float"
         case Parser.parseFromText Parser.floatLiteral input of
           Left _ -> rtError $ "`read_float` could not parse the line " <> quoted input
           Right f -> alloc $ VFloat f),
       ("read_boolean", Op 1 $ \_ _ -> do
-        input <- T.pack <$> liftIO getLine
+        input <- readInputLine "read_boolean"
         case Parser.parseFromText Parser.bool input of
           Left _ -> rtError $ "`read_boolean` could not parse the line " <> quoted input
           Right b -> alloc $ VBoolean b)
@@ -414,6 +471,21 @@ globalOps = [
     ])
   ]
 
+-- | One line of standard input.
+--
+--   Reading past the end of the input is a program-level mistake (a script ran
+--   out of answers), not a broken interpreter, so it is reported as a runtime
+--   diagnostic with a position rather than escaping as a Haskell exception
+--   with a backtrace.
+readInputLine :: Text -> Interp Text
+readInputLine op = do
+  result <- liftIO (try getLine)
+  case result of
+    Right line -> pure $ T.pack line
+    Left e
+      | isEOFError e -> rtError $ "`" <> op <> "` reached the end of the input"
+      | otherwise -> rtError $ "`" <> op <> "` could not read the input: " <> T.pack (show e)
+
 -- | The argument list of an operation whose arity is fixed did not match.
 arityError :: Text -> Int -> [Address] -> Interp a
 arityError op expected args =
@@ -453,15 +525,19 @@ undead addr =
 globalHandlers :: [HandlerFrame]
 globalHandlers = [
     HandlerFrame {
+      hId = -1,
       hEffect = eff,
       hClauses = Map.fromList [(n, opClause o) | (n, o) <- ops],
+      hArities = Map.fromList [(n, o.opArity) | (n, o) <- ops],
       hThen = pure
     }
   | (eff, ops) <- globalOps
   ]
 
-buildInitialEnv :: Interp EnvId
-buildInitialEnv = do
+-- | The initial environment: the operations of the built-in effects and the
+--   native values, exactly the names 'Builtins.builtins' lists.
+buildInitialEnv :: [String] -> Interp EnvId
+buildInitialEnv cmdArgs = do
   -- замыкания операций строятся из той же таблицы, что и клаузы (арность не дублируется)
   let allocEffectCall eff (op, o) = do
         env <- gets sEnv
@@ -516,6 +592,7 @@ buildInitialEnv = do
         b <- getInt addrB
         alloc $ VInt $ a - b
   forceAddr <- alloc $ VClosure st.sEnv emptyCache force
+  whnfBuiltinAddr <- alloc $ VClosure st.sEnv emptyCache whnf
   ieqAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
       a <- getInt addrA
       st' <- get
@@ -537,6 +614,12 @@ buildInitialEnv = do
   notAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
       a <- getBool addrA
       alloc $ VBoolean $ not a
+  predAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
+      a <- getInt addrA
+      alloc $ VInt $ a - 1
+  argsAddr <- do
+      argAddrs <- mapM (alloc . VString) (map T.pack cmdArgs)
+      alloc $ VArray argAddrs
   andAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
       a <- getBool addrA
       st' <- get
@@ -547,13 +630,32 @@ buildInitialEnv = do
           ("+", plusAddr),
           ("-", minusAddr),
           ("force", forceAddr),
+          ("whnf", whnfBuiltinAddr),
           ("ieq", ieqAddr),
           (">", igtAddr),
           ("<", iltAddr),
           ("and", andAddr),
-          ("not", notAddr)
+          ("not", notAddr),
+          ("pred", predAddr),
+          ("args", argsAddr)
         ]
-  modifyCurrentEnv $ \e -> e {bindings = operations <> justNatives <> e.bindings}
+
+      allBindings = operations <> justNatives
+
+      -- The checker and the interpreter must offer the same names: a name the
+      -- program can call but the interpreter cannot run would crash, and a
+      -- name the interpreter can run but the checker rejects is dead code.
+      missing = [n | n <- Builtins.names, not (Map.member n allBindings)]
+      extra = [n | n <- Map.keys allBindings, n `notElem` Builtins.names]
+
+  unless (null missing && null extra) $
+    rtError $ T.concat [
+        "internal error: the interpreter and the builtin table disagree",
+        if null missing then "" else "; missing: " <> T.intercalate ", " missing,
+        if null extra then "" else "; unexpected: " <> T.intercalate ", " extra
+      ]
+
+  modifyCurrentEnv $ \e -> e {bindings = allBindings <> e.bindings}
 
 -- | Выполнение чанка (игнорируем декларации, просто идём дальше)
 evalChunk :: IR.Chunk -> Interp Value
@@ -654,12 +756,12 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
       (_, m, a) <- findBindingEnv env n
       when (m == Var) $ logEvent EvRead
       cont a
-    TEArray _ xs -> do
+    TEArray _ _ xs -> do
       traceEval $ "evalExpr [TEArray] | [" <> T.unpack (T.intercalate ", " $ map pretty xs) <> "]"
       st <- get
       xs' <- mapM (\x -> alloc $ VThunk x st.sEnv) xs
       cont =<< alloc (VArray xs')
-    TEPair l r -> do
+    TEPair _ l r -> do
       env <- gets sEnv
       traceEval $ "evalExpr [TEPair] | l: " <> T.unpack (pretty l) <> ", r: " <> T.unpack (pretty r)
       l' <- alloc $ VThunk l env
@@ -705,7 +807,7 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
           modify $ \s -> s {sEnv = oldEnv}
           pure result
         _ -> rtError $ "the left side of an application is not a function: it is " <> describe v
-    TERecord _ ps -> do
+    TERecord _ ps _ -> do
       st <- get
       when (any (\p -> p.terMut == Var) ps) $ logEvent EvCreate
       triples <- mapM (\p -> (p.terMut, p.terName, ) <$> alloc (VThunk p.terExpr st.sEnv)) ps
@@ -730,6 +832,8 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
       env <- gets sEnv
       thenFn <- evalLambda env thenLam
       kstack0 <- gets sKstack
+      handlerId <- gets sNextHandler
+      modify $ \s -> s {sNextHandler = handlerId + 1}
       callCC $ \finish -> do
         let finishWithThen result = do
               traceEval $ "running then"
@@ -738,16 +842,23 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
               thenResult <- thenFn result
               modify $ \s -> s {sEnv = env}
               finish thenResult
-        let clausesMap = Map.fromList $ map (makeClause finishWithThen) clauses
-            handler = HandlerFrame fx clausesMap finishWithThen
+        let clausesMap = Map.fromList $ map (makeClause handlerId finishWithThen) clauses
+            handler = HandlerFrame handlerId fx clausesMap
+              (Map.fromList [(name, arity) | (name, _, _, arity) <- clauses])
+              finishWithThen
         -- операции эффекта живут в собственном окружении, а не в текущем
         opsEnv <- newEnv Env {bindings = Map.empty, parent = Just env}
         forM_ clauses $ \(name, _, _, arity) -> do
           fn <- makeEffectClosure opsEnv arity fx name
           void $ bindValIn opsEnv name (VClosure opsEnv (Just IM.empty) fn)
         modify $ \s -> s {sEnv = opsEnv, sKstack = handler : s.sKstack}
+        -- The body is evaluated to weak head normal form while the handler is
+        -- still installed: a thunk returned by the body must not escape and
+        -- perform its effects after the handler has been popped.  The model
+        -- forces to WHNF, so fields of a returned record or pair stay lazy.
         result <- evalBlock b pure
-        finishWithThen result
+        result' <- whnf result
+        finishWithThen result'
     p@(TEParen _) -> do
       env <- gets sEnv
       cont =<< alloc (VThunk p env)
@@ -762,7 +873,13 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
           clos tAddr
         _ -> rtError "`resume` is not a continuation here; it may only be used inside a handler clause"
     TELet pat bound body -> do
-      addr <- evalExpr bound pure
+      -- A destructuring pattern inspects the *value* of the right-hand side, so
+      -- it has to be forced first: `let (a, b) = p` must work when `p` is a
+      -- thunk, not only when the right-hand side is a literal pair.  A plain
+      -- name pattern binds the address itself, and forcing there would make
+      -- `let` strict, which it is not.
+      addr0 <- evalExpr bound pure
+      addr <- if needsValue pat then whnf addr0 else pure addr0
       bindings' <- matchPattern pat addr
       -- модель: let открывает область; привязки паттерна не выходят за тело
       outer <- gets sEnv
@@ -913,17 +1030,33 @@ makeEffectClosure env arity eff op =
         _ -> alloc . VClosure env (Just IM.empty) =<< go (arg : acc) (n - 1)
 
 makeClause ::
-  (Address -> Interp Address)     -- finishWithThen
+  Int                             -- the handler that owns the clauses
+  -> (Address -> Interp Address)  -- finishWithThen
   -> IR.HandlerClause
   -> (Text, Clause)
-makeClause finishWithThen
+makeClause handlerId finishWithThen
   (name, lam, hasResume, _) =
     (name, runClause)
   where
     runClause args k = do
       traceEval $ "makeClause: " <> show name <> " called with args " <> show args
       cur <- gets sEnv
-      resumeAddr <- alloc $ VClosure cur (Just IM.empty) k
+      -- A continuation is one-shot: resuming it twice would replay the rest of
+      -- the handled computation with the current heap, duplicating mutations.
+      -- It also dies with its handler: a continuation invoked after the
+      -- handler returned would re-enter the handled code with the wrong stack.
+      contId <- gets sNextCont
+      modify $ \s -> s {sNextCont = contId + 1}
+      resumeAddr <- alloc $ VClosure cur (Just IM.empty) $ \tAddr -> do
+        alive <- any ((== handlerId) . hId) <$> gets sKstack
+        unless alive $
+          rtError "`resume` was called after its handler returned; the continuation is no longer installed"
+        used <- gets sUsedConts
+        when (Set.member contId used) $
+          rtError "`resume` was called more than once; a handler continuation is one-shot"
+        modify $ \s -> s {sUsedConts = Set.insert contId s.sUsedConts}
+        k tAddr
+      modify $ \s -> s {sContAddrs = Set.insert (addrToInt resumeAddr) s.sContAddrs}
 
       -- resume живёт в собственном окружении клаузы
       eid <- newEnv Env {
@@ -937,7 +1070,14 @@ makeClause finishWithThen
 
       case hasResume of
         NoResume -> finishWithThen result
-        _ -> k result
+        _ -> do
+          -- Returning from a clause that contains `resume` is the one
+          -- resumption when the clause did not take the `resume` branch.
+          used <- gets sUsedConts
+          when (Set.member contId used) $
+            rtError "internal error: a handler clause returned after resuming its continuation"
+          modify $ \s -> s {sUsedConts = Set.insert contId s.sUsedConts}
+          k result
 
 applyMany :: (Address -> Interp Address) -> EnvId -> IntMap Address -> [Address] -> Interp Address
 applyMany clos eid cache args = do
@@ -1107,8 +1247,15 @@ freezeCell a = do
         Just v0 -> pure v0
         Nothing -> undead a
       case v of
-        VClosure env cache _ ->
+        VClosure env cache _ -> do
+          conts <- gets sContAddrs
+          when (Set.member (addrToInt a) conts) $
+            rtError "a snapshot cannot capture `resume`: a handler continuation is one-shot and cannot be frozen"
           case IM.lookup (addrToInt a) st.sCode of
+            -- A closure without recorded code is a builtin or an effect
+            -- operation.  Such closures are stateless atoms: the operation
+            -- names its effect in its captured Haskell function, and the
+            -- interpreter never reads the bindings of their env to apply them.
             Nothing -> share a
             Just code -> do
               a' <- placeholder
@@ -1282,16 +1429,19 @@ lookupMut e name = do
 freeVars :: TypedExpr -> Set Text
 freeVars = \case
   TEXVar n _ -> Set.singleton n
-  TEArray _ es -> Set.unions (map freeVars es)
-  TEPair l r -> Set.union (freeVars l) (freeVars r)
+  TEArray _ _ es -> Set.unions (map freeVars es)
+  TEPair _ l r -> Set.union (freeVars l) (freeVars r)
   TEXLambda lam ->
     let bodyFV = freeVarsBlock lam.lBlock
     in Set.delete lam.lArg bodyFV  -- аргумент связан
   TEApply f x -> Set.union (freeVars f) (freeVars x)
-  TERecord _ props -> Set.unions [freeVars (terExpr p) | p <- props]
+  TERecord _ props _ -> Set.unions [freeVars (terExpr p) | p <- props]
   TEHandle handler _ -> freeVarsHandler handler
   TEParen b -> freeVarsBlock b
-  TEResume e _ -> freeVars e
+  -- `resume` is syntax, not an ordinary name, but the continuation it denotes
+  -- is a value in the clause environment: a snapshot that reaches it must see
+  -- the name and refuse to freeze the continuation.
+  TEResume e _ -> Set.insert "resume" (freeVars e)
   TELet pat bound body ->
     let boundFV = freeVars bound
         bodyFV = freeVars body
@@ -1342,6 +1492,20 @@ atomLetPatternVars = \case
   ALPPair l r -> Set.union (letPatternVars l) (letPatternVars r)
   ALPRecord props -> Set.unions [maybe Set.empty atomLetPatternVars alp | LetPatternRecordProp _ _ alp <- props]
   _ -> Set.empty
+
+-- | Does matching this pattern need the value of the right-hand side?
+--
+--   A pair and a record pattern destructure, so the address must be forced to
+--   weak head normal form first.  A name, `_` and the nil literal bind the
+--   address as it is, which keeps @let x = e@ non-strict.
+needsValue :: LetPattern -> Bool
+needsValue = \case
+  LPParam _ -> False
+  LPATom a -> case a of
+    ALPPair {} -> True
+    ALPRecord {} -> True
+    ALPNil -> False
+    ALPUnderscore -> False
 
 matchPattern :: LetPattern -> Address -> Interp [(Text, Mutability, Address)]
 matchPattern pat addr = do
@@ -1419,6 +1583,10 @@ initialInterpState = InterpState {
   sKstack     = globalHandlers,
   sNextAddr   = 0,
   sNextEnv    = 1,
+  sNextCont   = 0,
+  sUsedConts  = Set.empty,
+  sContAddrs  = Set.empty,
+  sNextHandler = 0,
   sCode       = IM.empty,
   sFreezeMemo = IM.empty,
   sTrace      = False,

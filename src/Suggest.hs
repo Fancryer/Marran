@@ -23,7 +23,7 @@ module Suggest (
 
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.List (sortOn)
+import Data.List (sortOn, zip5)
 
 -- | Optimal string alignment distance between two strings: insertions,
 --   deletions, substitutions and transpositions of adjacent characters.
@@ -32,35 +32,62 @@ import Data.List (sortOn)
 --   > distance "lenght" "length" == 1
 --   > distance "" "abc" == 3
 --
---   Identifiers are short, so the full table is kept rather than a rolling pair
---   of rows: the transposition rule reaches two rows back, and the clarity is
---   worth more than the few cells of memory.
+--   The table is built one row at a time.  Row @i@ holds the distance from
+--   @take i as@ to every prefix of @bs@, so it has @m + 1@ entries; an entry
+--   depends on its left neighbour, on the entry above it and on the entry above
+--   and to the left.  A transposition reaches two rows back, so the two
+--   previous rows are kept.  Rows are combined with 'zip5' and 'scanl' rather
+--   than indexed — identifiers are short, and an index that cannot go out of
+--   bounds is worth more than the cells the zipping costs.
 distance :: Text -> Text -> Int
-distance a b = table !! n !! m
+distance a b = lastOr 0 (lastOr [] rows)
   where
     as = T.unpack a
     bs = T.unpack b
-    n = length as
     m = length bs
 
-    -- @table !! i !! j@ is the distance from @take i as@ to @take j bs@.
-    table = [[entry i j | j <- [0 .. m]] | i <- [0 .. n]]
+    -- Row 0 is the distance from the empty prefix to every prefix of @bs@.
+    firstRow = [0 .. m]
 
-    entry 0 j = j
-    entry i 0 = i
-    entry i j
-      | as !! (i - 1) == bs !! (j - 1) = table !! (i - 1) !! (j - 1)
-      | transposed = 1 + table !! (i - 2) !! (j - 2)
-      | otherwise = 1 + minimum [
-            table !! (i - 1) !! j
-          , table !! i !! (j - 1)
-          , table !! (i - 1) !! (j - 1)
-          ]
-      where
-        transposed =
-          i > 1 && j > 1
-            && as !! (i - 1) == bs !! (j - 2)
-            && as !! (i - 2) == bs !! (j - 1)
+    -- A lazily built table.  Each row is computed from the two above it, and
+    -- the third argument is the character two rows up, which the transposition
+    -- rule compares against: it is 'Nothing' in the first row, where a
+    -- transposition cannot apply.
+    rows = firstRow : go 1 firstRow firstRow Nothing as
+
+    go _ _ _ _ [] = []
+    go i prev prevPrev mCa2 (ca : rest) =
+      let row = nextRow i mCa2 ca prev prevPrev
+      in row : go (i + 1) row prev (Just ca) rest
+
+    -- The row for the next character of @a@.  'scanl' carries the entry to the
+    -- left, which is the one value the zipped columns cannot supply; 'zip5'
+    -- supplies the rest: the two characters of @bs@ involved, the entry above,
+    -- the entry above and left, and the entry two rows above and two columns
+    -- left.
+    nextRow i mCa2 ca prev prevPrev =
+      scanl (cell ca mCa2) i $
+        zip5
+          bs
+          (Nothing : map Just bs)
+          (drop 1 prev)
+          prev
+          (Nothing : map Just prevPrev)
+
+    cell ca mCa2 left (cb, mCb2, up, diag, mDiag2)
+      | ca == cb = diag
+      | Just ca2 <- mCa2
+      , Just cb2 <- mCb2
+      , Just diag2 <- mDiag2
+      , ca == cb2
+      , ca2 == cb = 1 + diag2
+      | otherwise = 1 + minimum [up, left, diag]
+
+-- | The last element of a list, or the default when it is empty.  The table
+--   above always has at least one row of at least one entry, so the defaults
+--   are never reached; they are there so that the function is total.
+lastOr :: a -> [a] -> a
+lastOr def = foldl (\_ x -> x) def
 
 -- | How far a typo may be from the name it mistypes: one edit for a short name,
 --   more for a long one, so that @freezeRowMutiIn@ can still suggest
