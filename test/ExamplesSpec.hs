@@ -770,6 +770,35 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> expectationFailure $ "a row alias over an effect must work: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe` ["3"]
 
+  describe "Nothing is the bottom type" $ do
+    it "types `[[1], []]` and `[[], [1]]` the same way" $ do
+      -- The empty array is `[Nothing]`, and `Nothing <: T`; an ordinary
+      -- unification only knows that when the bottom type is on the left, so
+      -- the order of the components used to matter.
+      r <- runSourceWithInput "empty_arrays.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn [[1], []];"
+        , "  sayn [[], [1]]"
+        ]
+      case r of
+        Left err -> expectationFailure $
+          "the order of the components must not matter: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["[[1], []]", "[[], [1]]"]
+
+    it "rejects an `Int` where `Nothing` is declared" $ do
+      -- `Nothing` is a subtype of everything, but nothing is a subtype of it
+      -- except itself: a parameter declared `Nothing` stays empty.
+      r <- runSourceWithInput "bottom_param.marr" "" $ T.unlines
+        [ "funct f (x Nothing) : Int = 0"
+        , ""
+        , "funct main () : {Output} () = sayn (f 1)"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Nothing" `isInfixOf`)
+        Right out -> expectationFailure $
+          "an Int is not a Nothing; got output: " ++ take 300 out
+
   it (rejectedProgram ++ " is rejected with the missing Read effect") $ do
     r <- runProgram rejectedProgram
     case r of

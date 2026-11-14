@@ -23,6 +23,7 @@ module Unify (
   applyEffConsSubst,
   unifyTypes,
   unifyArgType,
+  joinTypes,
   subsumesType,
   unifyTypeArgs,
   unifyTypeArgLists,
@@ -459,6 +460,10 @@ subsumesType scope actual declared = do
   a <- applyTypeSubst scope actual
   d <- applyTypeSubst scope declared
   case (a, d) of
+    -- `Nothing` is the bottom type: a value of it (the empty array literal) is
+    -- a value of every type.  The converse does not hold, so this case is not
+    -- symmetric -- see 'unifyTypes'.
+    (TNothing, _) -> pure scope
     (TArray ta ra, TArray td rd) -> do
       s <- subsumesType scope ta td
       subsumesEffRow s ra rd
@@ -470,6 +475,81 @@ subsumesType scope actual declared = do
       s <- subsumesRecords scope pa pd
       subsumesEffRow s fa fd
     _ -> unifyTypes scope actual declared
+
+-- | The least type that both values have, used where two expressions must
+--   agree without either being the declared side: the components of an array
+--   literal and the two branches of an @if@.
+--
+--   'Nothing' is the bottom type, so joining it with anything gives the other
+--   type.  That is what makes the order of the components irrelevant:
+--   @[[1], []]@ and @[[], [1]]@ must have the same type.  An ordinary
+--   unification cannot express it, because its @TNothing@ rule only fires when
+--   the bottom type is on the left.
+--
+--   Structural types are joined componentwise and their rows are unioned: the
+--   pending row of an aggregate is an upper bound of the rows of its
+--   components, so a component that reads state must not force the row of the
+--   empty component next to it to read too.  Anything else is an ordinary
+--   unification: two unrelated rigid types have no join.
+joinTypes :: Scope -> Typ -> Typ -> TypeCheckM (Typ, Scope)
+joinTypes scope t1 t2 = do
+  t1' <- applyTypeSubst scope t1
+  t2' <- applyTypeSubst scope t2
+  case (t1', t2') of
+    (TNothing, t) -> pure (t, scope)
+    (t, TNothing) -> pure (t, scope)
+    (TArray a1 r1, TArray a2 r2) -> do
+      (el, s) <- joinTypes scope a1 a2
+      (r, s') <- joinRows s r1 r2
+      pure (TArray el r, s')
+    (TPair l1 r1 f1, TPair l2 r2 f2) -> do
+      (l, s1) <- joinTypes scope l1 l2
+      (r, s2) <- joinTypes s1 r1 r2
+      (f, s3) <- joinRows s2 f1 f2
+      pure (TPair l r f, s3)
+    (TRecord p1 f1, TRecord p2 f2) ->
+      case joinRecords p1 p2 of
+        Just zipped -> do
+          (ps, s) <- foldM joinField ([], scope) zipped
+          (f, s') <- joinRows s f1 f2
+          pure (TRecord ps f, s')
+        Nothing -> unifyThen scope t1' t2'
+    _ -> unifyThen scope t1' t2'
+  where
+    joinField :: ([TRecordProp], Scope) -> (TRecordProp, TRecordProp) -> TypeCheckM ([TRecordProp], Scope)
+    joinField (acc, s) (a, b) = do
+      (t, s') <- joinTypes s (tTyp a) (tTyp b)
+      pure (acc <> [TRecordProp (tMut a) (tName a) t], s')
+
+-- | The row of a joined aggregate: the union of the two, because the pending
+--   row of an aggregate bounds the rows of all its components, so it has to
+--   provide everything either side performs.
+joinRows :: Scope -> EffRow -> EffRow -> TypeCheckM (EffRow, Scope)
+joinRows scope r1 r2 = do
+  r1' <- applyEffRowSubst scope r1
+  r2' <- applyEffRowSubst scope r2
+  pure (unionEffRows r1' r2', scope)
+
+-- | Two types that are not structurally joinable must still unify: that is
+--   how a meta is solved by the other side, and how two different rigid types
+--   are reported.
+unifyThen :: Scope -> Typ -> Typ -> TypeCheckM (Typ, Scope)
+unifyThen scope t1 t2 = do
+  s <- unifyTypes scope t1 t2
+  t <- applyTypeSubst s t1
+  pure (t, s)
+
+-- | Pair up the fields of two records by name, if they name the same fields
+--   with the same mutability and neither repeats a name.
+joinRecords :: [TRecordProp] -> [TRecordProp] -> Maybe [(TRecordProp, TRecordProp)]
+joinRecords props1 props2
+  | length z1 /= length z2 = Nothing
+  | not (and (zipWith sameField z1 z2)) = Nothing
+  | otherwise = Just (zip z1 z2)
+  where
+    z1 = sortOn tName props1
+    z2 = sortOn tName props2
+    sameField a b = tName a == tName b && tMut a == tMut b
 
 -- | 'unifyRecords' with the component types related by 'subsumesType'.
 --
@@ -500,6 +580,12 @@ unifyTypes scope t1 t2 = do
   t1' <- applyTypeSubst scope t1
   t2' <- applyTypeSubst scope t2
   case (t1', t2') of
+    -- `Nothing` is the bottom type, and this rule is deliberately one-sided:
+    -- on the left it means "a value of the empty type, which also has type
+    -- `T`", so `var xs = []; xs := [1]` widens the element type.  On the right
+    -- it must not fire, or `f 1` would pass where the parameter is declared
+    -- `Nothing`; 'subsumesType' and 'joinTypes' are what make the other
+    -- positions order-independent.
     (TNothing, _); (TInt, TInt); (TFloat, TFloat);
       (TBoolean, TBoolean); (TString, TString); (TNil, TNil) ->
       pure scope

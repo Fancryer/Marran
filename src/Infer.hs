@@ -81,6 +81,7 @@ import Unify (
     TypeCheckError(..),
     unifyTypes,
     unifyArgType,
+    joinTypes,
     subsumesType,
     applyTypeSubst,
     freshMetaTypeM,
@@ -588,21 +589,24 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
     InferResult hEntry fxs scope1 <- inferExpr scope x
     hType <- typeOfTypedExprUnsafe hEntry
 
-    -- Типизируем остальные элементы и одновременно унифицируем типы
-    (typedEntries, finalFxs, finalScope) <- foldM
-      (\(accEntries, accFxs, sc) ae -> do
+    -- Типизируем остальные элементы и одновременно сводим их типы к общему.
+    -- `Nothing` — нижний тип, поэтому сведение, а не унификация: `[[1], []]`
+    -- и `[[], [1]]` должны иметь один и тот же тип `[[Int]]`, в каком бы
+    -- порядке компоненты ни стояли.
+    (typedEntries, finalFxs, elemType, finalScope) <- foldM
+      (\(accEntries, accFxs, accT, sc) ae -> do
         InferResult tEntry tFxs sc' <- inferExpr sc ae
         tEntryTyp <- typeOfTypedExprUnsafe tEntry
-        sc'' <- unifyTypes sc' hType tEntryTyp
-        pure (accEntries <> [tEntry], Eff.unionEffRows accFxs tFxs, sc''))
-      ([hEntry], fxs, scope1)
+        (joined, sc'') <- joinTypes sc' accT tEntryTyp
+        pure (accEntries <> [tEntry], Eff.unionEffRows accFxs tFxs, joined, sc''))
+      ([hEntry], fxs, hType, scope1)
       xs
     -- Men(Γ,tᵢ): a snapshot of a component reaches whatever its code mentions.
     men <- mentionRow finalScope (Set.unions (map fvTyped typedEntries))
     pending <- freshMetaRowM
     finalScope' <- subsumesEffRow finalScope (Eff.unionEffRows finalFxs men) pending
     wrapInferResultWithCell $
-      InferResult (TEArray hType pending typedEntries) finalFxs finalScope'
+      InferResult (TEArray elemType pending typedEntries) finalFxs finalScope'
   Pair l r -> do
     InferResult l' lRow scope' <- inferExpr scope l
     InferResult r' rRow scope'' <- inferExpr scope' r
@@ -813,7 +817,10 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
     InferResult typF fFxs fScope <- inferExpr tScope f
     typT' <- typeOfTypedExprIn fScope typT
     typF' <- typeOfTypedExprIn fScope typF
-    iScope <- unifyTypes fScope typT' typF'
+    -- The two branches must have a common type, and `Nothing` (the type of an
+    -- empty array) is bottom: `if c then [] else xs` is as well typed as
+    -- `if c then xs else []`.
+    (_, iScope) <- joinTypes fScope typT' typF'
     wrapInferResultWithCell $ InferResult
       (TEIfElse typP typT typF)
       (Eff.unionEffRows pFxs $ Eff.unionEffRows tFxs fFxs)

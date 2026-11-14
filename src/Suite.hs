@@ -60,6 +60,7 @@ cases =
   , ("row_poly",          ["hello", "42"])
   , ("under",             ["1"])
   , ("effect_in_function", ["3"])
+  , ("empty_arrays",      ["[[1], []]", "[[], [1]]", "[]"])
   ]
 
 -- | The program that the type checker must reject; the error must name @Read@.

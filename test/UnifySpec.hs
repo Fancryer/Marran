@@ -33,6 +33,7 @@ testScope = globalScope []
 uSpec :: Spec
 uSpec = do
   describe "Type unification" typeUnificationTests
+  describe "The bottom type" bottomTypeTests
   describe "Type argument unification" typeArgTests
   describe "Effect constructor unification" effectConsTests
   describe "Effect row unification" effectRowTests
@@ -1216,6 +1217,72 @@ shouldReturnType expected result =
 -- ---------------------------------------------------------------------------
 -- 1. Type unification
 -- ---------------------------------------------------------------------------
+
+-- | `Nothing` is the bottom type.  The rules differ by position, and the tests
+--   pin down which one is which: unification is the equality used for a
+--   variable's own type, subsumption is "fits the declared type", and the join
+--   is what an array literal or an `if` needs.
+bottomTypeTests :: Spec
+bottomTypeTests = do
+  it "unifies `Nothing` with itself" $
+    runWithScope
+      (\sc -> unifyTypes sc TNothing TNothing)
+      shouldBeRight
+
+  it "rejects `Int` where `Nothing` is expected" $
+    -- `var xs = []; xs := [1]` widens the array, but a parameter declared
+    -- `Nothing` stays empty: `Nothing` is a subtype of `Int`, not the other
+    -- way round.
+    runWithScope
+      (\sc -> unifyTypes sc TInt TNothing)
+      shouldBeLeft
+
+  it "subsumes `Nothing` under every declared type" $
+    runWithScope
+      (\sc -> subsumesType sc TNothing (TArray TInt nilRow))
+      shouldBeRight
+
+  it "does not subsume `Int` under `Nothing`" $
+    runWithScope
+      (\sc -> subsumesType sc TInt TNothing)
+      shouldBeLeft
+
+  it "subsumes `[Nothing]` under `[Int]`" $
+    runWithScope
+      (\sc -> subsumesType sc (TArray TNothing nilRow) (TArray TInt nilRow))
+      shouldBeRight
+
+  it "joins `Nothing` and `Int` in either order" $ do
+    joined TNothing TInt `shouldBeRight_` TInt
+    joined TInt TNothing `shouldBeRight_` TInt
+
+  it "joins `[[1], []]` and `[[], [1]]` to the same type" $ do
+    let ints = TArray TInt nilRow
+        emptyA = TArray TNothing nilRow
+    joined (TArray ints nilRow) (TArray emptyA nilRow) `shouldBeRight_` TArray ints nilRow
+    joined (TArray emptyA nilRow) (TArray ints nilRow) `shouldBeRight_` TArray ints nilRow
+
+  it "joins the rows of the components instead of requiring one" $
+    -- An array whose elements read state and one whose elements do not still
+    -- have a common type: the pending row of the array is an upper bound of
+    -- the rows of its components.
+    joined (TArray TInt (closedRow ["Read"])) (TArray TNothing nilRow)
+      `shouldBeRight_` TArray TInt (closedRow ["Read"])
+
+-- | Join two types and substitute the result, to compare with an expected
+--   type.
+joined :: Typ -> Typ -> Either (ErrorStack, TypeCheckError) Typ
+joined t1 t2 = evalTypeCheckM
+  (testScope >>= \sc -> joinTypes sc t1 t2 >>= \(t, s) -> applyTypeSubst s t)
+  initialState
+
+infix 1 `shouldBeRight_`
+
+shouldBeRight_ :: (Eq a, Show a) => Either e a -> a -> Expectation
+shouldBeRight_ result expected =
+  case result of
+    Left _ -> expectationFailure "expected a join, got an error"
+    Right actual -> actual `shouldBe` expected
 
 typeUnificationTests :: Spec
 typeUnificationTests = do
