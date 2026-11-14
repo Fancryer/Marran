@@ -679,6 +679,22 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> err `shouldSatisfy` ("@{Read}" `isInfixOf`)
         Right _ -> expectationFailure "the annotation mismatch must be reported"
 
+  describe "printing values" $ do
+    it "prints array elements, not their addresses" $ do
+      -- `stringify` used `pretty` on the element addresses, so `sayn [1, 2]`
+      -- printed `[#00000019, #0000001a]`.
+      r <- runSourceWithInput "print_array.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn [1, 2];"
+        , "  sayn [['a'], ['b', 'c']];"
+        , "  sayn [(1, 2), (3, 4)];"
+        , "  sayn #{ val xs = [1] }"
+        ]
+      case r of
+        Left err -> expectationFailure $ "printing an array must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["[1, 2]", "[[a], [b, c]]", "[(1, 2), (3, 4)]", "#{val xs = [1]}"]
+
   it (rejectedProgram ++ " is rejected with the missing Read effect") $ do
     r <- runProgram rejectedProgram
     case r of

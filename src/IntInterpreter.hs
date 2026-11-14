@@ -129,7 +129,9 @@ instance Stringify Value where
       l' <- stringify l
       r' <- stringify r
       pure $ T.concat ["(", l', ", ", r', ")"]
-    VArray vals -> pure $ "[" <> T.intercalate ", " (map pretty vals) <> "]"
+    VArray vals -> do
+      vals' <- mapM stringify vals
+      pure $ "[" <> T.intercalate ", " vals' <> "]"
     VRecord eid -> do
       env <- getEnv eid
       bindings' <- go env []
