@@ -17,10 +17,10 @@ main = getArgs >>= \case
     Left err -> putStrLn err >> exitFailure
     Right out -> putStr out >> putStrLn "(done)"
   _ -> putStrLn $ unlines
-    [ "usage: marran-exe               run the examples of the paper"
-    , "       marran-exe --bench [--csv FILE]        the graphs of Table 2"
+    [ "usage: marran-exe               run the bundled example programs"
+    , "       marran-exe --bench [--csv FILE]        the benchmark graphs"
     , "       marran-exe --bench-edges [--csv FILE]  the wider edge sweep"
-    , "       marran-exe --run <name>  run one program"
+    , "       marran-exe --run <name>  run one program from app/marr"
     ]
 
 -- | Criterion accepts @--csv@ only as its first argument.
