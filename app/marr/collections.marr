@@ -1,0 +1,58 @@
+//| Функции высшего порядка и массивы из стандартной библиотеки: `id`, `const`,
+//| `flip`, `compose`, `curry`, `uncurry`; `head`, `tail`, `empty`, `alen`,
+//| `map`, `filter`, `any`, `all`, `foldl`, `foldr`, `concat`, `zip`, `at`,
+//| `take`, `drop`; пары `fst`/`snd` и `show`.
+//|
+//| `at` за границей массива — ошибка эффекта `Error`: её можно поймать
+//| (`under Error`), а непойманная доходит до нижнего обработчика.
+//| Ожидается вывод:
+//| 5
+//| hello
+//| 3
+//| 4
+//| 6
+//| 2
+//| 10
+//| 1
+//| 3
+//| [2, 3]
+//| [1, 2]
+//| [2, 3]
+//| [2, 4, 6]
+//| [2, 3]
+//| false
+//| true
+//| 10
+//| 24
+//| [1, 2, 3]
+//| [(1, a), (2, b)]
+//| 20
+//| `at`: index 5 is out of range for an array of 1 element
+//| 9
+funct main () : {Output; Error} () =
+  //| `id` возвращает аргумент как есть, `const` игнорирует второй
+  sayn (id 5); sayn (const 'hello' 1); sayn (id 3);
+  //| `flip` меняет местами первые два аргумента: `flip - 4 8` — это `- 8 4`
+  sayn (flip - 4 8);
+  //| `compose` применяет справа налево
+  sayn (compose {x = * x 2} {x = + x 1} 2);
+  //| `curry`/`uncurry` переводят пару в два аргумента и обратно
+  sayn (curry {p = + (fst p) (snd p)} 1 1);
+  sayn (uncurry + (4, 6));
+  //| массивы
+  sayn (head [1, 2, 3]); sayn (alen [1, 2, 3]); sayn (tail [1, 2, 3]);
+  sayn (take 2 [1, 2, 3]); sayn (drop 1 [1, 2, 3]);
+  sayn (map {x = * x 2} [1, 2, 3]); sayn (filter {x = > x 1} [1, 2, 3]);
+  sayn (any {x = > x 3} [1, 2, 3]); sayn (all {x = > x 0} [1, 2, 3]);
+  sayn (foldl + 0 [1, 2, 3, 4]); sayn (foldr * 1 [2, 3, 4]);
+  sayn (concat [[1], [2, 3]]); sayn (zip [1, 2] ['a', 'b']);
+  //| `at` в пределах массива
+  sayn (at [10, 20, 30] 1);
+  //| `at` за границей — `Error`, пойманная обработчиком: `show` приводит обе
+  //| ветки к строке, иначе тип обработчика не совпал бы с типом тела
+  sayn (under Error to show (at [1] 5)
+    handle
+    | error e => e
+    | then x => x);
+  //| `show` — текст значения
+  sayn (slen (show [1, 2, 3]))

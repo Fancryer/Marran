@@ -1,0 +1,42 @@
+//| Эффекты стандартной библиотеки, кроме `Output`/`Input`: `Env` (`get_env`,
+//| `set_env`), `File` (`write_file`, `append_file`, `read_file`, `file_exists`,
+//| `delete_file`, `list_directory`), `System` (`args`, `hostname`, `system`) и
+//| `try` — обработчик `Error` внутри языка.
+//|
+//| Файл пишется в текущий каталог и удаляется в конце, поэтому пример можно
+//| запускать из любого места. `hostname` на разных системах разный, поэтому
+//| проверяется только то, что он непустой.
+//| Ожидается вывод:
+//| ok
+//| 0
+//| true
+//| 11
+//| 42
+//| -4
+//| 0
+//| false
+funct boom () : {Error} Int = + 1 (error 'boom')
+
+funct fine () : Int = 42
+
+funct main () : {Output; Error; Env; File; System} () =
+  //| окружение процесса: записанное значение читается обратно
+  set_env 'MARRAN_STDLIB_PROBE' 'value';
+  sayn (if seq (get_env 'MARRAN_STDLIB_PROBE') 'value' then 'ok' else 'bad');
+  //| командная строка: при запуске из тестов она пустая
+  sayn (alen (args ()));
+  //| имя узла есть всегда, но какое — зависит от системы
+  sayn (> (slen (hostname ())) 0);
+  //| файл: запись, дописывание, чтение («firstsecond» — 11 символов)
+  val path = 'marran_probe.tmp';
+  write_file path 'first';
+  append_file path 'second';
+  sayn (slen (read_file path));
+  //| `try` ловит `Error` тела; дальше идёт то, что вернул обработчик
+  sayn (try fine {e = slen e});
+  sayn (try boom {e = neg (slen e)});
+  //| `system` возвращает код возврата команды
+  sayn (system 'echo hi');
+  //| файл существует до удаления и нет после
+  delete_file path;
+  sayn (file_exists path)

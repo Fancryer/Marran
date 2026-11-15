@@ -18,6 +18,8 @@ module Eff (
   pureEffDeclWithOps,
   fxInput,
   fxOutput,
+  fxEnv,
+  fxFile,
   fxRandom,
   fxTime,
   fxSystem,
@@ -104,9 +106,11 @@ unionEffRowsList = foldl unionEffRows $ RClosed []
 pureEffDeclWithOps :: Text -> [(Text, Funct)] -> EffDef
 pureEffDeclWithOps name = EffDef name []
 
-fxInput, fxOutput, fxRandom, fxTime, fxSystem, fxError, fxVar, fxRead, fxRebind, fxCell :: EffRow
+fxInput, fxOutput, fxEnv, fxFile, fxRandom, fxTime, fxSystem, fxError, fxVar, fxRead, fxRebind, fxCell :: EffRow
 fxInput = closedOfFlat "Input"
 fxOutput = closedOfFlat "Output"
+fxEnv = closedOfFlat "Env"
+fxFile = closedOfFlat "File"
 fxRandom = closedOfFlat "Random"
 fxTime = closedOfFlat "Time"
 fxSystem = closedOfFlat "System"

@@ -18,6 +18,16 @@
 --   its fields; it names them, and both sides build the record out of the very
 --   values they bind globally.  That is what makes @Numbers@+@ and @+@ the same
 --   function rather than two that must be kept in step.
+--
+--   Not every group of @app/std.marr@ can be a record yet.  A record's fields
+--   are inferred at one type ('Infer.inferRecord'), so a field cannot be
+--   quantified: @Arrays@ would have to hold @map@ at a single element type.
+--   The fields of @Functions@, @Arrays@, @Pairs@, @Conv@, @Output@ and
+--   @Input@ are therefore unpacked into the native scope as plain functions,
+--   and only the monomorphic groups are records.  When a record field may be
+--   polymorphic these names will move into their records as well, and the flat
+--   names will be built from the records, exactly as @+@ and @Numbers@+@
+--   already are.
 module Builtins (
   Builtin(..),
   BuiltinKind(..),
@@ -119,7 +129,44 @@ builtins = [
     -- introspection and memory
     Builtin "force" Native,
     Builtin "whnf" Native,
-    Builtin "args" Native,
+
+    -- the polymorphic groups of `app/std.marr`, unpacked (see the note above):
+    -- `Functions`
+    Builtin "id" Native,
+    Builtin "const" Native,
+    Builtin "flip" Native,
+    Builtin "compose" Native,
+    Builtin "apply" Native,
+    Builtin "curry" Native,
+    Builtin "uncurry" Native,
+
+    -- `Arrays`
+    Builtin "head" Native,
+    Builtin "tail" Native,
+    Builtin "empty" Native,
+    Builtin "alen" Native,
+    Builtin "map" Native,
+    Builtin "filter" Native,
+    Builtin "any" Native,
+    Builtin "all" Native,
+    Builtin "foldl" Native,
+    Builtin "foldr" Native,
+    Builtin "concat" Native,
+    Builtin "zip" Native,
+    Builtin "at" Native,
+    Builtin "take" Native,
+    Builtin "drop" Native,
+
+    -- `Pairs`
+    Builtin "fst" Native,
+    Builtin "snd" Native,
+
+    -- `Conv` (`parse` is still missing: see TODO)
+    Builtin "show" Native,
+
+    -- `try` handles `Error` inside the language: it installs a handler for the
+    -- body, so it is a function, not an operation whose clause a handler needs.
+    Builtin "try" Native,
 
     Builtin "say" (Op "Output"),
     Builtin "sayn" (Op "Output"),
@@ -137,6 +184,24 @@ builtins = [
 
     Builtin "time_ms" (Op "Time"),
     Builtin "sleep" (Op "Time"),
+
+    -- `Env`, `File` and `System` are declared by `app/std.marr` and implemented
+    -- here; none of them needs a record, because their operations are ordinary
+    -- effect operations.
+    Builtin "get_env" (Op "Env"),
+    Builtin "set_env" (Op "Env"),
+
+    Builtin "read_file" (Op "File"),
+    Builtin "write_file" (Op "File"),
+    Builtin "append_file" (Op "File"),
+    Builtin "file_exists" (Op "File"),
+    Builtin "delete_file" (Op "File"),
+    Builtin "list_directory" (Op "File"),
+
+    Builtin "args" (Op "System"),
+    Builtin "hostname" (Op "System"),
+    Builtin "system" (Op "System"),
+    Builtin "exit" (Op "System"),
 
     -- `error` is the operation of `Error` a handler catches; `assert` is a
     -- plain function that performs it, so a handler needs one clause, not two.

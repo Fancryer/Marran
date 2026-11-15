@@ -20,3 +20,5 @@
 | gene.marr | блок в `val`-привязке: значение вычисляется при использовании | (нет вывода: `main` возвращает `Int`, а не печатает его) |
 | under.marr | клауза `sub` без `resume` прерывает вычисление: `add 5 (sub 3 2)` равно 1 | 1 |
 | handle_while.marr | обработчики эффектов: `break : `T -> `T`, `continue`, тело `under` форсируется самим обработчиком | на ввод `1 2 5` печатает 7; без 5 после десяти итераций печатает 0 |
+| collections.marr | функции высшего порядка и массивы stdlib: `id`, `const`, `flip`, `compose`, `curry`, `uncurry`, `map`, `filter`, `foldl`, `zip`, `at`, `show` | 23 строки, см. шапку файла |
+| stdlib_effects.marr | эффекты `Env`, `File`, `System` и `try` | ok, 0, true, 11, 42, -4, 0, false |

@@ -1124,6 +1124,59 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> expectationFailure $ "`sub` must not fail on a long length: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe` ["bcd", "abc", "", "0"]
 
+    it "keeps `id` and `const` lazy, so an argument they ignore is not forced" $ do
+      -- `id` returns its argument's address, not its value: a delayed spin that
+      -- neither is asked for must not run, and `head` must not force the first
+      -- element either -- the pending row of the array says what that costs.
+      r <- runSourceWithInput "lazy_id.marr" "" $ T.unlines
+        [ "funct spin (n Int) : Int = spin n"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (const 1 (spin 2));"
+        , "  sayn (alen (map {x = spin x} []))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`const` and `map` must not force: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["1", "0"]
+
+    it "reports an index past the end through `Error`, so `try` can catch it" $ do
+      r <- runSourceWithInput "at_out_of_range.marr" "" $ T.unlines
+        [ "funct main () : {Output; Error} () ="
+        , "  sayn (try {u = at [1, 2] 5} {e = 0});"
+        , "  sayn (at [10, 20] 1)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`at` must report through `Error`: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["0", "20"]
+
+    it "runs `Env` and `File` as effects with operations, not as constants" $ do
+      -- The operations are named by a row: a program that does not declare
+      -- `File` cannot call `write_file`, and `get_env` of a name that was just
+      -- set reads the value back.
+      r <- runSourceWithInput "env_and_file.marr" "" $ T.unlines
+        [ "funct main () : {Output; Env; File; Error} () ="
+        , "  set_env 'MARRAN_TEST_VAR' 'v';"
+        , "  sayn (get_env 'MARRAN_TEST_VAR');"
+        , "  val path = 'marran_spec_probe.tmp';"
+        , "  write_file path 'x';"
+        , "  sayn (read_file path);"
+        , "  delete_file path;"
+        , "  sayn (file_exists path)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`Env` and `File` must run: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["v", "x", "false"]
+
+    it "rejects `write_file` in a function whose row does not name `File`" $ do
+      r <- runSourceWithInput "file_without_row.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  write_file 'x' 'y'"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("File" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a call to `write_file` must charge `File`; got output: " ++ take 300 out
+
   where
     isReport l = "EVENTS:" `isInfixOf` l || "EVENT-VIOLATION" `isInfixOf` l
     isCodedHeader l =

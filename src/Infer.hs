@@ -388,6 +388,12 @@ withDeclFrame name sp = withErrorStack (EFIr $ IrFrame name sp)
 inferChunk :: [Text] -> Types.Chunk -> TypeCheckM TypedIR.Chunk
 inferChunk args chunk = do
   globalScope <- Scope.globalScope args
+  -- The builtins live in the outer scope, so a program declaration shadows
+  -- one: `funct apply ...` in a program is the program's `apply`, and the
+  -- library's is still reachable from a scope that does not rebind it.  It is
+  -- also why a user name only has to be added to the program's scope, not
+  -- merged with the builtin table.
+  let programScope = enterScope globalScope
   -- Первый проход: регистрируем только эффекты и функции (с предварительными схемами)
   (scope1, funSigs) <- foldM (\(sc, sigs) stat -> case stat of
       Types.SEffDef sp effDef -> withDeclFrame ("effect " <> effName effDef) sp $ do
@@ -430,7 +436,7 @@ inferChunk args chunk = do
         pure (sc', sigs <> [(functDecl, retFxs, retTyp)])
 
       _ -> pure (sc, sigs)
-    ) (globalScope, []) chunk
+    ) (programScope, []) chunk
 
   -- Второй проход: типизируем тела функций и обновляем схемы
   (_scope2, typedFuns) <- foldM (\(sc, acc) (functDecl, retFxs, retTyp) -> do

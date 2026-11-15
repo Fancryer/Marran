@@ -275,6 +275,194 @@ globalScope _args = do
   boundWhnf <- freshBoundM
 
   boundError <- freshBoundM
+  -- `exit` never returns, so its result is the bottom of every type.
+  boundExit <- freshBoundM
+
+  -- The polymorphic groups of `app/std.marr`, unpacked into the native scope.
+  --
+  -- A record's fields are inferred at a single type ('Infer.inferRecord'), so
+  -- a field cannot be quantified; these names are therefore plain functions.
+  -- Every variable below is a meta that the scheme quantifies, so each use
+  -- gets fresh ones.  A row variable is a meta for the same reason, and also
+  -- because 'Unify.applyEffRowSubst' resolves rows through 'rowSubst' only for
+  -- metas: a rigid row variable in a scheme would never be freshened.
+  polyEntries <- do
+    -- `Functions`
+    idT <- freshMetaM
+    constA <- freshMetaM
+    constB <- freshMetaM
+    flipA <- freshMetaM
+    flipB <- freshMetaM
+    flipC <- freshMetaM
+    flipR <- freshMetaM
+    compA <- freshMetaM
+    compB <- freshMetaM
+    compC <- freshMetaM
+    compR <- freshMetaM
+    appA <- freshMetaM
+    appB <- freshMetaM
+    appR <- freshMetaM
+    curryA <- freshMetaM
+    curryB <- freshMetaM
+    curryC <- freshMetaM
+    curryR <- freshMetaM
+    uncurryA <- freshMetaM
+    uncurryB <- freshMetaM
+    uncurryC <- freshMetaM
+    uncurryR <- freshMetaM
+
+    -- `Arrays`
+    headT <- freshMetaM
+    headR <- freshMetaM
+    tailT <- freshMetaM
+    tailR <- freshMetaM
+    emptyT <- freshMetaM
+    emptyR <- freshMetaM
+    alenT <- freshMetaM
+    alenR <- freshMetaM
+    mapA <- freshMetaM
+    mapB <- freshMetaM
+    mapR <- freshMetaM
+    mapR0 <- freshMetaM
+    filterT <- freshMetaM
+    filterR <- freshMetaM
+    filterR0 <- freshMetaM
+    anyT <- freshMetaM
+    anyR <- freshMetaM
+    anyR0 <- freshMetaM
+    allT <- freshMetaM
+    allR <- freshMetaM
+    allR0 <- freshMetaM
+    foldlA <- freshMetaM
+    foldlB <- freshMetaM
+    foldlR <- freshMetaM
+    foldlR0 <- freshMetaM
+    foldrA <- freshMetaM
+    foldrB <- freshMetaM
+    foldrR <- freshMetaM
+    foldrR0 <- freshMetaM
+    concatT <- freshMetaM
+    concatR0 <- freshMetaM
+    concatR1 <- freshMetaM
+    zipA <- freshMetaM
+    zipB <- freshMetaM
+    zipR0 <- freshMetaM
+    zipR1 <- freshMetaM
+    zipR2 <- freshMetaM
+    atT <- freshMetaM
+    atR <- freshMetaM
+    takeT <- freshMetaM
+    takeR <- freshMetaM
+    dropT <- freshMetaM
+    dropR <- freshMetaM
+
+    -- `Pairs`, `Conv`
+    fstL <- freshMetaM
+    fstR <- freshMetaM
+    sndL <- freshMetaM
+    sndR <- freshMetaM
+    fstRow <- freshMetaM
+    sndRow <- freshMetaM
+    showT <- freshMetaM
+
+    -- `Error@try`
+    tryA <- freshMetaM
+    tryR <- freshMetaM
+
+    let t x = TVar x
+        -- a function whose latent row is `rw`; an empty row is a pure one
+        fn i o = tfunc i o
+        fnR i o rw = TFunct (Funct i o (RVar rw))
+        -- an array of `x` whose elements may cost `rw`
+        arr x rw = TArray (TVar x) (RVar rw)
+        arrT ty rw = TArray ty (RVar rw)
+        -- a builtin whose types and rows are both quantified
+        poly name tvs rvs typ = (name, tvs, rvs, typ)
+
+        functions =
+          [ poly "id" [idT] [] $ fn (t idT) (t idT)
+          , poly "const" [constA, constB] [] $ fn (t constA) (fn (t constB) (t constA))
+          -- `flip` applies the function it is given, so its row is `R`; the
+          -- two arrows of the result are pure, because building the closures
+          -- performs nothing.
+          , poly "flip" [flipA, flipB, flipC] [flipR] $
+              fn (fnR (t flipA) (fnR (t flipB) (t flipC) flipR) flipR)
+                 (fn (t flipB) (fnR (t flipA) (t flipC) flipR))
+          , poly "compose" [compA, compB, compC] [compR] $
+              fn (fnR (t compB) (t compC) compR)
+                 (fn (fnR (t compA) (t compB) compR)
+                     (fnR (t compA) (t compC) compR))
+          -- `apply` is the opposite: it applies at once, so the row of the
+          -- returned function is paid by the call.
+          , poly "apply" [appA, appB] [appR] $
+              fn (fnR (t appA) (t appB) appR) (fnR (t appA) (t appB) appR)
+          , poly "curry" [curryA, curryB, curryC] [curryR] $
+              fn (fnR (TPair (t curryA) (t curryB) (RClosed [])) (t curryC) curryR) $
+                fn (t curryA) (fnR (t curryB) (t curryC) curryR)
+          , poly "uncurry" [uncurryA, uncurryB, uncurryC] [uncurryR] $
+              fn (fnR (t uncurryA) (fnR (t uncurryB) (t uncurryC) uncurryR) uncurryR)
+                 (fnR (TPair (t uncurryA) (t uncurryB) (RClosed [])) (t uncurryC) uncurryR)
+          ]
+
+        arrays =
+          [ poly "head" [headT] [headR] $ fn (arr headT headR) (t headT)
+          , poly "tail" [tailT] [tailR] $ fn (arr tailT tailR) (arr tailT tailR)
+          , poly "empty" [emptyT] [emptyR] $ fn (arr emptyT emptyR) TBoolean
+          , poly "alen" [alenT] [alenR] $ fn (arr alenT alenR) TInt
+          -- The element row of the input is its own variable, not the row the
+          -- function costs: tying them together would make the result of
+          -- `map sayn []` depend on the order the two are unified in.
+          , poly "map" [mapA, mapB] [mapR, mapR0] $
+              fn (fnR (t mapA) (t mapB) mapR)
+                 (fnR (arr mapA mapR0) (arr mapB mapR) mapR)
+          , poly "filter" [filterT] [filterR, filterR0] $
+              fn (fnR (t filterT) TBoolean filterR)
+                 (fnR (arr filterT filterR0) (arr filterT filterR0) filterR)
+          , poly "any" [anyT] [anyR, anyR0] $
+              fn (fnR (t anyT) TBoolean anyR)
+                 (fnR (arr anyT anyR0) TBoolean anyR)
+          , poly "all" [allT] [allR, allR0] $
+              fn (fnR (t allT) TBoolean allR)
+                 (fnR (arr allT allR0) TBoolean allR)
+          , poly "foldl" [foldlA, foldlB] [foldlR, foldlR0] $
+              fn (fn (t foldlB) (fnR (t foldlA) (t foldlB) foldlR))
+                 (fn (t foldlB) (fnR (arr foldlA foldlR0) (t foldlB) foldlR))
+          , poly "foldr" [foldrA, foldrB] [foldrR, foldrR0] $
+              fn (fn (t foldrA) (fnR (t foldrB) (t foldrB) foldrR))
+                 (fn (t foldrB) (fnR (arr foldrA foldrR0) (t foldrB) foldrR))
+          , poly "concat" [concatT] [concatR0, concatR1] $
+              fn (arrT (TArray (TVar concatT) (RVar concatR1)) concatR0) (arr concatT concatR1)
+          , poly "zip" [zipA, zipB] [zipR0, zipR1, zipR2] $
+              fn (arr zipA zipR0) (fn (arr zipB zipR1) (TPair (TVar zipA) (TVar zipB) (RVar zipR2)))
+          -- `at` reports an out-of-range index through `Error`, as the
+          -- standard library says.
+          , poly "at" [atT] [atR] $ fn (arr atT atR) (TFunct $ Funct TInt (TVar atT) Eff.fxError)
+          , poly "take" [takeT] [takeR] $ fn TInt (fn (arr takeT takeR) (arr takeT takeR))
+          , poly "drop" [dropT] [dropR] $ fn TInt (fn (arr dropT dropR) (arr dropT dropR))
+          ]
+
+        pairs =
+          [ poly "fst" [fstL, fstR] [fstRow] $ fn (TPair (TVar fstL) (TVar fstR) (RVar fstRow)) (TVar fstL)
+          , poly "snd" [sndL, sndR] [sndRow] $ fn (TPair (TVar sndL) (TVar sndR) (RVar sndRow)) (TVar sndR)
+          ]
+
+        convs =
+          [ poly "show" [showT] [] $ fn (t showT) TString
+          -- `try` runs its body with an `Error` handler installed and hands a
+          -- caught message to the second function; the row it costs is the row
+          -- of the body without `Error`, which is the same row the handler
+          -- calls.  Both arguments are functions and the result is evaluated,
+          -- so the row sits on the arrow that returns the result:
+          -- `(() -> {Error | R} A) -> (String -> R A) -> R A`.
+          , poly "try" [tryA] [tryR] $
+              fn (TFunct (Funct TNil (t tryA) (ROpen [Eff.label "Error"] tryR)))
+                 (TFunct $ Funct
+                    (TFunct (Funct TString (t tryA) (RVar tryR)))
+                    (t tryA)
+                    (RVar tryR))
+          ]
+
+    pure (functions <> arrays <> pairs <> convs)
 
   let emptyScope = Scope
         Map.empty
@@ -346,16 +534,16 @@ globalScope _args = do
 
       -- A value the interpreter builds directly.  Its arrows are opened below,
       -- so the row of the argument is charged at the call site.
-      native name typ = (name, [], typ)
+      native name typ = (name, [], [], typ)
 
-      -- A parameterised builtin: its type variable is quantified by the
-      -- scheme, so every instantiation gets a fresh one.
-      quantified name tvs typ = (name, tvs, typ)
+      -- A parameterised builtin: its type variables are quantified by the
+      -- scheme, so every instantiation gets fresh ones.
+      quantified name tvs typ = (name, tvs, [], typ)
 
       -- An operation of a built-in effect.  The program sees it as a function
-      -- whose latent row is that single effect.
-      operation name input output effect =
-        (name, [], TFunct $ Funct input output $ RClosed [Eff.label effect])
+      -- whose latent row names the effects it may perform.
+      operation name input output effects =
+        (name, [], [], TFunct $ Funct input output $ RClosed (map Eff.label effects))
 
       entries =
         [ native n t | (n, t) <- fieldTypes ] <>
@@ -364,20 +552,40 @@ globalScope _args = do
         , quantified "say" [boundSay] $ TFunct $ Funct tSay TNil Eff.fxOutput
         , quantified "sayn" [boundSayn] $ TFunct $ Funct tSayn TNil Eff.fxOutput
         , quantified "trace" [boundTrace] $ TFunct $ Funct tTrace tTrace Eff.fxOutput
-        , ("args", [], strings)
-        , operation "read_int" TNil TInt "Input"
-        , operation "read_string" TNil TString "Input"
-        , operation "read_float" TNil TFloat "Input"
-        , operation "read_boolean" TNil TBoolean "Input"
+        , operation "read_int" TNil TInt ["Input"]
+        , operation "read_string" TNil TString ["Input"]
+        , operation "read_float" TNil TFloat ["Input"]
+        , operation "read_boolean" TNil TBoolean ["Input"]
         , ( "random_int"
+          , []
           , []
           , TFunct $ Funct TInt (TFunct $ Funct TInt TInt Eff.fxRandom) Eff.empty
           )
-        , operation "random_float" TNil TFloat "Random"
-        , operation "random_boolean" TNil TBoolean "Random"
-        , operation "random_string" TInt TString "Random"
-        , operation "time_ms" TNil TInt "Time"
-        , operation "sleep" TInt TNil "Time"
+        , operation "random_float" TNil TFloat ["Random"]
+        , operation "random_boolean" TNil TBoolean ["Random"]
+        , operation "random_string" TInt TString ["Random"]
+        , operation "time_ms" TNil TInt ["Time"]
+        , operation "sleep" TInt TNil ["Time"]
+        -- `Env`, `File` and `System` of `app/std.marr`.  A file operation that
+        -- can fail names `Error` in its row as well, so a handler for it is
+        -- optional but a `try` or `under Error` can catch the failure.
+        , operation "get_env" TString TString ["Env"]
+        , operation "set_env" TString (tfunc TString TNil) ["Env"]
+        , operation "read_file" TString TString ["File", "Error"]
+        , operation "write_file" TString (tfunc TString TNil) ["File", "Error"]
+        , operation "append_file" TString (tfunc TString TNil) ["File", "Error"]
+        , operation "file_exists" TString TBoolean ["File"]
+        , operation "delete_file" TString TNil ["File", "Error"]
+        , operation "list_directory" TString strings ["File", "Error"]
+        -- `args` is an operation, not a constant: the command line is read when
+        -- the program asks for it, and a program that does not name `System`
+        -- cannot see it.
+        , operation "args" TNil strings ["System"]
+        , operation "hostname" TNil TString ["System"]
+        , operation "system" TString TInt ["System"]
+        -- `exit` never returns, like `error`: its result is the bottom type.
+        , quantified "exit" [boundExit] $
+            TFunct $ Funct TInt (TVar boundExit) (Eff.closedOfFlat "System")
         -- `error` never returns, so its result is the bottom of every type: a
         -- use reads as whatever the surrounding expression needs.  It is also
         -- an operation of the built-in effect `Error` below, which is what
@@ -390,7 +598,7 @@ globalScope _args = do
         , native "assert" (TFunct $ Funct TBoolean (TFunct $ Funct TString TNil Eff.fxError) Eff.empty)
         ]
 
-      flatNames = map (\(n, _, _) -> n) entries
+      flatNames = map (\(n, _, _, _) -> n) (entries <> polyEntries)
       recordNames = Builtins.namesOfKind isRecord
       declared = flatNames <> recordNames
       undocumented = filter (`notElem` declared) Builtins.names
@@ -429,12 +637,12 @@ globalScope _args = do
   -- The flat names first: a record is built out of their types, so
   -- `Numbers@+` and `+` are the same scheme, not two that happen to agree.
   withFlat <- foldM
-    (\sc (name, tvs, typ) -> do
+    (\sc (name, tvs, rvs, typ) -> do
         (openedTyp, rowVars) <- openArrows typ
-        let scheme = Scheme tvs [] rowVars Map.empty Map.empty openedTyp
+        let scheme = Scheme tvs [] (rvs <> rowVars) Map.empty Map.empty openedTyp
         addBinding name scheme (valueOf name scheme) Val sc)
     builtinScope
-    entries
+    (entries <> polyEntries)
 
   foldM addRecord withFlat (Builtins.builtins >>= asRecord)
 
@@ -488,13 +696,16 @@ globalScope _args = do
             -- would stay in the type, so the tail could never be solved.
             r <- freshMetaM
             (o', rs) <- go o
-            -- An explicit open row (an effect with parameters, say) keeps its
-            -- own tail; only a closed one gets a fresh one.
-            let fxs' = case fxs of
-                  RClosed cs -> ROpen cs r
-                  RVar _ -> ROpen [] r
-                  _ -> fxs
-            pure (TFunct (Funct i o' fxs'), r : rs)
+            -- A row that is an explicit variable belongs to the signature and
+            -- must be kept, not replaced: `apply` says its result costs the
+            -- same row as the function it applies, and `try` says it costs the
+            -- row its body may perform.  Replacing such a row with a fresh
+            -- tail would cut the link and let a call claim the argument costs
+            -- nothing.  Only a closed row is opened.
+            let (fxs', rs') = case fxs of
+                  RClosed cs -> (ROpen cs r, r : rs)
+                  _ -> (fxs, rs)
+            pure (TFunct (Funct i o' fxs'), rs')
           _ -> pure (ty, [])
 
     -- The scope keeps a value only so that the checker can tell what a name

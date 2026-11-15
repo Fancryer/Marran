@@ -54,8 +54,15 @@ import Resume (ResumeInfo(..))
 import Text.Printf (printf)
 import Data.Maybe (isJust)
 import System.Environment (lookupEnv)
-import Control.Exception (AsyncException (..), evaluate, fromException, throwIO, try)
+import Control.Exception (AsyncException (..), IOException, evaluate, fromException, throwIO, try)
 import System.IO.Error (isEOFError)
+import System.Environment (lookupEnv, setEnv)
+import System.Exit (ExitCode (..), exitWith)
+import qualified System.Directory as Dir
+import qualified System.Process as Proc
+import System.Info (os)
+import qualified Data.Text.IO as TIO
+
 import Data.IORef
 import qualified Builtins
 import qualified Data.IntMap.Strict as IM
@@ -332,6 +339,7 @@ data InterpState = InterpState
   , sEvents     :: Map Event Int
   , sNoMemo     :: Bool
   , sSpan       :: Span                  -- ^ where the interpreter currently is
+  , sCmdArgs    :: [String]              -- ^ the command line, read by `System@args`
   }
 
 type Clause = [Address] -> (Address -> Interp Address) -> Interp Address
@@ -416,11 +424,13 @@ interpret :: IR.Chunk -> [String] -> IO (Either InterpError Value)
 interpret chunk cmdArgs = do
   rootRef <- newIORef (Env Map.empty Nothing)
   let root = EnvId {envId = 0, envCell = rootRef}
+      state = (initialInterpState root) {sCmdArgs = cmdArgs}
   result <- try $ fst <$> runInterp (do
     modify $ \st -> st {sEnv = root}
     _ <- buildInitialEnv cmdArgs
     evalChunk chunk
-    ) (initialInterpState root)
+    ) state
+
   case result of
     Right ok -> pure ok
     Left e -> case fromException e of
@@ -556,6 +566,128 @@ globalOps = [
             VInt i -> liftIO (threadDelay $ fromInteger i) >> alloc VNil
             _ -> rtError "`sleep` needs an Int as its duration in microseconds"
         args -> \_ -> arityError "sleep" 1 args)
+    ]),
+    -- `Env` of `app/std.marr`: the process environment.
+    (Eff.elabel "Env", [
+      ("get_env", Op 1 $ \case
+        [addr] -> \_ -> do
+          v <- forceValue addr
+          case v of
+            VString name -> do
+              -- A missing variable reads as the empty string: the row has no
+              -- `Error`, so the program has to decide what a missing name
+              -- means, and `slen (get_env name)` is a natural test.
+              found <- liftIO $ lookupEnv (T.unpack name)
+              alloc $ VString (maybe "" T.pack found)
+            other -> rtError $ "`get_env` expected a String, but got " <> describe other
+        args -> \_ -> arityError "get_env" 1 args),
+      ("set_env", Op 2 $ \case
+        [nameAddr, valueAddr] -> \_ -> do
+          nameV <- forceValue nameAddr
+          valueV <- forceValue valueAddr
+          case (nameV, valueV) of
+            (VString name, VString value) -> do
+              liftIO $ setEnv (T.unpack name) (T.unpack value)
+              alloc VNil
+            _ -> rtError "`set_env` needs a String as both the name and the value"
+        args -> \_ -> arityError "set_env" 2 args)
+    ]),
+    -- `File` of `app/std.marr`.  Every operation that can fail reports the
+    -- failure through `Error`, the same way `/` reports a zero divisor, so a
+    -- program can catch it with `try` or `under Error`.
+    (Eff.elabel "File", [
+      ("read_file", Op 1 $ \case
+        [addr] -> \_ -> do
+          v <- forceValue addr
+          case v of
+            VString path -> do
+              r <- liftIO $ try (TIO.readFile (T.unpack path)) :: Interp (Either IOException Text)
+              case r of
+                Left e -> fileError "read_file" path e
+                Right contents -> alloc $ VString contents
+            other -> rtError $ "`read_file` expected a String, but got " <> describe other
+        args -> \_ -> arityError "read_file" 1 args),
+      ("write_file", Op 2 $ \case
+        [pathAddr, textAddr] -> \_ -> withFilePathAndText "write_file" pathAddr textAddr $ \path text -> do
+          r <- liftIO $ try (TIO.writeFile (T.unpack path) text) :: Interp (Either IOException ())
+          either (fileError "write_file" path) (const $ alloc VNil) r
+        args -> \_ -> arityError "write_file" 2 args),
+      ("append_file", Op 2 $ \case
+        [pathAddr, textAddr] -> \_ -> withFilePathAndText "append_file" pathAddr textAddr $ \path text -> do
+          r <- liftIO $ try (TIO.appendFile (T.unpack path) text) :: Interp (Either IOException ())
+          either (fileError "append_file" path) (const $ alloc VNil) r
+        args -> \_ -> arityError "append_file" 2 args),
+      ("file_exists", Op 1 $ \case
+        [addr] -> \_ -> do
+          v <- forceValue addr
+          case v of
+            VString path -> do
+              -- The row has no `Error`, so a path the system rejects is simply
+              -- not there, not a failure of the operation.
+              there <- liftIO $ Dir.doesPathExist (T.unpack path)
+              alloc $ VBoolean there
+            other -> rtError $ "`file_exists` expected a String, but got " <> describe other
+        args -> \_ -> arityError "file_exists" 1 args),
+      ("delete_file", Op 1 $ \case
+        [addr] -> \_ -> do
+          v <- forceValue addr
+          case v of
+            VString path -> do
+              r <- liftIO $ try (Dir.removeFile (T.unpack path)) :: Interp (Either IOException ())
+              either (fileError "delete_file" path) (const $ alloc VNil) r
+            other -> rtError $ "`delete_file` expected a String, but got " <> describe other
+        args -> \_ -> arityError "delete_file" 1 args),
+      ("list_directory", Op 1 $ \case
+        [addr] -> \_ -> do
+          v <- forceValue addr
+          case v of
+            VString path -> do
+              r <- liftIO $ try (Dir.listDirectory (T.unpack path)) :: Interp (Either IOException [FilePath])
+              case r of
+                Left e -> fileError "list_directory" path e
+                Right entries -> do
+                  addrs <- mapM (alloc . VString . T.pack) entries
+                  alloc $ VArray addrs
+            other -> rtError $ "`list_directory` expected a String, but got " <> describe other
+        args -> \_ -> arityError "list_directory" 1 args)
+    ]),
+    -- `System` of `app/std.marr`.
+    (Eff.elabel "System", [
+      -- The command line is read when the program asks for it: an `args ()`
+      -- in a library is not a reason to give every program a `System` row.
+      ("args", Op 1 $ \_ _ -> do
+        cmdArgs' <- gets sCmdArgs
+        addrs <- mapM (alloc . VString . T.pack) cmdArgs'
+        alloc $ VArray addrs),
+      ("hostname", Op 1 $ \_ _ -> do
+        -- There is no portable hostname in `base`; the environment variable the
+        -- platform sets is the closest thing without a second dependency.
+        name <- liftIO $ firstJustM [lookupEnv "COMPUTERNAME", lookupEnv "HOSTNAME"]
+        alloc $ VString $ maybe (T.pack os) T.pack name),
+      ("system", Op 1 $ \case
+        [addr] -> \_ -> do
+          v <- forceValue addr
+          case v of
+            VString command -> do
+              (code, _, _) <- liftIO $ Proc.readCreateProcessWithExitCode
+                (Proc.shell (T.unpack command)) ""
+              alloc $ VInt $ case code of
+                ExitSuccess -> 0
+                ExitFailure n -> fromIntegral n
+            other -> rtError $ "`system` expected a String, but got " <> describe other
+        args -> \_ -> arityError "system" 1 args),
+      -- `exit` never returns.  It is not a diagnostic: the program asked to
+      -- stop, so the process ends with the code it gave, exactly as a shell
+      -- command would.
+      ("exit", Op 1 $ \case
+        [addr] -> \_ -> do
+          v <- forceValue addr
+          case v of
+            VInt n -> liftIO $ exitWith $ if n == 0
+              then ExitSuccess
+              else ExitFailure (fromIntegral n)
+            other -> rtError $ "`exit` expected an Int, but got " <> describe other
+        args -> \_ -> arityError "exit" 1 args)
     ])
   ]
 
@@ -625,8 +757,12 @@ globalHandlers = [
 --   a language whose arguments are delayed must not force a `spin` that its
 --   result never mentions, so `||` and `&&` stop at the first deciding
 --   argument and every other operation forces only what it reads.
+--
+--   The command line is not bound here: `args` is an operation of `System`, so
+--   it reads 'sCmdArgs' when the program asks for it.  A constant would make
+--   every program see the name without naming the effect.
 buildInitialEnv :: [String] -> Interp EnvId
-buildInitialEnv cmdArgs = do
+buildInitialEnv _cmdArgs = do
   -- замыкания операций строятся из той же таблицы, что и клаузы (арность не дублируется)
   let allocEffectCall eff (op, o) = do
         env <- gets sEnv
@@ -846,9 +982,169 @@ buildInitialEnv cmdArgs = do
       if ok
         then alloc VNil
         else withString "assert" b callError
-  argsAddr <- do
-      argAddrs <- mapM (alloc . VString . T.pack) cmdArgs
-      alloc $ VArray argAddrs
+
+  -- The polymorphic groups of the standard library.  A record's fields are
+  -- monomorphic (see `Builtins`), so these live here as plain functions; when
+  -- a record field may be quantified they will move into `Functions`,
+  -- `Arrays`, `Pairs` and `Conv`, and the flat names will be views of them.
+  --
+  -- Each one forces exactly what it needs: `id` and `const` return an argument
+  -- untouched, so an argument they ignore is never evaluated, and `head` and
+  -- `tail` return element addresses without forcing them -- the pending row of
+  -- the array says what forcing costs, and the caller pays it.
+  --
+  -- `map`, `filter`, `foldl`, `foldr`, `any` and `all` apply the function they
+  -- are given at once, not when the result is read.  The row is charged
+  -- correctly either way; only the moment differs, and delaying the
+  -- application would need a thunk over native code, which the store does not
+  -- have.
+  let applyTo :: Text -> Address -> Address -> Interp Address
+      applyTo what fAddr argAddr = do
+        fAddr' <- whnf fAddr
+        v <- readCell fAddr'
+        case v of
+          VClosure env _ _ clos -> do
+            oldEnv <- gets sEnv
+            modify $ \s -> s {sEnv = env}
+            result <- clos argAddr
+            modify $ \s -> s {sEnv = oldEnv}
+            pure result
+          other -> rtError $ "`" <> what <> "` expected a function, but got " <> describe other
+
+      -- Two addresses as a pair, for `curry` and `zip`.
+      pairOf :: Address -> Address -> Interp Address
+      pairOf l r = alloc (VPair l r)
+
+      -- Apply a predicate and read the Boolean it returned.
+      applyBool :: Text -> Address -> Address -> Interp Bool
+      applyBool what f x = applyTo what f x >>= \v -> withBool what v pure
+
+  idAddr <- native1 pure
+  constAddr <- nativeN 2 $ \case
+    [a, _] -> pure a
+    args -> arityError "const" 2 args
+  flipAddr <- nativeN 3 $ \case
+    [f, b, a] -> applyTo "flip" f a >>= \g -> applyTo "flip" g b
+    args -> arityError "flip" 3 args
+  composeAddr <- nativeN 3 $ \case
+    [g, f, x] -> applyTo "compose" f x >>= applyTo "compose" g
+    args -> arityError "compose" 3 args
+  applyAddr <- native2 $ \f x -> applyTo "apply" f x
+  curryAddr <- nativeN 3 $ \case
+    [f, a, b] -> pairOf a b >>= applyTo "curry" f
+    args -> arityError "curry" 3 args
+  uncurryAddr <- native2 $ \f p -> do
+    p' <- whnf p
+    v <- readCell p'
+    case v of
+      VPair l r -> applyTo "uncurry" f l >>= \g -> applyTo "uncurry" g r
+      other -> rtError $ "`uncurry` expected a pair, but got " <> describe other
+
+  -- Empty arrays are a program-level mistake, not an interpreter bug, and
+  -- `head`/`tail` are declared pure, so it is reported as a diagnostic (E0020)
+  -- rather than through the catchable `Error` effect.
+  headAddr <- native1 $ \a -> withArray "head" a $ \case
+    [] -> programError "`head` of an empty array"
+    (x:_) -> pure x
+  tailAddr <- native1 $ \a -> withArray "tail" a $ \case
+    [] -> programError "`tail` of an empty array"
+    (_:xs) -> alloc $ VArray xs
+  emptyAddr <- native1 $ \a -> withArray "empty" a $ \xs -> alloc $ VBoolean (null xs)
+  alenAddr <- native1 $ \a -> withArray "alen" a $ \xs -> alloc $ VInt (fromIntegral (length xs))
+  mapAddr <- native2 $ \f a -> withArray "map" a $ \xs -> do
+    ys <- mapM (applyTo "map" f) xs
+    alloc $ VArray ys
+  filterAddr <- native2 $ \f a -> withArray "filter" a $ \xs -> do
+    flags <- mapM (applyBool "filter" f) xs
+    alloc $ VArray [x | (x, True) <- zip xs flags]
+  anyAddr <- native2 $ \f a -> withArray "any" a $ \xs -> do
+    flags <- mapM (applyBool "any" f) xs
+    alloc $ VBoolean (or flags)
+  allAddr <- native2 $ \f a -> withArray "all" a $ \xs -> do
+    flags <- mapM (applyBool "all" f) xs
+    alloc $ VBoolean (and flags)
+  foldlAddr <- nativeN 3 $ \case
+    [f, z, a] -> withArray "foldl" a $ \xs ->
+      foldM (\acc x -> applyTo "foldl" f acc >>= \g -> applyTo "foldl" g x) z xs
+    args -> arityError "foldl" 3 args
+  foldrAddr <- nativeN 3 $ \case
+    [f, z, a] -> withArray "foldr" a $ \xs -> do
+      -- Folded from the right: the accumulator is the last element first.
+      let step acc x = do
+            g <- applyTo "foldr" f x
+            applyTo "foldr" g acc
+      foldM step z (reverse xs)
+    args -> arityError "foldr" 3 args
+  concatAddr' <- native1 $ \a -> withArray "concat" a $ \xs -> do
+    parts <- mapM (\x -> withArray "concat" x pure) xs
+    alloc $ VArray (concat parts)
+  zipAddr <- native2 $ \a b -> withArray "zip" a $ \as ->
+    withArray "zip" b $ \bs -> do
+      pairs <- mapM (uncurry pairOf) (zip as bs)
+      alloc $ VArray pairs
+  atAddr <- native2 $ \a i -> withArray "at" a $ \xs ->
+    withInt "at" i $ \n ->
+      if n >= 0 && n < fromIntegral (length xs)
+        then pure (xs !! fromIntegral n)
+        else callError $ T.concat [
+            "`at`: index ", T.pack (show n), " is out of range for an array of ",
+            T.pack (show (length xs)), if length xs == 1 then " element" else " elements"
+          ]
+  takeAddr <- native2 $ \n a -> withInt "take" n $ \k ->
+    withArray "take" a $ \xs ->
+      alloc $ VArray (take (max 0 (fromIntegral k)) xs)
+  dropAddr <- native2 $ \n a -> withInt "drop" n $ \k ->
+    withArray "drop" a $ \xs ->
+      alloc $ VArray (drop (max 0 (fromIntegral k)) xs)
+
+  fstAddr <- native1 $ \p -> do
+    p' <- whnf p
+    v <- readCell p'
+    case v of
+      VPair l _ -> pure l
+      other -> rtError $ "`fst` expected a pair, but got " <> describe other
+  sndAddr <- native1 $ \p -> do
+    p' <- whnf p
+    v <- readCell p'
+    case v of
+      VPair _ r -> pure r
+      other -> rtError $ "`snd` expected a pair, but got " <> describe other
+
+  -- `show` is `say` without the line: the value is forced, because a printed
+  -- value is its text, not a reference to a cell.
+  showAddr <- native1 $ \a -> do
+    s <- force a >>= stringify
+    alloc $ VString s
+
+  -- `try body on_error` runs `body` with a handler for `Error` installed: a
+  -- caught message goes to `on_error`, and a body that finishes normally keeps
+  -- its value.  The handler is pushed and popped here rather than built by
+  -- `TEHandle`, because the body is a value the program passes, not a block the
+  -- checker saw: nothing about it is known until it runs.
+  tryAddr <- native2 $ \body onError -> do
+    env <- gets sEnv
+    kstack0 <- gets sKstack
+    handlerId <- gets sNextHandler
+    modify $ \s -> s {sNextHandler = handlerId + 1}
+    callCC $ \finish -> do
+      let finishWithThen result = do
+            modify $ \s -> s {sKstack = kstack0, sEnv = env}
+            finish result
+          catchClause args k = case args of
+            [msgAddr] -> do
+              modify $ \s -> s {sKstack = kstack0, sEnv = env}
+              applyTo "try" onError msgAddr >>= \r -> whnf r >>= finishWithThen
+            args -> arityError "error" 1 args
+          handler = HandlerFrame
+            handlerId
+            (Eff.elabel "Error")
+            (Map.singleton "error" catchClause)
+            (Map.singleton "error" 1)
+            finishWithThen
+      modify $ \s -> s {sKstack = handler : s.sKstack}
+      unit <- alloc VNil
+      result <- applyTo "try" body unit >>= whnf
+      finishWithThen result
 
   let natives = [
           ("+", plusAddr),
@@ -906,7 +1202,32 @@ buildInitialEnv cmdArgs = do
           ("whnf", whnfBuiltinAddr),
           ("pred", predAddr),
           ("assert", assertAddr),
-          ("args", argsAddr)
+          ("id", idAddr),
+          ("const", constAddr),
+          ("flip", flipAddr),
+          ("compose", composeAddr),
+          ("apply", applyAddr),
+          ("curry", curryAddr),
+          ("uncurry", uncurryAddr),
+          ("head", headAddr),
+          ("tail", tailAddr),
+          ("empty", emptyAddr),
+          ("alen", alenAddr),
+          ("map", mapAddr),
+          ("filter", filterAddr),
+          ("any", anyAddr),
+          ("all", allAddr),
+          ("foldl", foldlAddr),
+          ("foldr", foldrAddr),
+          ("concat", concatAddr'),
+          ("zip", zipAddr),
+          ("at", atAddr),
+          ("take", takeAddr),
+          ("drop", dropAddr),
+          ("fst", fstAddr),
+          ("snd", sndAddr),
+          ("show", showAddr),
+          ("try", tryAddr)
         ]
 
   -- The library records are views of the very values above, so
@@ -951,6 +1272,30 @@ callError :: Text -> Interp Address
 callError msg = do
   addr <- alloc (VString msg)
   callEffect (Eff.elabel "Error") "error" [addr]
+
+-- | A failure of a `File` operation, reported through `Error` with the
+--   operation and the path in the message: the OS message alone ("does not
+--   exist") leaves a reader guessing which file.
+fileError :: Text -> Text -> IOException -> Interp Address
+fileError op path e = callError $ T.concat [
+    "`", op, "` on `", path, "`: ", T.pack (show e)
+  ]
+
+-- | Read the path and the text of a two-argument file operation.
+withFilePathAndText :: Text -> Address -> Address -> (Text -> Text -> Interp Address) -> Interp Address
+withFilePathAndText op pathAddr textAddr k = do
+  pathV <- forceValue pathAddr
+  textV <- forceValue textAddr
+  case (pathV, textV) of
+    (VString path, VString text) -> k path text
+    _ -> rtError $ "`" <> op <> "` needs a String as both the path and the text"
+
+-- | The first of the actions that answers.
+firstJustM :: [IO (Maybe a)] -> IO (Maybe a)
+firstJustM [] = pure Nothing
+firstJustM (a:rest) = a >>= \case
+  Just x -> pure (Just x)
+  Nothing -> firstJustM rest
 
 -- | Division of decimals, rounded to fifteen places.
 --
@@ -1986,7 +2331,8 @@ initialInterpState root = InterpState {
   sTrace      = False,
   sEvents     = Map.empty,
   sNoMemo     = False,
-  sSpan       = noSpan
+  sSpan       = noSpan,
+  sCmdArgs    = []
 }
 
 prepareSnapshotBenchmark :: Int -> [(Int, Int)] -> IO (IO (Int, Int, Int))
