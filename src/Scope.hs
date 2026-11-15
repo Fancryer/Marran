@@ -37,13 +37,14 @@ import Types (
     HandlerSig,
     Mutability(..),
     Typ(..),
+    TRecordProp(..),
     EffDef(..),
     Funct(..),
     TypeScheme,
 
     EffRow(RClosed, ROpen, RVar),
     Scheme(Scheme),
-    Expr(..), NativeLambdaSign (..), tfunc, monoScheme, _a,
+    Expr(..), NativeLambdaSign (..), tfunc, _a,
     Taste,
     pattern NLambda
   )
@@ -273,6 +274,8 @@ globalScope _args = do
   boundForce <- freshBoundM
   boundWhnf <- freshBoundM
 
+  boundError <- freshBoundM
+
   let emptyScope = Scope
         Map.empty
         Map.empty
@@ -292,8 +295,58 @@ globalScope _args = do
       tForce = TVar boundForce
       tWhnf = TVar boundWhnf
 
-      -- A value the interpreter builds directly.
-      native name input output = (name, [], tfunc input output)
+      -- Curried shapes, spelled once so that a field of a library record and
+      -- the flat name next to it cannot drift apart: both are built from this
+      -- one table.
+      i2i = tfunc TInt (tfunc TInt TInt)
+      i2b = tfunc TInt (tfunc TInt TBoolean)
+      i1i = tfunc TInt TInt
+      f2f = tfunc TFloat (tfunc TFloat TFloat)
+      f2b = tfunc TFloat (tfunc TFloat TBoolean)
+      f1f = tfunc TFloat TFloat
+      b2b = tfunc TBoolean TBoolean
+      s2s = tfunc TString TString
+      s2b = tfunc TString (tfunc TString TBoolean)
+      s3s = tfunc TString (tfunc TString (tfunc TString TString))
+
+      strings = TArray TString (RClosed [])
+
+      -- The arithmetic, the strings and the booleans: monomorphic, so a field
+      -- of a record is exactly the type of the flat name.
+      fieldTypes =
+        [ ("pred", i1i)
+        -- `/` reports a zero divisor through `Error`, so its latent row names
+        -- the effect: a caller pays for it, exactly as `app/std.marr` says.
+        , ("+", i2i), ("-", i2i), ("*", i2i), ("%", i2i)
+        , ("/", TFunct $ Funct TInt (tfunc TInt TInt) Eff.fxError)
+        , ("neg", i1i), ("abs", i1i), ("max", i2i), ("min", i2i)
+        , ("ieq", i2b), ("ineq", i2b)
+        , (">", i2b), ("<", i2b), ("<=", i2b), (">=", i2b)
+        , ("+.", f2f), ("-.", f2f), ("*.", f2f), ("/.", f2f), ("%.", f2f)
+        , ("fneg", f1f), ("fabs", f1f), ("fmax", f2f), ("fmin", f2f)
+        , ("feq", f2b), ("fneq", f2b)
+        , ("<.", f2b), (">.", f2b), ("<=.", f2b), (">=.", f2b)
+        , ("to_int", tfunc TFloat TInt), ("to_float", tfunc TInt TFloat)
+        , ("++", tfunc TString s2s)
+        , ("slen", tfunc TString TInt)
+        -- start, length, string
+        , ("sub", tfunc TInt (tfunc TInt (tfunc TString TString)))
+        -- separator, string
+        , ("split", tfunc TString (tfunc TString strings))
+        , ("join", tfunc TString (tfunc strings TString))
+        , ("trim", s2s), ("upper", s2s), ("lower", s2s)
+        , ("contains", s2b), ("replace", s3s)
+        , ("seq", s2b), ("sneq", s2b)
+        , ("not", b2b)
+        , ("||", tfunc TBoolean b2b), ("&&", tfunc TBoolean b2b)
+        , ("^", tfunc TBoolean b2b), ("nor", tfunc TBoolean b2b)
+        , ("nand", tfunc TBoolean b2b)
+        , ("and", tfunc TBoolean b2b)
+        ]
+
+      -- A value the interpreter builds directly.  Its arrows are opened below,
+      -- so the row of the argument is charged at the call site.
+      native name typ = (name, [], typ)
 
       -- A parameterised builtin: its type variable is quantified by the
       -- scheme, so every instantiation gets a fresh one.
@@ -305,20 +358,13 @@ globalScope _args = do
         (name, [], TFunct $ Funct input output $ RClosed [Eff.label effect])
 
       entries =
-        [ native "pred" TInt TInt
-        , native "not" TBoolean TBoolean
-        , native "+" TInt (tfunc TInt TInt)
-        , native "-" TInt (tfunc TInt TInt)
-        , native "ieq" TInt (tfunc TInt TBoolean)
-        , native ">" TInt (tfunc TInt TBoolean)
-        , native "<" TInt (tfunc TInt TBoolean)
-        , native "and" TBoolean (tfunc TBoolean TBoolean)
-        , quantified "force" [boundForce] $ TFunct $ Funct tForce tForce Eff.empty
+        [ native n t | (n, t) <- fieldTypes ] <>
+        [ quantified "force" [boundForce] $ TFunct $ Funct tForce tForce Eff.empty
         , quantified "whnf" [boundWhnf] $ TFunct $ Funct tWhnf tWhnf Eff.empty
         , quantified "say" [boundSay] $ TFunct $ Funct tSay TNil Eff.fxOutput
         , quantified "sayn" [boundSayn] $ TFunct $ Funct tSayn TNil Eff.fxOutput
         , quantified "trace" [boundTrace] $ TFunct $ Funct tTrace tTrace Eff.fxOutput
-        , ("args", [], TArray TString (RClosed []))
+        , ("args", [], strings)
         , operation "read_int" TNil TInt "Input"
         , operation "read_string" TNil TString "Input"
         , operation "read_float" TNil TFloat "Input"
@@ -332,9 +378,21 @@ globalScope _args = do
         , operation "random_string" TInt TString "Random"
         , operation "time_ms" TNil TInt "Time"
         , operation "sleep" TInt TNil "Time"
+        -- `error` never returns, so its result is the bottom of every type: a
+        -- use reads as whatever the surrounding expression needs.  It is also
+        -- an operation of the built-in effect `Error` below, which is what
+        -- makes a use charge `Error` and lets `under Error to ...` catch it.
+        , quantified "error" [boundError] $
+            TFunct $ Funct TString (TVar boundError) (Eff.closedOfFlat "Error")
+        -- `assert` performs `Error` only when the condition fails, which the
+        -- type cannot express: the call is charged as if it may, and a program
+        -- that asserts inside `under Error to ...` pays for the handler.
+        , native "assert" (TFunct $ Funct TBoolean (TFunct $ Funct TString TNil Eff.fxError) Eff.empty)
         ]
 
-      declared = map (\(n, _, _) -> n) entries
+      flatNames = map (\(n, _, _) -> n) entries
+      recordNames = Builtins.namesOfKind isRecord
+      declared = flatNames <> recordNames
       undocumented = filter (`notElem` declared) Builtins.names
       unimplemented = filter (`notElem` Builtins.names) declared
 
@@ -345,15 +403,66 @@ globalScope _args = do
         report "the checker binds but the table lacks" unimplemented
       ]
 
-  foldM
+  -- The flat names first: a record is built out of their types, so
+  -- `Numbers@+` and `+` are the same scheme, not two that happen to agree.
+  -- `Error` is the one effect a program may name without declaring it: the
+  -- interpreter keeps a bottom handler for it that turns an unhandled `error`
+  -- into a diagnostic, and `/` reports a zero divisor through it.  A program
+  -- that writes `under Error to ... handle | error e => ...` catches it
+  -- instead of letting it reach the bottom.
+  --
+  -- It lives in its own outer scope, so a program is still free to declare
+  -- `effect Error` itself (`app/std.marr` does): a declaration shadows a
+  -- built-in, and `addEffect` only looks at the scope it adds to.
+  let errorScope = emptyScope {effects = Map.singleton "Error" errorEff}
+      builtinScope = emptyScope {parent = Just errorScope}
+
+      errorEff = EffDef "Error" [] [
+          -- The result is the bottom type: `error` never returns, so its use
+          -- reads as whatever the surrounding expression needs.  The latent
+          -- row is empty like every declared operation's: an effect is charged
+          -- at the use site ('Scope.findOperations'), not by the operation's
+          -- own type.
+          ("error", Funct TString TNothing Eff.empty)
+        ]
+
+  -- The flat names first: a record is built out of their types, so
+  -- `Numbers@+` and `+` are the same scheme, not two that happen to agree.
+  withFlat <- foldM
     (\sc (name, tvs, typ) -> do
         (openedTyp, rowVars) <- openArrows typ
         let scheme = Scheme tvs [] rowVars Map.empty Map.empty openedTyp
         addBinding name scheme (valueOf name scheme) Val sc)
-    emptyScope
+    builtinScope
     entries
 
+  foldM addRecord withFlat (Builtins.builtins >>= asRecord)
+
   where
+    isRecord (Builtins.Record _) = True
+    isRecord _ = False
+
+    asRecord (Builtins.Builtin name (Builtins.Record fields)) = [(name, fields)]
+    asRecord _ = []
+
+    -- A library record.  Its fields keep the open rows of the flat names: the
+    -- record is a view of the library, not a second copy of it, and a field
+    -- read through the record must be as permissive as the name itself.
+    addRecord sc (name, fields) = do
+      let fieldOf n =
+            case Scope.findBinding True sc n of
+              Just (scheme, _, _) -> scheme._a
+              Nothing -> TInt -- unreachable: the flat pass bound every field
+      (props, rowVars) <- foldM
+        (\(acc, rs) n -> do
+            (t, rs') <- openArrows (fieldOf n)
+            pure (acc <> [TRecordProp Val n t], rs <> rs'))
+        ([], [])
+        fields
+      let typ = TRecord props (RClosed [])
+          scheme = Scheme [] [] rowVars Map.empty Map.empty typ
+      addBinding name scheme (valueOf name scheme) Val sc
+
     report what ns =
       if null ns then "" else "; " <> what <> ": " <> T.intercalate ", " ns
 

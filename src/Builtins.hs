@@ -11,6 +11,13 @@
 --   implemented but rejected by the checker.  This module is the one list both
 --   sides are checked against, so a name added in one place and forgotten in
 --   the other is reported instead of discovered by a user.
+--
+--   The list grew into the standard library of line 0.2: the arithmetic, the
+--   strings and the booleans of @app/std.marr@ live here.  A record of the
+--   library (@Numbers@, @Strings@, @Booleans@) is not a second definition of
+--   its fields; it names them, and both sides build the record out of the very
+--   values they bind globally.  That is what makes @Numbers@+@ and @+@ the same
+--   function rather than two that must be kept in step.
 module Builtins (
   Builtin(..),
   BuiltinKind(..),
@@ -26,6 +33,12 @@ data BuiltinKind =
     -- | A value the interpreter builds directly (a closure over native code,
     --   or a constant such as @args@).
     Native
+    -- | A record whose fields are the named builtins.  The fields are listed
+    --   globally as well, so @Booleans@@not@ and @not@ are the same value; the
+    --   order here is the order @app/std.marr@ declares them in, which is the
+    --   order a record prints its fields in only if the names happen to sort
+    --   that way, and that is fine.
+  | Record [Text]
     -- | An operation of a built-in effect.
   | Op Text
   deriving (Eq, Ord, Show)
@@ -39,16 +52,73 @@ data Builtin = Builtin {
 --   implementations in step; 'Marran.Test.BuiltinSpec' fails when they are not.
 builtins :: [Builtin]
 builtins = [
+    -- integers
     Builtin "pred" Native,
-    Builtin "not" Native,
     Builtin "+" Native,
     Builtin "-" Native,
-    Builtin "force" Native,
-    Builtin "whnf" Native,
+    Builtin "*" Native,
+    Builtin "/" Native,
+    Builtin "%" Native,
+    Builtin "neg" Native,
+    Builtin "abs" Native,
+    Builtin "max" Native,
+    Builtin "min" Native,
     Builtin "ieq" Native,
-    Builtin "and" Native,
+    Builtin "ineq" Native,
     Builtin ">" Native,
     Builtin "<" Native,
+    Builtin "<=" Native,
+    Builtin ">=" Native,
+
+    -- floats
+    Builtin "+." Native,
+    Builtin "-." Native,
+    Builtin "*." Native,
+    Builtin "/." Native,
+    Builtin "%." Native,
+    Builtin "fneg" Native,
+    Builtin "fabs" Native,
+    Builtin "fmax" Native,
+    Builtin "fmin" Native,
+    Builtin "feq" Native,
+    Builtin "fneq" Native,
+    Builtin "<." Native,
+    Builtin ">." Native,
+    Builtin "<=." Native,
+    Builtin ">=." Native,
+
+    -- conversions
+    Builtin "to_int" Native,
+    Builtin "to_float" Native,
+
+    -- strings
+    Builtin "++" Native,
+    Builtin "slen" Native,
+    Builtin "sub" Native,
+    Builtin "split" Native,
+    Builtin "join" Native,
+    Builtin "trim" Native,
+    Builtin "upper" Native,
+    Builtin "lower" Native,
+    Builtin "contains" Native,
+    Builtin "replace" Native,
+    Builtin "seq" Native,
+    Builtin "sneq" Native,
+
+    -- booleans
+    Builtin "not" Native,
+    Builtin "||" Native,
+    Builtin "&&" Native,
+    Builtin "^" Native,
+    Builtin "nor" Native,
+    Builtin "nand" Native,
+    -- the conjunction the paper's examples are written with; `&&` is the name
+    -- `app/std.marr` gives it
+    Builtin "and" Native,
+
+    -- introspection and memory
+    Builtin "force" Native,
+    Builtin "whnf" Native,
     Builtin "args" Native,
 
     Builtin "say" (Op "Output"),
@@ -66,7 +136,25 @@ builtins = [
     Builtin "random_string" (Op "Random"),
 
     Builtin "time_ms" (Op "Time"),
-    Builtin "sleep" (Op "Time")
+    Builtin "sleep" (Op "Time"),
+
+    -- `error` is the operation of `Error` a handler catches; `assert` is a
+    -- plain function that performs it, so a handler needs one clause, not two.
+    Builtin "error" (Op "Error"),
+    Builtin "assert" Native,
+
+    -- the records of the library, field by field as `app/std.marr` lists them
+    Builtin "Numbers" (Record [
+        "+", "-", "*", "/", "%", "neg", "abs", "max", "min",
+        "ieq", "ineq", "<", ">", "<=", ">=",
+        "+.", "-.", "*.", "/.", "%.", "fneg", "fabs", "fmax", "fmin",
+        "feq", "fneq", "<.", ">.", "<=.", ">=.",
+        "to_int", "to_float"]),
+    Builtin "Strings" (Record [
+        "++", "slen", "sub", "split", "join", "trim", "upper", "lower",
+        "contains", "replace", "seq", "sneq"]),
+    Builtin "Booleans" (Record [
+        "not", "||", "&&", "^", "nor", "nand"])
   ]
 
 names :: [Text]

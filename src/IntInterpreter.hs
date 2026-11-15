@@ -24,7 +24,7 @@ import qualified Data.Map as Map
 import Data.Map (Map)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Scientific (Scientific, fromFloatDigits)
+import Data.Scientific (Scientific, fromFloatDigits, normalize, scientific)
 import Control.Monad.Cont (ContT(..), callCC)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Span (Span, noSpan)
@@ -381,6 +381,14 @@ rtErrorAt = raise
 raise :: Span -> Text -> Interp a
 raise sp msg = lift $ throwError (InterpError msg sp Nothing)
 
+-- | A mistake the program itself reports through the effect @Error@ (a
+--   division by zero, an unhandled @error@).  It carries a code of its own: it
+--   is not an interpreter bug, so it must not read like one.
+programError :: Text -> Interp a
+programError msg = do
+  sp <- gets sSpan
+  lift $ throwError (InterpError msg sp (Just "E0020"))
+
 -- | The diagnostic code a runtime error is reported under.  A program that is
 --   well typed only reaches one of these by running out of memory; the rest are
 --   interpreter bugs, which are still worth a stable identifier in a report.
@@ -474,6 +482,20 @@ globalOps = [
           liftIO $ putStrLn $ T.unpack $ pretty v
           pure addrArg
         args -> \_ -> arityError "trace" 1 args)
+    ]),
+    -- `error` has a clause at the bottom of the stack, so `1 / 0` is a
+    -- diagnostic even when the program installs no handler of its own; a
+    -- program that writes `under Error to ... handle | error e => ...` replaces
+    -- it for the extent of the body.
+    (Eff.elabel "Error", [
+      ("error", Op 1 $ \case
+        [addrArg] -> \_ -> do
+          v <- readCell addrArg
+          msg <- case v of
+            VString s -> pure s
+            other -> stringify other
+          programError msg
+        args -> \_ -> arityError "error" 1 args)
     ]),
     (Eff.elabel "Input", [
       ("read_string", Op 1 $ \_ _ -> do
@@ -597,6 +619,12 @@ globalHandlers = [
 
 -- | The initial environment: the operations of the built-in effects and the
 --   native values, exactly the names 'Builtins.builtins' lists.
+--
+--   The arithmetic and the strings of @app/std.marr@ live here as native
+--   closures.  Each one forces exactly the arguments whose values it needs:
+--   a language whose arguments are delayed must not force a `spin` that its
+--   result never mentions, so `||` and `&&` stop at the first deciding
+--   argument and every other operation forces only what it reads.
 buildInitialEnv :: [String] -> Interp EnvId
 buildInitialEnv cmdArgs = do
   -- замыкания операций строятся из той же таблицы, что и клаузы (арность не дублируется)
@@ -609,102 +637,293 @@ buildInitialEnv cmdArgs = do
   let operations = Map.fromList opBindings
   st <- get
 
-  let getInt :: Address -> Interp Integer
-      getInt addr = do
-        v <- readCell addr
-        case v of
-          VThunk {} -> do
-            forced <- force addr
-            v' <- readCell forced
-            case v' of
-              VInt i -> pure i
-              other -> rtError $ "expected an Int, got " <> describe other
-          VInt i -> pure i
-          other -> rtError $ "expected an Int, got " <> describe other
-      getBool :: Address -> Interp Bool
-      getBool addr = do
-        v <- readCell addr
-        case v of
-          VThunk {} -> do
-            forced <- force addr
-            v' <- readCell forced
-            case v' of
-              VBoolean b -> pure b
-              other -> rtError $ "expected a Boolean, got " <> describe other
-          VBoolean b -> pure b
-          other -> rtError $ "expected a Boolean, got " <> describe other
-
   let emptyCache = Just (IM.empty :: IntMap Address)
 
-  plusAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getInt addrA
-      st' <- get
-      alloc $ VClosure st'.sEnv emptyCache Nothing $ \addrB -> do
-        b <- getInt addrB
-        alloc $ VInt $ a + b
-  minusAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getInt addrA
-      st' <- get
-      alloc $ VClosure st'.sEnv emptyCache Nothing $ \addrB -> do
-        b <- getInt addrB
-        alloc $ VInt $ a - b
+      -- Build a curried native function of a given arity.  The closures of the
+      -- partially applied stages are allocated on every call, as they were
+      -- when each operation was written out by hand.
+      nativeN :: Int -> ([Address] -> Interp Address) -> Interp Address
+      nativeN n body = go [] n
+        where
+          go acc 0 = body (reverse acc)
+          go acc k = alloc $ VClosure st.sEnv emptyCache Nothing $ \arg ->
+            go (arg : acc) (k - 1)
+
+      native1 f = nativeN 1 $ \case [a] -> f a; _ -> arityError "<native>" 1 []
+      native2 f = nativeN 2 $ \case [a, b] -> f a b; _ -> arityError "<native>" 2 []
+
+  -- Reading an argument.  A native operation forces its argument to weak head
+  -- normal form and then asks for the value it needs; a wrong shape is a bug in
+  -- the checker, not in the program, so the message says what it wanted.
+  let valueOfArg :: Address -> Interp Value
+      valueOfArg = forceValue
+
+      withInt :: Text -> Address -> (Integer -> Interp a) -> Interp a
+      withInt what addr k = valueOfArg addr >>= \case
+        VInt i -> k i
+        other -> rtError $ "`" <> what <> "` expected an Int, but got " <> describe other
+
+      withFloat :: Text -> Address -> (Scientific -> Interp a) -> Interp a
+      withFloat what addr k = valueOfArg addr >>= \case
+        VFloat f -> k f
+        other -> rtError $ "`" <> what <> "` expected a Float, but got " <> describe other
+
+      withBool :: Text -> Address -> (Bool -> Interp a) -> Interp a
+      withBool what addr k = valueOfArg addr >>= \case
+        VBoolean b -> k b
+        other -> rtError $ "`" <> what <> "` expected a Boolean, but got " <> describe other
+
+      withString :: Text -> Address -> (Text -> Interp a) -> Interp a
+      withString what addr k = valueOfArg addr >>= \case
+        VString s -> k s
+        other -> rtError $ "`" <> what <> "` expected a String, but got " <> describe other
+
+      withArray :: Text -> Address -> ([Address] -> Interp a) -> Interp a
+      withArray what addr k = valueOfArg addr >>= \case
+        VArray xs -> k xs
+        other -> rtError $ "`" <> what <> "` expected an array, but got " <> describe other
+
+      intOp :: Text -> (Integer -> Integer -> Integer) -> Interp Address
+      intOp name f = native2 $ \a b ->
+        withInt name a $ \x -> withInt name b $ \y -> alloc $ VInt (f x y)
+
+      intCmp :: Text -> (Integer -> Integer -> Bool) -> Interp Address
+      intCmp name f = native2 $ \a b ->
+        withInt name a $ \x -> withInt name b $ \y -> alloc $ VBoolean (f x y)
+
+      intFun :: Text -> (Integer -> Integer) -> Interp Address
+      intFun name f = native1 $ \a ->
+        withInt name a $ \x -> alloc $ VInt (f x)
+
+      floatOp :: Text -> (Scientific -> Scientific -> Scientific) -> Interp Address
+      floatOp name f = native2 $ \a b ->
+        withFloat name a $ \x -> withFloat name b $ \y -> alloc $ VFloat (f x y)
+
+      floatCmp :: Text -> (Scientific -> Scientific -> Bool) -> Interp Address
+      floatCmp name f = native2 $ \a b ->
+        withFloat name a $ \x -> withFloat name b $ \y -> alloc $ VBoolean (f x y)
+
+      floatFun :: Text -> (Scientific -> Scientific) -> Interp Address
+      floatFun name f = native1 $ \a ->
+        withFloat name a $ \x -> alloc $ VFloat (f x)
+
+      boolOp :: Text -> (Bool -> Bool -> Bool) -> Interp Address
+      boolOp name f = native2 $ \a b ->
+        withBool name a $ \x -> withBool name b $ \y -> alloc $ VBoolean (f x y)
+
+      -- Short-circuiting boolean connectives: the second argument is only
+      -- forced when the first one does not decide the result.
+      shortCircuit :: Text -> Bool -> Interp Address
+      shortCircuit name stopOn = native2 $ \a b ->
+        withBool name a $ \x ->
+          if x == stopOn
+            then alloc $ VBoolean stopOn
+            else withBool name b (alloc . VBoolean)
+
+      string2 :: Text -> (Text -> Text -> Text) -> Interp Address
+      string2 name f = native2 $ \a b ->
+        withString name a $ \x -> withString name b $ \y -> alloc $ VString (f x y)
+
+      stringFun :: Text -> (Text -> Text) -> Interp Address
+      stringFun name f = native1 $ \a ->
+        withString name a $ \x -> alloc $ VString (f x)
+
+  -- Integers.  `/` and `%` report a zero divisor through the effect `Error`,
+  -- so a program can catch it (`under Error to ... handle | error e => ...`)
+  -- or let it reach the bottom handler, which reports it as a diagnostic.
+  plusAddr <- intOp "+" (+)
+  minusAddr <- intOp "-" (-)
+  timesAddr <- intOp "*" (*)
+  divAddr <- native2 $ \a b ->
+    withInt "/" a $ \x -> withInt "/" b $ \y ->
+      if y == 0
+        then callError "division by zero"
+        else alloc $ VInt (x `quot` y)
+  remAddr <- native2 $ \a b ->
+    withInt "%" a $ \x -> withInt "%" b $ \y ->
+      if y == 0
+        -- `%` is declared pure, so a zero divisor must not become a catchable
+        -- `Error`: it is a mistake of the program, reported as a diagnostic.
+        then programError "division by zero"
+        else alloc $ VInt (x `rem` y)
+  negAddr <- intFun "neg" negate
+  absAddr <- intFun "abs" abs
+  maxAddr <- intOp "max" max
+  minAddr <- intOp "min" min
+  ieqAddr <- intCmp "ieq" (==)
+  ineqAddr <- intCmp "ineq" (/=)
+  igtAddr <- intCmp ">" (>)
+  iltAddr <- intCmp "<" (<)
+  ileAddr <- intCmp "<=" (<=)
+  igeAddr <- intCmp ">=" (>=)
+
+  -- Floats.  `Scientific` is exact in decimal, so `/.' rounds to fifteen
+  -- decimal places instead of pretending to be binary: the alternative, a
+  -- `Double`, would make `0.1 +. 0.2` print `0.30000000000000004`, and the
+  -- language has no notation for that.
+  fplusAddr <- floatOp "+." (+)
+  fminusAddr <- floatOp "-." (-)
+  ftimesAddr <- floatOp "*." (*)
+  fdivAddr <- floatOp "/." floatDiv
+  fremAddr <- native2 $ \a b ->
+    withFloat "%." a $ \x -> withFloat "%." b $ \y ->
+      if y == 0
+        then programError "division by zero"
+        else alloc $ VFloat (x - y * fromInteger (truncate (x / y)))
+  fnegAddr <- floatFun "fneg" negate
+  fabsAddr <- floatFun "fabs" abs
+  fmaxAddr <- floatOp "fmax" max
+  fminAddr <- floatOp "fmin" min
+  feqAddr <- floatCmp "feq" (==)
+  fneqAddr <- floatCmp "fneq" (/=)
+  fltAddr <- floatCmp "<." (<)
+  fgtAddr <- floatCmp ">." (>)
+  fleAddr <- floatCmp "<=." (<=)
+  fgeAddr <- floatCmp ">=." (>=)
+
+  toIntAddr <- native1 $ \a ->
+    withFloat "to_int" a $ \x -> alloc $ VInt (truncate x)
+  toFloatAddr <- native1 $ \a ->
+    withInt "to_float" a $ \x -> alloc $ VFloat (fromInteger x)
+
+  -- Strings.
+  concatAddr <- string2 "++" (<>)
+  slenAddr <- native1 $ \a ->
+    withString "slen" a $ \s -> alloc $ VInt (fromIntegral (T.length s))
+  -- start, length, string: characters outside the string are dropped, so a
+  -- slice never fails and `sub 0 n s` is a prefix of `s` of length `n`.
+  subAddr <- nativeN 3 $ \case
+    [startA, lenA, sA] -> do
+      start <- withInt "sub" startA pure
+      len <- withInt "sub" lenA pure
+      withString "sub" sA $ \s ->
+        alloc $ VString $ T.take (fromInteger (max 0 len)) $ T.drop (fromInteger (max 0 start)) s
+    args -> arityError "sub" 3 args
+  splitAddr <- native2 $ \a b ->
+    withString "split" a $ \sep -> withString "split" b $ \s -> do
+      xs <- mapM (alloc . VString) $ if T.null sep then [s] else T.splitOn sep s
+      alloc $ VArray xs
+  joinAddr <- native2 $ \a b ->
+    withString "join" a $ \sep -> withArray "join" b $ \xs -> do
+      parts <- mapM (\x -> withString "join" x pure) xs
+      alloc $ VString (T.intercalate sep parts)
+  trimAddr <- stringFun "trim" T.strip
+  upperAddr <- stringFun "upper" T.toUpper
+  lowerAddr <- stringFun "lower" T.toLower
+  containsAddr <- native2 $ \a b ->
+    withString "contains" a $ \needle -> withString "contains" b $ \hay ->
+      alloc $ VBoolean (needle `T.isInfixOf` hay)
+  replaceAddr <- nativeN 3 $ \case
+    [fromA, toA, sA] -> do
+      from <- withString "replace" fromA pure
+      to <- withString "replace" toA pure
+      withString "replace" sA $ \s ->
+        alloc $ VString (if T.null from then s else T.replace from to s)
+    args -> arityError "replace" 3 args
+  seqAddr <- native2 $ \a b ->
+    withString "seq" a $ \x -> withString "seq" b $ \y -> alloc $ VBoolean (x == y)
+  sneqAddr <- native2 $ \a b ->
+    withString "sneq" a $ \x -> withString "sneq" b $ \y -> alloc $ VBoolean (x /= y)
+
+  -- Booleans.
+  notAddr <- native1 $ \a ->
+    withBool "not" a $ \x -> alloc $ VBoolean (not x)
+  orAddr <- shortCircuit "||" True
+  andAddr <- shortCircuit "&&" False
+  xorAddr <- boolOp "^" (/=)
+  norAddr <- boolOp "nor" (\a b -> not (a || b))
+  nandAddr <- boolOp "nand" (\a b -> not (a && b))
+
+  -- `and` is the old short-circuiting conjunction; it stays because the
+  -- examples of the paper use it, and it means the same as `&&`.
+  legacyAndAddr <- shortCircuit "and" False
+
   forceAddr <- alloc $ VClosure st.sEnv emptyCache Nothing force
   whnfBuiltinAddr <- alloc $ VClosure st.sEnv emptyCache Nothing whnf
-  ieqAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getInt addrA
-      st' <- get
-      alloc $ VClosure st'.sEnv emptyCache Nothing $ \addrB -> do
-        b <- getInt addrB
-        alloc $ VBoolean $ a == b
-  igtAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getInt addrA
-      st' <- get
-      alloc $ VClosure st'.sEnv emptyCache Nothing $ \addrB -> do
-        b <- getInt addrB
-        alloc $ VBoolean $ a > b
-  iltAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getInt addrA
-      st' <- get
-      alloc $ VClosure st'.sEnv emptyCache Nothing $ \addrB -> do
-        b <- getInt addrB
-        alloc $ VBoolean $ a < b
-  notAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getBool addrA
-      alloc $ VBoolean $ not a
-  predAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getInt addrA
-      alloc $ VInt $ a - 1
+  predAddr <- intFun "pred" (subtract 1)
+  assertAddr <- native2 $ \a b ->
+    withBool "assert" a $ \ok ->
+      if ok
+        then alloc VNil
+        else withString "assert" b callError
   argsAddr <- do
       argAddrs <- mapM (alloc . VString . T.pack) cmdArgs
       alloc $ VArray argAddrs
-  andAddr <- alloc $ VClosure st.sEnv emptyCache Nothing $ \addrA -> do
-      a <- getBool addrA
-      st' <- get
-      alloc $ VClosure st'.sEnv emptyCache Nothing $ \addrB ->
-        -- `and` is short-circuiting: the language is non-strict, so the second
-        -- argument must not be forced when the first one already decides the
-        -- result.  Forcing it unconditionally made
-        -- `and false (ieq (spin 1) 0)` diverge.
-        if not a
-          then alloc $ VBoolean False
-          else do
-            b <- getBool addrB
-            alloc $ VBoolean b
-  let justNatives = Map.fromList $ map (\(n, a) -> (n, (Val, a))) [
+
+  let natives = [
           ("+", plusAddr),
           ("-", minusAddr),
-          ("force", forceAddr),
-          ("whnf", whnfBuiltinAddr),
+          ("*", timesAddr),
+          ("/", divAddr),
+          ("%", remAddr),
+          ("neg", negAddr),
+          ("abs", absAddr),
+          ("max", maxAddr),
+          ("min", minAddr),
           ("ieq", ieqAddr),
+          ("ineq", ineqAddr),
           (">", igtAddr),
           ("<", iltAddr),
-          ("and", andAddr),
+          ("<=", ileAddr),
+          (">=", igeAddr),
+          ("+.", fplusAddr),
+          ("-.", fminusAddr),
+          ("*.", ftimesAddr),
+          ("/.", fdivAddr),
+          ("%.", fremAddr),
+          ("fneg", fnegAddr),
+          ("fabs", fabsAddr),
+          ("fmax", fmaxAddr),
+          ("fmin", fminAddr),
+          ("feq", feqAddr),
+          ("fneq", fneqAddr),
+          ("<.", fltAddr),
+          (">.", fgtAddr),
+          ("<=.", fleAddr),
+          (">=.", fgeAddr),
+          ("to_int", toIntAddr),
+          ("to_float", toFloatAddr),
+          ("++", concatAddr),
+          ("slen", slenAddr),
+          ("sub", subAddr),
+          ("split", splitAddr),
+          ("join", joinAddr),
+          ("trim", trimAddr),
+          ("upper", upperAddr),
+          ("lower", lowerAddr),
+          ("contains", containsAddr),
+          ("replace", replaceAddr),
+          ("seq", seqAddr),
+          ("sneq", sneqAddr),
           ("not", notAddr),
+          ("||", orAddr),
+          ("&&", andAddr),
+          ("^", xorAddr),
+          ("nor", norAddr),
+          ("nand", nandAddr),
+          ("and", legacyAndAddr),
+          ("force", forceAddr),
+          ("whnf", whnfBuiltinAddr),
           ("pred", predAddr),
+          ("assert", assertAddr),
           ("args", argsAddr)
         ]
 
-      allBindings = operations <> justNatives
+  -- The library records are views of the very values above, so
+  -- `Numbers@+` and `+` are one function and cannot drift apart.
+  recordBindings <- forM (Builtins.builtins >>= asRecord) $ \(name, fields) -> do
+    propAddrs <- forM fields $ \field ->
+      case lookup field natives of
+        Just addr -> pure (field, addr)
+        Nothing -> rtError $ "internal error: the library record `" <> name
+          <> "` names `" <> field <> "`, which is not a native value"
+    eid <- newEnv Env {bindings = Map.fromList [(n, (Val, a)) | (n, a) <- propAddrs], parent = Nothing}
+    addr <- alloc (VRecord eid)
+    pure (name, (Val, addr))
+
+  let justNatives = Map.fromList $ map (\(n, a) -> (n, (Val, a))) natives
+
+      allBindings = operations <> justNatives <> Map.fromList recordBindings
 
       -- The checker and the interpreter must offer the same names: a name the
       -- program can call but the interpreter cannot run would crash, and a
@@ -720,6 +939,31 @@ buildInitialEnv cmdArgs = do
       ]
 
   modifyCurrentEnv $ \e -> e {bindings = allBindings <> e.bindings}
+
+  where
+    asRecord (Builtins.Builtin name (Builtins.Record fields)) = [(name, fields)]
+    asRecord _ = []
+
+-- | Raise an error through the effect @Error@, so that a handler installed by
+--   the program sees it and the bottom handler turns it into a diagnostic when
+--   no handler does.
+callError :: Text -> Interp Address
+callError msg = do
+  addr <- alloc (VString msg)
+  callEffect (Eff.elabel "Error") "error" [addr]
+
+-- | Division of decimals, rounded to fifteen places.
+--
+--   `Scientific` has no division of its own: the quotient of two decimals is
+--   not necessarily a decimal.  The rounding is explicit so that the result is
+--   a value of the same type as its operands, and a reader sees the precision
+--   the language promises rather than the one a `Double` happens to have.
+floatDiv :: Scientific -> Scientific -> Scientific
+floatDiv _ 0 = 0 -- unreachable: the caller reports a zero divisor first
+floatDiv x y = normalize (scientific n (-15))
+  where
+    n = round (toRational x / toRational y * 10 ^ (15 :: Int)) :: Integer
+
 
 -- | Выполнение чанка (игнорируем декларации, просто идём дальше)
 evalChunk :: IR.Chunk -> Interp Value

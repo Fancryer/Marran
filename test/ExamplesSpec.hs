@@ -941,6 +941,79 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
       errorCodeOf err `shouldBe` Just "E0019"
       T.unpack (pretty err) `shouldSatisfy` ("out of memory" `isInfixOf`)
       ieSpan err `shouldSatisfy` (not . isNoSpan)
+
+  describe "the standard library" $ do
+    it "binds a field of a record to the same function as the flat name" $ do
+      -- `Numbers@+` is not a second `+`: the record is a view of the values the
+      -- initial environment already holds, so a call through it and a call to
+      -- the name give the same result and cost the same row.
+      r <- runSourceWithInput "records_of_the_library.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn (Numbers@+ 1 2);"
+        , "  sayn (+ 1 2);"
+        , "  sayn (Strings@slen 'abc');"
+        , "  sayn (Booleans@not true)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the records must be callable: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["3", "3", "3", "false"]
+
+    it "reports a zero divisor through `Error`, so a handler can catch it" $ do
+      r <- runSourceWithInput "division_by_zero.marr" "" $ T.unlines
+        [ "funct safe_div (a Int) (b Int) : {Output} Int ="
+        , "  (under Error to"
+        , "    (/ a b)"
+        , "  handle"
+        , "  | error e => sayn (++ 'caught: ' e); 0"
+        , "  | then x => x)"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (safe_div 10 2);"
+        , "  sayn (safe_div 1 0)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`/` must be catchable: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["5", "caught: division by zero", "0"]
+
+    it "an uncaught `error` is a diagnostic with a code of its own" $ do
+      r <- runSourceWithInput "uncaught_error.marr" "" $ T.unlines
+        [ "funct main () : {Output; Error} () ="
+        , "  sayn (error 'boom')"
+        ]
+      case r of
+        Left err -> do
+          err `shouldSatisfy` ("E0020" `isInfixOf`)
+          err `shouldSatisfy` ("boom" `isInfixOf`)
+        Right out -> expectationFailure $
+          "an uncaught error must be a diagnostic; got output: " ++ take 300 out
+
+    it "`||` does not touch its second argument when the first one decides" $ do
+      r <- runSourceWithInput "lazy_or.marr" "" $ T.unlines
+        [ "funct spin (n Int) : Boolean = spin n"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (|| true (spin 1));"
+        , "  sayn (&& false (spin 2))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`||` and `&&` must short-circuit: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["true", "false"]
+
+    it "slices a string past its ends without failing" $ do
+      -- `sub` takes a start and a length, so a slice that runs past the end is
+      -- simply shorter: a reader of `sub 0 n s` should not have to guard n.
+      r <- runSourceWithInput "sub_slice.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn (sub 1 3 'abcdef');"
+        , "  sayn (sub 0 100 'abc');"
+        , "  sayn (sub 10 2 'abc');"
+        , "  sayn (slen (sub 2 0 'abc'))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`sub` must not fail on a long length: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["bcd", "abc", "", "0"]
+
   where
     isReport l = "EVENTS:" `isInfixOf` l || "EVENT-VIOLATION" `isInfixOf` l
     isCodedHeader l =

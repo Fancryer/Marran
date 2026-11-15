@@ -133,6 +133,7 @@ close to anything also stays opaque and fails later at unification.
 | E0017 | an application or arity error (`with` arguments, an effect parameter list, a non-function head) |
 | E0018 | an inference limitation (an occurs check, an escaping rigid variable, a failed instantiation, a forbidden effect in a constrained row, or an operation name provided by two effects in the same row) |
 | E0019 | the program exhausted memory (the heap or the stack), reported at the body of `main` |
+| E0020 | the program itself failed: an uncaught `error`/failed `assert` of the effect `Error`, or a zero divisor in `%` |
 
 Errors raised by the elaborator (the phase between the parser and the type
 checker) carry a message but no code: they are about the shape of the program

@@ -1,0 +1,49 @@
+//| Стандартная библиотека: арифметика, строки и булевы операции. Каждое имя
+//| доступно и само по себе (`+`, `slen`), и через запись (`Numbers@+`,
+//| `Strings@slen`); запись — это вид на те же значения, а не второй набор
+//| функций.
+//| Ожидается вывод:
+//| 3 2 24 3 1
+//| 3.75 0.25 3 3.0
+//| abcd 5 bcd [a, b, c] a-b
+//| x ABC abc true heLLo
+//| false true false true
+//| false true
+//| 3 5
+//| `Numbers@/` называет `Error` в своём ряду (нулевой делитель — это ошибка,
+//| которую можно поймать), поэтому ряд `main` тоже содержит `Error`.
+funct main () : {Output; Error} () =
+  //| целые
+  say (Numbers@+ 1 2); say ' ';
+  say (Numbers@- 5 3); say ' ';
+  say (Numbers@* 4 6); say ' ';
+  say (Numbers@/ 7 2); say ' ';
+  sayn (Numbers@% 7 2);
+  //| вещественные и преобразования
+  say (+. 1.5 2.25); say ' ';
+  say (/. 1.0 4.0); say ' ';
+  say (to_int 3.9); say ' ';
+  sayn (to_float 3);
+  //| строки
+  say (Strings@++ 'ab' 'cd'); say ' ';
+  say (Strings@slen 'hello'); say ' ';
+  say (sub 1 3 'abcdef'); say ' ';
+  say (split ',' 'a,b,c'); say ' ';
+  sayn (join '-' ['a', 'b']);
+  //| строки без скобок вокруг аргумента: `trim`, `upper`, `lower`
+  say (trim '  x  '); say ' ';
+  say (upper 'abc'); say ' ';
+  say (lower 'ABC'); say ' ';
+  say (contains 'ell' 'hello'); say ' ';
+  sayn (replace 'l' 'L' 'hello');
+  //| булевы операции
+  say (not true); say ' ';
+  say (|| false true); say ' ';
+  say (&& true false); say ' ';
+  sayn (nor false false);
+  //| `and` — та же конъюнкция, что `&&`
+  say (Booleans@nand true true); say ' ';
+  sayn (and true true);
+  //| арифметика через запись и напрямую — одно и то же
+  say (Numbers@to_int (Numbers@+. 1.5 1.5)); say ' ';
+  sayn (abs (neg 5))

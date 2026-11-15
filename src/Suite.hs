@@ -64,6 +64,14 @@ cases =
   , ("record_update",     ["#{val a = 1; val b = 2}", "#{val a = 1; val b = 2; val c = 3}", "1", "#{val a = 10; val b = 2}", "1"])
   , ("lazy_and",          ["false"])
   , ("long_loop",         ["30000", "0", "300000"])
+  , ("stdlib",            [ "3 2 24 3 1"
+                          , "3.75 0.25 3 3.0"
+                          , "abcd 5 bcd [a, b, c] a-b"
+                          , "x ABC abc true heLLo"
+                          , "false true false true"
+                          , "false true"
+                          , "3 5"
+                          ])
   ]
 
 -- | The program that the type checker must reject; the error must name @Read@.
