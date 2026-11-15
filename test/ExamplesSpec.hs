@@ -799,6 +799,58 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Right out -> expectationFailure $
           "an Int is not a Nothing; got output: " ++ take 300 out
 
+  describe "records are updated, not extended" $ do
+    it "keeps the fields of the base" $ do
+      r <- runSourceWithInput "record_update.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val base = #{ val a = 1; val b = 2 };"
+        , "  val s = #{ base | val c = 3 };"
+        , "  sayn s;"
+        , "  sayn s@a"
+        ]
+      case r of
+        Left err -> expectationFailure $ "an update must keep the base fields: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["#{val a = 1; val b = 2; val c = 3}", "1"]
+
+    it "replaces a field and leaves the base alone" $ do
+      r <- runSourceWithInput "record_update_replace.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val base = #{ val a = 1 };"
+        , "  val s = #{ base | val a = 2 };"
+        , "  sayn s;"
+        , "  sayn base"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a replaced field must update the result: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["#{val a = 2}", "#{val a = 1}"]
+
+    it "adds the type of the base fields to the result" $ do
+      -- The type of `s` must name `a`, or `s@a` would not type-check even at
+      -- run time.
+      r <- runSourceWithInput "record_update_type.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val base = #{ val a = 1 };"
+        , "  val s = #{ base | val b = 'x' };"
+        , "  sayn s@a"
+        ]
+      case r of
+        Left err -> expectationFailure $ "s@a must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["1"]
+
+    it "refuses to change the mutability of a field" $ do
+      r <- runSourceWithInput "record_update_mut.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val base = #{ val a = 1 };"
+        , "  val s = #{ base | var a = 2 };"
+        , "  sayn s"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("var" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a field must not change mutability; got output: " ++ take 300 out
+
   it (rejectedProgram ++ " is rejected with the missing Read effect") $ do
     r <- runProgram rejectedProgram
     case r of

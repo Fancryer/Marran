@@ -910,7 +910,7 @@ inferRecord scope (Just anchor) props = withNewLevel $ do
             Just (TRecordProp baseMut _ _) ->
               if baseMut /= mut then
                 throwTypeCheckError $ RecordError $ T.pack
-                $ printf "the field `%s` is %s in the record being extended, so it cannot become %s" name baseMut mut
+                $ printf "the field `%s` is %s in the record being updated, so it cannot become %s" name baseMut mut
               else do
                 -- Удаляем старое TERecordProp с таким же именем, если есть
                 let accProps' = filter (\(TERecordProp _ n _ _) -> n /= name) accProps
@@ -923,16 +923,27 @@ inferRecord scope (Just anchor) props = withNewLevel $ do
               -- Новое поле
               pure (accProps <> [TERecordProp mut name propT exprExpr], Eff.unionEffRows accFxs exprFxs, sc'')
         ) ([], anchorFxs, scope1) props
+      -- `#{ base | ... }` is an update, not an extension: the result has every
+      -- field of the base, and the listed ones replace the base's.  An
+      -- inherited field is read through the base (the interpreter shares the
+      -- value, since a `val` field never changes), so its typed expression is
+      -- the field access on the base.
+      let inherited =
+            [ TERecordProp m n t (TEPropAccess anchorExpr n)
+            | TRecordProp m n t <- baseProps
+            , not (any (\(ERecordProp _ n' _ _) -> n' == n) props)
+            ]
+          allProps = inherited <> recProps
       -- T-Rec: the record being built gets its own annotation; the base's
       -- pending row is a bound too, since the new record still shares the
       -- base's fields.
-      men <- mentionRow finalScope (Set.unions (map (fvTyped . terExpr) recProps))
+      men <- mentionRow finalScope (Set.unions (map (fvTyped . terExpr) allProps))
       basePending' <- applyEffRowSubst finalScope basePending
       pending <- freshMetaRowM
       finalScope' <- subsumesEffRow finalScope
         (Eff.unionEffRows (Eff.unionEffRows propFxs men) basePending') pending
       wrapInferResultWithCell $
-        InferResult (TERecord (Just anchorExpr) recProps pending) propFxs finalScope'
+        InferResult (TERecord (Just anchorExpr) allProps pending) propFxs finalScope'
     _ -> throwTypeCheckError $ RecordError "a record can only be built from another record, but this base is not one"
 
 inferHandler :: Scope -> Types.Handler -> InferM TypedExpr

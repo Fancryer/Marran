@@ -61,6 +61,7 @@ cases =
   , ("under",             ["1"])
   , ("effect_in_function", ["3"])
   , ("empty_arrays",      ["[[1], []]", "[[], [1]]", "[]"])
+  , ("record_update",     ["#{val a = 1; val b = 2}", "#{val a = 1; val b = 2; val c = 3}", "1", "#{val a = 10; val b = 2}", "1"])
   ]
 
 -- | The program that the type checker must reject; the error must name @Read@.

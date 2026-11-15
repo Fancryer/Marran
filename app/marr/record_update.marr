@@ -1,0 +1,17 @@
+//| `#{ base | ... }` — иммутабельное обновление записи: результат содержит все
+//| поля base, перечисленные поля заменены.  base не меняется.
+//| Ожидается вывод:
+//| #{val a = 1; val b = 2}
+//| #{val a = 1; val b = 2; val c = 3}
+//| 1
+//| #{val a = 10; val b = 2}
+//| 1
+funct main () : {Output} () =
+  val base = #{ val a = 1; val b = 2 };
+  val s = #{ base | val c = 3 };
+  sayn base;
+  sayn s;
+  sayn s@a;
+  val t = #{ base | val a = 10 };
+  sayn t;
+  sayn base@a
