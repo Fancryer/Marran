@@ -42,7 +42,7 @@ sym :: Text -> Token -> Lexer Token
 sym s t = t <$ L.symbol sc s
 
 kw :: Text -> Keyword -> Lexer Token
-kw s k = lexeme $ TKW k <$ try (string s <* notFollowedBy normalChar)
+kw s k = lexeme $ TKW k <$ try (string s <* notFollowedBy wordChar)
 
 digit, hexDigit :: Lexer Char
 
@@ -143,14 +143,35 @@ hexFloatLiteral = lexeme $ do
   pure $ base * (2 ^^ exp2)
 
 
-normalChar :: Lexer Char
-normalChar = satisfy (\c -> isAlphaNum c || elem c ("_+/%|&^~<=>.*!?-" :: String))
+-- | Characters that may occur in a name.  An operator is just a name whose
+--   characters come from this set, so @+@, @<=@, @|>@ and @<|@ are names, and
+--   the lexer needs no special case for any of them.  A name that starts with
+--   an operator character consists of operator characters only, so @|val@ is
+--   the pipe followed by @val@, not one name.  A lone @|@ is not a name: it is
+--   the pipe that separates a record from its base and a row from its tail, so
+--   'name' maps exactly that one back to 'TPipe'.
+operatorChar :: Char -> Bool
+operatorChar = (`elem` ("+/%|&^~<=>.*!?-" :: String))
+
+normalChar :: Char -> Bool
+normalChar c = isAlphaNum c || c == '_' || operatorChar c
+
+wordChar :: Lexer Char
+wordChar = satisfy normalChar
 
 nameText :: Lexer Text
-nameText = T.pack <$> some normalChar
+nameText = do
+  c <- wordChar
+  rest <-
+    if isAlphaNum c || c == '_'
+      then many wordChar
+      else many (satisfy operatorChar)
+  pure $ T.pack (c : rest)
 
 name :: Lexer Token
-name = lexeme $ TName <$> nameText
+name = lexeme $ do
+  t <- nameText
+  pure $ if t == "|" then TPipe else TName t
 
 tvar :: Lexer Token
 tvar = lexeme $ TTVar <$> (char '`' *> nameText)
@@ -178,7 +199,6 @@ token = choice [
     sym "=>" TMatchArrow,
     sym "==>" THRPArrow,
     sym "=" TAssign,
-    sym "|" TPipe,
     sym "_" TUnderscore,
     sym "->" TArrow,
     kw "effect" KWEffect,
