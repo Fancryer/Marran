@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module ExamplesSpec (eSpec) where
 
+import Control.Exception (AsyncException (HeapOverflow))
 import Control.Monad (forM_)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Maybe (listToMaybe)
@@ -8,6 +9,9 @@ import qualified Data.Text as T
 import System.Environment (setEnv)
 import Test.Hspec
 
+import IntInterpreter (InterpError (..), errorCodeOf, heapError)
+import Span (isNoSpan, spanAt)
+import Utils (Pretty (..))
 import Suite (cases, rejectedProgram, runProgram, runProgramWithInput, runSourceWithInput)
 
 -- | The example programs of the paper, as tests.  The event check of the
@@ -902,6 +906,41 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         ls `shouldSatisfy` any ("^" `isInfixOf`)
       Right out -> expectationFailure $
         "expected a type error, got output: " ++ take 300 out
+
+  describe "memory" $ do
+    it "a long tail-recursive loop finishes and prints its result" $ do
+      r <- runSourceWithInput "long_loop.marr" "" $ T.unlines
+        [ "funct step (i Int) (acc Int) : Int ="
+        , "  if ieq i 0 then acc else step (pred i) (+ acc 1)"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (step 1000000 0)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the loop must not run out of memory: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["1000000"]
+
+    it "a structure that becomes unreachable is collected" $ do
+      -- Each iteration builds a record over `i` and drops it.  With a growing
+      -- table of cells this loop is the one that used to exhaust the heap.
+      r <- runSourceWithInput "gc_records.marr" "" $ T.unlines
+        [ "funct burn (i Int) : Int ="
+        , "  if ieq i 0 then 0 else"
+        , "    let garbage = #{ val left = i; val right = - i 1 } in"
+        , "    if ieq garbage@left 0 then 0 else burn (pred i)"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (burn 200000)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the garbage must be collected: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["0"]
+
+    it "an exhausted heap is a diagnostic with a code and a position" $ do
+      let err = heapError (spanAt "mem.marr" 5 3) HeapOverflow
+      errorCodeOf err `shouldBe` Just "E0019"
+      T.unpack (pretty err) `shouldSatisfy` ("out of memory" `isInfixOf`)
+      ieSpan err `shouldSatisfy` (not . isNoSpan)
   where
     isReport l = "EVENTS:" `isInfixOf` l || "EVENT-VIOLATION" `isInfixOf` l
     isCodedHeader l =

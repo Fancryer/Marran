@@ -38,7 +38,7 @@ import ErrorContext (
     Diagnostic(..), innermost
   )
 import Infer (inferChunk)
-import IntInterpreter (interpret, InterpError(..))
+import IntInterpreter (interpret, InterpError(..), errorCodeOf)
 import Parser (parseFromTextNamed, chunk)
 import Unify (TypeCheckState(..), evalTypeCheckM, errorCode)
 import Utils (Pretty(..))
@@ -63,6 +63,7 @@ cases =
   , ("empty_arrays",      ["[[1], []]", "[[], [1]]", "[]"])
   , ("record_update",     ["#{val a = 1; val b = 2}", "#{val a = 1; val b = 2; val c = 3}", "1", "#{val a = 10; val b = 2}", "1"])
   , ("lazy_and",          ["false"])
+  , ("long_loop",         ["30000", "0", "300000"])
   ]
 
 -- | The program that the type checker must reject; the error must name @Read@.
@@ -123,7 +124,7 @@ runSourceWithInput path input src = do
               r <- captureStdoutWith (withStdin input (interpret ic []))
               case r of
                 (Left err, _) -> pure . Left . T.unpack $
-                  renderDiagnostic sources ((diagnostic SevError Nothing (pretty err)) {
+                  renderDiagnostic sources ((diagnostic SevError (errorCodeOf err) (pretty err)) {
                     diagLabels = [primaryLabel (ieSpan err) ""]
                   })
                 (Right _, out) -> pure $ Right out
