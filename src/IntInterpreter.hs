@@ -454,7 +454,7 @@ globalOps = [
           case v of
             VInt n | n <= 0 -> alloc $ VString ""
             VInt n -> do
-              chars <- mapM (const $ chr <$> randomRIO (32, 126)) [1 .. fromInteger n]
+              chars <- mapM (const $ chr <$> randomRIO (32, 126)) [1 :: Integer .. fromInteger n]
               alloc $ VString (T.pack chars)
             _ -> rtError "`random_string` needs an Int as its length"
         args -> \_ -> arityError "random_string" 1 args)
@@ -514,7 +514,7 @@ describe = \case
   VArray _ -> "an array"
   VPair _ _ -> "a pair"
   VRecord _ -> "a record"
-  VClosure _ _ _ -> "a function"
+  VClosure {} -> "a function"
   VThunk _ _ -> "an unevaluated expression"
   VBThunk _ _ -> "an unevaluated expression"
   VBottom -> "an undefined value"
@@ -620,14 +620,21 @@ buildInitialEnv cmdArgs = do
       a <- getInt addrA
       alloc $ VInt $ a - 1
   argsAddr <- do
-      argAddrs <- mapM (alloc . VString) (map T.pack cmdArgs)
+      argAddrs <- mapM (alloc . VString . T.pack) cmdArgs
       alloc $ VArray argAddrs
   andAddr <- alloc $ VClosure st.sEnv emptyCache $ \addrA -> do
       a <- getBool addrA
       st' <- get
-      alloc $ VClosure st'.sEnv emptyCache $ \addrB -> do
-        b <- getBool addrB
-        alloc $ VBoolean $ a && b
+      alloc $ VClosure st'.sEnv emptyCache $ \addrB ->
+        -- `and` is short-circuiting: the language is non-strict, so the second
+        -- argument must not be forced when the first one already decides the
+        -- result.  Forcing it unconditionally made
+        -- `and false (ieq (spin 1) 0)` diverge.
+        if not a
+          then alloc $ VBoolean False
+          else do
+            b <- getBool addrB
+            alloc $ VBoolean b
   let justNatives = Map.fromList $ map (\(n, a) -> (n, (Val, a))) [
           ("+", plusAddr),
           ("-", minusAddr),
@@ -750,7 +757,7 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
       traceEval $ "evalExpr [TEString] | " <> T.unpack s
       cont =<< alloc (VString s)
     TENil -> do
-      traceEval $ "evalExpr [TENil]"
+      traceEval "evalExpr [TENil]"
       cont =<< alloc VNil
     TEXVar n _ -> do
       traceEval $ "evalExpr [TEXVar] | " <> T.unpack n
@@ -838,7 +845,7 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
       modify $ \s -> s {sNextHandler = handlerId + 1}
       callCC $ \finish -> do
         let finishWithThen result = do
-              traceEval $ "running then"
+              traceEval "running then"
               -- обработчик снимается до then: эффекты в then обрабатывает внешний обработчик
               modify $ \s -> s {sKstack = kstack0}
               thenResult <- thenFn result
@@ -1050,7 +1057,7 @@ makeClause handlerId finishWithThen
       contId <- gets sNextCont
       modify $ \s -> s {sNextCont = contId + 1}
       resumeAddr <- alloc $ VClosure cur (Just IM.empty) $ \tAddr -> do
-        alive <- any ((== handlerId) . hId) <$> gets sKstack
+        alive <- gets (any ((== handlerId) . hId) . sKstack)
         unless alive $
           rtError "`resume` was called after its handler returned; the continuation is no longer installed"
         used <- gets sUsedConts
@@ -1239,6 +1246,7 @@ freezeCode env' = \case
 -- | Замороженная копия ячейки (модель: freezeV). Копирование транзитивно: данные,
 --  thunk'и и код замыканий, достижимые по свободным переменным. Общая таблица
 --  sFreezeMemo сохраняет разделение и обрывает циклы (рекурсия функций).
+freezeCell :: Address -> Interp Address
 freezeCell a = do
   memo <- gets sFreezeMemo
   case IM.lookup (addrToInt a) memo of

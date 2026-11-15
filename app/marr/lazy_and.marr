@@ -1,0 +1,7 @@
+//| Язык нестрогий, и `and` тоже: если первый аргумент уже решает результат,
+//| второй не трогается.  `spin` не завершается, но `and false (spin 1)` — да.
+//| Ожидается вывод: false
+funct spin (n Int) : Boolean = spin n
+
+funct main () : {Output} () =
+  sayn (and false (spin 1))

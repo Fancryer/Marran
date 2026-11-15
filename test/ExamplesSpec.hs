@@ -851,6 +851,43 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Right out -> expectationFailure $
           "a field must not change mutability; got output: " ++ take 300 out
 
+  describe "builtins are as lazy as the language" $ do
+    it "`and false x` never touches `x`" $ do
+      -- `and` used to force its second argument unconditionally, so a program
+      -- that short-circuited diverged instead.
+      r <- runSourceWithInput "lazy_and.marr" "" $ T.unlines
+        [ "funct spin (n Int) : Boolean = spin n"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (and false (spin 1))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`and` must short-circuit: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["false"]
+
+    it "`and true x` is the value of `x`" $ do
+      r <- runSourceWithInput "lazy_and_true.marr" "" $ T.unlines
+        [ "funct spin (n Int) : Int = spin n"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (and true (ieq 1 1));"
+        , "  sayn (and true (ieq 1 2))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`and true x` must be `x`: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["true", "false"]
+
+    it "`if` does not touch the branch it does not take" $ do
+      r <- runSourceWithInput "lazy_if.marr" "" $ T.unlines
+        [ "funct spin (n Int) : Int = spin n"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (if true then 1 else spin 2)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`if` must be lazy: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["1"]
+
   it (rejectedProgram ++ " is rejected with the missing Read effect") $ do
     r <- runProgram rejectedProgram
     case r of
