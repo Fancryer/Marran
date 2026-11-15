@@ -20,7 +20,8 @@ main = getArgs >>= \case
     [ "usage: marran-exe               run the bundled example programs"
     , "       marran-exe --bench [--csv FILE]        the benchmark graphs"
     , "       marran-exe --bench-edges [--csv FILE]  the wider edge sweep"
-    , "       marran-exe --run <name>  run one program from app/marr"
+    , "       marran-exe --run <name|path>           run a program: a name from"
+    , "                                              app/marr, or any .marr file"
     ]
 
 -- | Criterion accepts @--csv@ only as its first argument.

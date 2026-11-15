@@ -25,7 +25,7 @@ import Control.Exception (bracket, finally, try)
 import Control.Monad (filterM)
 import Control.Monad.State.Lazy (evalState)
 import Control.Monad.Except (runExceptT)
-import Data.List (isInfixOf, isPrefixOf, intercalate)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf, intercalate)
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.Environment (setEnv)
 import System.IO
@@ -112,17 +112,31 @@ cases =
 rejectedProgram :: FilePath
 rejectedProgram = "imm_needs_read"
 
--- | The directories that may contain the example programs, tried in order.
+-- | The file a name refers to, if there is one.
+--
+--   @--run@ takes either the name of a bundled example (@guess@) or a path to
+--   any Mårran file (@scratch/guess.marr@, @D:\scratch\guess.marr@).  A path
+--   is tried as given first, so a file outside @app/marr@ -- and a name that
+--   is relative to the reader's directory -- works; the bundled directories
+--   are tried afterwards, which keeps the short form working from the
+--   repository root and from a build directory.
 programPath :: FilePath -> IO (Maybe FilePath)
 programPath name = do
-  let candidates = [ "app/marr/" <> name <> ".marr"
-                   , "../app/marr/" <> name <> ".marr"
-                   , "../../app/marr/" <> name <> ".marr"
-                   ]
+  let given = programFileName name
+      -- A name with a separator is a path the reader wrote on purpose: looking
+      -- for it under `app/marr` as well would be guessing.
+      hasDir = any (`elem` ("/\\" :: String)) name
+      candidates = [ given ]
+        <> [ dir <> given | not hasDir
+                          , dir <- ["app/marr/", "../app/marr/", "../../app/marr/"] ]
   found <- filterM doesFileExist candidates
   pure $ case found of
     (p:_) -> Just p
     []    -> Nothing
+
+-- | The name a program is reported under when it cannot be found.
+programFileName :: FilePath -> FilePath
+programFileName name = if ".marr" `isSuffixOf` name then name else name <> ".marr"
 
 -- | Elaborate, type-check and interpret a program.  Everything it prints is
 --   captured and returned; the result is 'Left' on a parse, elaboration or
@@ -138,7 +152,7 @@ runProgram name = runProgramWithInput name ""
 runProgramWithInput :: FilePath -> String -> IO (Either String String)
 runProgramWithInput name input =
   programPath name >>= \case
-    Nothing -> pure $ Left $ "program not found: " ++ name ++ ".marr"
+    Nothing -> pure $ Left $ "program not found: " ++ programFileName name
     Just path -> do
       src <- T.pack <$> readFile path
       runSourceWithInput path input src

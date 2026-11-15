@@ -12,7 +12,7 @@ import Test.Hspec
 import IntInterpreter (InterpError (..), errorCodeOf, heapError)
 import Span (isNoSpan, spanAt)
 import Utils (Pretty (..))
-import Suite (cases, rejectedProgram, runProgram, runProgramWithInput, runSourceWithInput)
+import Suite (cases, rejectedProgram, programPath, runProgram, runProgramWithInput, runSourceWithInput)
 
 -- | The example programs of the paper, as tests.  The event check of the
 --   interpreter is enabled, so a mutation event that the declared row does not
@@ -1176,6 +1176,35 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> err `shouldSatisfy` ("File" `isInfixOf`)
         Right out -> expectationFailure $
           "a call to `write_file` must charge `File`; got output: " ++ take 300 out
+
+    it "reads a line of input as a string, without requiring quotes" $ do
+      -- The line is the answer, not source: a program that asks a person for a
+      -- name must accept `world` typed as it is.  A line that happens to be a
+      -- string literal keeps it, because the input is never parsed.
+      r <- runSourceWithInput "read_string_plain.marr" "world\n'quoted'\n" $ T.unlines
+        [ "funct main () : {Output; Input} () ="
+        , "  sayn (++ 'hello, ' (read_string ()));"
+        , "  sayn (read_string ())"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`read_string` must take the line as it is: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["hello, world", "'quoted'"]
+
+  describe "running a program by path" $ do
+    it "finds a file whose path has a directory, not just a bundled name" $ do
+      -- `--run` used to accept only a bare name under `app/marr`, so a file
+      -- anywhere else could not be run at all.  A path with a separator is
+      -- taken as written; a bare name still looks in the bundled directories.
+      let dir = "app/marr"
+      found <- programPath (dir ++ "/scoping")
+      found `shouldBe` Just (dir ++ "/scoping.marr")
+      -- An absolute path is a path too, and `.marr` is not doubled.
+      abs1 <- programPath (dir ++ "/scoping.marr")
+      abs1 `shouldBe` Just (dir ++ "/scoping.marr")
+
+    it "does not invent a path for a name it cannot find" $ do
+      found <- programPath "no_such_program_anywhere"
+      found `shouldBe` Nothing
 
   where
     isReport l = "EVENTS:" `isInfixOf` l || "EVENT-VIOLATION" `isInfixOf` l

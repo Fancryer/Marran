@@ -509,10 +509,12 @@ globalOps = [
     ]),
     (Eff.elabel "Input", [
       ("read_string", Op 1 $ \_ _ -> do
+        -- A line of input is text, not source: the whole line is the string,
+        -- quotes and all.  Parsing it as a Mårran literal made `hello` an
+        -- error and `'hello'` correct, which is the wrong way round for a
+        -- program that asks a person for an answer.
         input <- readInputLine "read_string"
-        case Parser.parseFromText Parser.stringLiteral input of
-          Left _ -> rtError $ "`read_string` could not parse the line " <> quoted input
-          Right s -> alloc $ VString s),
+        alloc $ VString input),
       ("read_int", Op 1 $ \_ _ -> do
         input <- readInputLine "read_int"
         case Parser.parseFromText Parser.intLiteral input of
@@ -1433,7 +1435,14 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
       body <- evalLambda env lam
       let cache = if isPureClosure lam.lFxs then Just IM.empty else Nothing
       cont =<< allocClosure env cache (CodeLam lam) body
-    TENLambda _ -> rtError "native lambdas are not implemented in the interpreter"
+    -- A native name in value position is not a node the interpreter ever
+    -- evaluates: `Scope.valueOf` puts a `TENLambda` into the binding for the
+    -- checker to name the type, and the interpreter finds the value in the
+    -- native scope, above the program's.  A program that stores such a name
+    -- (`val f = +; f 1 2`) keeps the variable, which resolves to that same
+    -- native address.  So this branch is unreachable, and saying so is more
+    -- useful than pretending to implement a second kind of closure.
+    TENLambda _ -> rtError "internal error: a native signature reached the interpreter as a value"
     TEApply f x -> do
       traceEval $ "evalExpr [TEApply] | f: " <> T.unpack (pretty f) <> ", x: " <> T.unpack (pretty x)
       fAddr <- force =<< evalExpr f pure
