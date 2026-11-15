@@ -699,6 +699,91 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Right out -> filter (not . isReport) (lines out) `shouldBe`
           ["[1, 2]", "[[a], [b, c]]", "[(1, 2), (3, 4)]", "#{val xs = [1]}"]
 
+    it "prints a function by its name, not by its address" $ do
+      -- A function used to print as `!closure[&00000000]!`: every function was
+      -- the same unreadable word, and a reader could not tell `add1` from `+`.
+      r <- runSourceWithInput "print_function.marr" "" $ T.unlines
+        [ "funct add1 (x Int) : Int = + x 1"
+        , "funct twice (x Int) : Int = add1 (add1 x)"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn add1;"
+        , "  sayn twice;"
+        , "  sayn +;"
+        , "  sayn (Numbers@+);"
+        , "  sayn [add1, twice];"
+        , "  sayn (add1, twice)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "printing a function must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["add1", "twice", "+", "+", "[add1, twice]", "(add1, twice)"]
+
+    it "says that a partial application is not the whole function" $ do
+      -- `add 1` is a function, but it is not `add`: printing the bare name would
+      -- claim that it takes the arguments it has already been given.
+      r <- runSourceWithInput "print_partial.marr" "" $ T.unlines
+        [ "funct add (x Int) (y Int) : Int = + x y"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (add 1);"
+        , "  sayn (map {x = + x 1});"
+        , "  sayn (add 1 2);"
+        , "  sayn (seq (show (add 1)) '<partial: add>')"
+        ]
+      case r of
+        Left err -> expectationFailure $ "printing a partial application must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["<partial: add>", "<partial: map>", "3", "true"]
+
+    it "prints a lambda as a lambda, since it has no name" $ do
+      r <- runSourceWithInput "print_lambda.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val f = {x = + x 1};"
+        , "  sayn f;"
+        , "  sayn (f 1)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "printing a lambda must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["<lambda>", "2"]
+
+    it "prints a delayed element as its value, not as a thunk" $ do
+      -- Array and record fields hold delayed expressions.  A printed value is
+      -- the value, so the element is forced on the way out instead of showing
+      -- `!vthunk: + 1 2!`.
+      r <- runSourceWithInput "print_thunk.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn [+ 1 2, 3];"
+        , "  sayn #{val a = + 1 2};"
+        , "  sayn (add1, 1)"
+        , ""
+        , "funct add1 (x Int) : Int = + x 1"
+        ]
+      case r of
+        Left err -> expectationFailure $ "printing a delayed element must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["[3, 3]", "#{val a = 3}", "(add1, 1)"]
+
+    it "`trace` shows the value it is given, after its label" $ do
+      -- `app/std.marr` declares `trace : String -> `A -> {Output} `A`, so the
+      -- label is part of the call, and the printed value is what the call
+      -- returns: `sayn (trace 'x' 5)` prints `x: 5` and then `5`.
+      r <- runSourceWithInput "trace_value.marr" "" $ T.unlines
+        [ "funct add1 (x Int) : Int = + x 1"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (trace 'calc' (add1 41));"
+        , "  sayn (trace 'sum' (+ 1 2));"
+        , "  sayn (trace 'fn' add1);"
+        , "  sayn (trace 'arr' [+ 1 2, 3]);"
+        , "  sayn (trace 'rec' #{val a = + 1 2})"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`trace` must take a label and a value: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["calc: 42", "42", "sum: 3", "3", "fn: add1", "add1",
+           "arr: [3, 3]", "[3, 3]", "rec: #{val a = 3}", "#{val a = 3}"]
+
   describe "effects visible where they are declared" $ do
     it "runs an operation from a function that names the effect in its row" $ do
       r <- runSourceWithInput "effect_in_function.marr" "" $ T.unlines

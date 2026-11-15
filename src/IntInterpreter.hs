@@ -104,7 +104,7 @@ instance Show Value where
     VArray as -> concat ["(VArray [", unwords $ map show as, "])"]
     VPair l r -> concat ["(VPair ", show l, " ", show r, ")"]
     VRecord fields -> "!record" <> show fields <> "!"
-    VClosure eid _ _ _ -> "!closure[" <> T.unpack (pretty eid) <> "]!"
+    VClosure _ _ code _ -> T.unpack (codeName code)
     VThunk te _ -> "!vthunk" <> show te <> "!"
     VBThunk b _ -> "!bthunk" <> show b <> "!"
     VBottom -> "!bottom!"
@@ -120,7 +120,7 @@ instance Pretty Value where
     VPair l r -> T.concat ["(", pretty l, ", ", pretty r, ")"]
     VArray vals -> "[" <> T.intercalate ", " (map pretty vals) <> "]"
     VRecord eid -> "!record[" <> pretty eid <> "]!"
-    VClosure eid _ _ _ -> "!closure[" <> pretty eid <> "]!"
+    VClosure _ _ code _ -> codeName code
     VThunk e _env -> T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> T.concat ["!vthunk: ", pretty b,"!"]
     VBottom -> "⊥"
@@ -156,7 +156,7 @@ instance Stringify Value where
             Just p -> do
               e <- getEnv p
               go e bindings'
-    VClosure eid _ _ _ -> pure $ "!closure[" <> pretty eid <> "]!"
+    VClosure _ _ code _ -> pure $ codeName code
     VThunk e _env -> pure $ T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> pure $ T.concat ["!bthunk: ", pretty b,"!"]
     VBottom -> pure "⊥"
@@ -237,7 +237,7 @@ findBindingEnv eid name = do
         Just (eff, arity) -> do
           env <- gets sEnv
           clos <- makeEffectClosure env arity eff name
-          a <- alloc (VClosure env Nothing Nothing clos)
+          a <- alloc (VClosure env Nothing (Just (CodeNative Whole name)) clos)
           pure (env, Val, a)
 
 findBindingEnvMaybe :: EnvId -> Text -> Interp (Maybe (EnvId, Mutability, Address))
@@ -317,9 +317,37 @@ unpackRef :: Env -> Text -> Maybe Address
 unpackRef e x = getRef e x
 
 -- | Код замыкания (нужен, чтобы снимок мог переписать функцию, а не только её данные)
+--
+--   The name is what printing has to say about a function, and it is the only
+--   thing a reader can check: an address or a heap id says nothing, and two
+--   different functions would print alike.  A lambda has no name, so it says
+--   that it is one; @CodeNative@ is the name the library binds a value to, so
+--   a builtin prints as what the program calls it.
+--
+--   'Partial' marks a stage of a curried application.  The name still says
+--   which function it came from, which is what a reader wants, and the word
+--   says that the value is not that function — it is missing arguments.
+data Stage = Whole | Partial
+
 data Code
   = CodeLam IR.Lambda
-  | CodeFun [Text] IR.Block
+  | CodeFun Stage Text [Text] IR.Block
+  | CodeNative Stage Text
+
+-- | How a function prints.  A value with no recorded code (a continuation, an
+--   effect operation built on the fly) says only that it is a function, which
+--   is true and says nothing it cannot support.
+codeName :: Maybe Code -> Text
+codeName = \case
+  Just (CodeFun Whole n _ _) -> n
+  Just (CodeFun Partial n _ _) -> partialName n
+  Just (CodeLam _) -> "<lambda>"
+  Just (CodeNative Whole n) -> n
+  Just (CodeNative Partial n) -> partialName n
+  Nothing -> "<function>"
+
+partialName :: Text -> Text
+partialName n = T.concat ["<partial: ", n, ">"]
 
 -- | События мутации (теорема об эффектах): чтение var, перепривязка, создание var, чтение снимком
 data Event = EvRead | EvRebind | EvCreate | EvSnapRead
@@ -486,12 +514,20 @@ globalOps = [
           liftIO . putStrLn . T.unpack =<< stringify =<< forceValue addrArg
           alloc VNil
         args -> \_ -> arityError "sayn" 1 args),
-      ("trace", Op 1 $ \case
-        [addrArg] -> \_ -> do
-          v <- readCell addrArg
-          liftIO $ putStrLn $ T.unpack $ pretty v
-          pure addrArg
-        args -> \_ -> arityError "trace" 1 args)
+      ("trace", Op 2 $ \case
+        [labelArg, valArg] -> \_ -> do
+          -- `trace` is `app/std.marr`'s `String -> `A -> {Output} `A`: the label
+          -- says where the value came from, and the value is shown, not its
+          -- thunk.  The cell is forced in place and the argument address is
+          -- returned, so the result is the value the label described.
+          label <- forceValue labelArg >>= \case
+            VString s -> pure s
+            other -> stringify other
+          v <- forceValue valArg
+          shown <- stringify v
+          liftIO $ putStrLn $ T.unpack $ T.concat [label, ": ", shown]
+          pure valArg
+        args -> \_ -> arityError "trace" 2 args)
     ]),
     -- `error` has a clause at the bottom of the stack, so `1 / 0` is a
     -- diagnostic even when the program installs no handler of its own; a
@@ -769,7 +805,7 @@ buildInitialEnv _cmdArgs = do
   let allocEffectCall eff (op, o) = do
         env <- gets sEnv
         clos <- makeEffectClosure env o.opArity eff op
-        addr <- alloc $ VClosure env Nothing Nothing clos
+        addr <- alloc $ VClosure env Nothing (Just (CodeNative Whole op)) clos
         pure (op, (Val, addr))
   opBindings <- fmap concat $ forM globalOps $ \(eff, ops) -> mapM (allocEffectCall eff) ops
   let operations = Map.fromList opBindings
@@ -779,16 +815,18 @@ buildInitialEnv _cmdArgs = do
 
       -- Build a curried native function of a given arity.  The closures of the
       -- partially applied stages are allocated on every call, as they were
-      -- when each operation was written out by hand.
-      nativeN :: Int -> ([Address] -> Interp Address) -> Interp Address
-      nativeN n body = go [] n
+      -- when each operation was written out by hand.  Each stage keeps the name
+      -- of the function and says whether it is the whole function or the rest
+      -- of one, so `sayn (map f)` says `map` is applied, not that it is `map`.
+      nativeN :: Text -> Int -> ([Address] -> Interp Address) -> Interp Address
+      nativeN name n body = go [] n Whole
         where
-          go acc 0 = body (reverse acc)
-          go acc k = alloc $ VClosure st.sEnv emptyCache Nothing $ \arg ->
-            go (arg : acc) (k - 1)
+          go acc 0 _ = body (reverse acc)
+          go acc k stage = alloc $ VClosure st.sEnv emptyCache (Just (CodeNative stage name)) $ \arg ->
+            go (arg : acc) (k - 1) Partial
 
-      native1 f = nativeN 1 $ \case [a] -> f a; _ -> arityError "<native>" 1 []
-      native2 f = nativeN 2 $ \case [a, b] -> f a b; _ -> arityError "<native>" 2 []
+      native1 name f = nativeN name 1 $ \case [a] -> f a; _ -> arityError name 1 []
+      native2 name f = nativeN name 2 $ \case [a, b] -> f a b; _ -> arityError name 2 []
 
   -- Reading an argument.  A native operation forces its argument to weak head
   -- normal form and then asks for the value it needs; a wrong shape is a bug in
@@ -822,48 +860,48 @@ buildInitialEnv _cmdArgs = do
         other -> rtError $ "`" <> what <> "` expected an array, but got " <> describe other
 
       intOp :: Text -> (Integer -> Integer -> Integer) -> Interp Address
-      intOp name f = native2 $ \a b ->
+      intOp name f = native2 name $ \a b ->
         withInt name a $ \x -> withInt name b $ \y -> alloc $ VInt (f x y)
 
       intCmp :: Text -> (Integer -> Integer -> Bool) -> Interp Address
-      intCmp name f = native2 $ \a b ->
+      intCmp name f = native2 name $ \a b ->
         withInt name a $ \x -> withInt name b $ \y -> alloc $ VBoolean (f x y)
 
       intFun :: Text -> (Integer -> Integer) -> Interp Address
-      intFun name f = native1 $ \a ->
+      intFun name f = native1 name $ \a ->
         withInt name a $ \x -> alloc $ VInt (f x)
 
       floatOp :: Text -> (Scientific -> Scientific -> Scientific) -> Interp Address
-      floatOp name f = native2 $ \a b ->
+      floatOp name f = native2 name $ \a b ->
         withFloat name a $ \x -> withFloat name b $ \y -> alloc $ VFloat (f x y)
 
       floatCmp :: Text -> (Scientific -> Scientific -> Bool) -> Interp Address
-      floatCmp name f = native2 $ \a b ->
+      floatCmp name f = native2 name $ \a b ->
         withFloat name a $ \x -> withFloat name b $ \y -> alloc $ VBoolean (f x y)
 
       floatFun :: Text -> (Scientific -> Scientific) -> Interp Address
-      floatFun name f = native1 $ \a ->
+      floatFun name f = native1 name $ \a ->
         withFloat name a $ \x -> alloc $ VFloat (f x)
 
       boolOp :: Text -> (Bool -> Bool -> Bool) -> Interp Address
-      boolOp name f = native2 $ \a b ->
+      boolOp name f = native2 name $ \a b ->
         withBool name a $ \x -> withBool name b $ \y -> alloc $ VBoolean (f x y)
 
       -- Short-circuiting boolean connectives: the second argument is only
       -- forced when the first one does not decide the result.
       shortCircuit :: Text -> Bool -> Interp Address
-      shortCircuit name stopOn = native2 $ \a b ->
+      shortCircuit name stopOn = native2 name $ \a b ->
         withBool name a $ \x ->
           if x == stopOn
             then alloc $ VBoolean stopOn
             else withBool name b (alloc . VBoolean)
 
       string2 :: Text -> (Text -> Text -> Text) -> Interp Address
-      string2 name f = native2 $ \a b ->
+      string2 name f = native2 name $ \a b ->
         withString name a $ \x -> withString name b $ \y -> alloc $ VString (f x y)
 
       stringFun :: Text -> (Text -> Text) -> Interp Address
-      stringFun name f = native1 $ \a ->
+      stringFun name f = native1 name $ \a ->
         withString name a $ \x -> alloc $ VString (f x)
 
   -- Integers.  `/` and `%` report a zero divisor through the effect `Error`,
@@ -872,12 +910,12 @@ buildInitialEnv _cmdArgs = do
   plusAddr <- intOp "+" (+)
   minusAddr <- intOp "-" (-)
   timesAddr <- intOp "*" (*)
-  divAddr <- native2 $ \a b ->
+  divAddr <- native2 "/" $ \a b ->
     withInt "/" a $ \x -> withInt "/" b $ \y ->
       if y == 0
         then callError "division by zero"
         else alloc $ VInt (x `quot` y)
-  remAddr <- native2 $ \a b ->
+  remAddr <- native2 "%" $ \a b ->
     withInt "%" a $ \x -> withInt "%" b $ \y ->
       if y == 0
         -- `%` is declared pure, so a zero divisor must not become a catchable
@@ -903,7 +941,7 @@ buildInitialEnv _cmdArgs = do
   fminusAddr <- floatOp "-." (-)
   ftimesAddr <- floatOp "*." (*)
   fdivAddr <- floatOp "/." floatDiv
-  fremAddr <- native2 $ \a b ->
+  fremAddr <- native2 "%." $ \a b ->
     withFloat "%." a $ \x -> withFloat "%." b $ \y ->
       if y == 0
         then programError "division by zero"
@@ -919,52 +957,52 @@ buildInitialEnv _cmdArgs = do
   fleAddr <- floatCmp "<=." (<=)
   fgeAddr <- floatCmp ">=." (>=)
 
-  toIntAddr <- native1 $ \a ->
+  toIntAddr <- native1 "to_int" $ \a ->
     withFloat "to_int" a $ \x -> alloc $ VInt (truncate x)
-  toFloatAddr <- native1 $ \a ->
+  toFloatAddr <- native1 "to_float" $ \a ->
     withInt "to_float" a $ \x -> alloc $ VFloat (fromInteger x)
 
   -- Strings.
   concatAddr <- string2 "++" (<>)
-  slenAddr <- native1 $ \a ->
+  slenAddr <- native1 "slen" $ \a ->
     withString "slen" a $ \s -> alloc $ VInt (fromIntegral (T.length s))
   -- start, length, string: characters outside the string are dropped, so a
   -- slice never fails and `sub 0 n s` is a prefix of `s` of length `n`.
-  subAddr <- nativeN 3 $ \case
+  subAddr <- nativeN "sub" 3 $ \case
     [startA, lenA, sA] -> do
       start <- withInt "sub" startA pure
       len <- withInt "sub" lenA pure
       withString "sub" sA $ \s ->
         alloc $ VString $ T.take (fromInteger (max 0 len)) $ T.drop (fromInteger (max 0 start)) s
     args -> arityError "sub" 3 args
-  splitAddr <- native2 $ \a b ->
+  splitAddr <- native2 "split" $ \a b ->
     withString "split" a $ \sep -> withString "split" b $ \s -> do
       xs <- mapM (alloc . VString) $ if T.null sep then [s] else T.splitOn sep s
       alloc $ VArray xs
-  joinAddr <- native2 $ \a b ->
+  joinAddr <- native2 "join" $ \a b ->
     withString "join" a $ \sep -> withArray "join" b $ \xs -> do
       parts <- mapM (\x -> withString "join" x pure) xs
       alloc $ VString (T.intercalate sep parts)
   trimAddr <- stringFun "trim" T.strip
   upperAddr <- stringFun "upper" T.toUpper
   lowerAddr <- stringFun "lower" T.toLower
-  containsAddr <- native2 $ \a b ->
+  containsAddr <- native2 "contains" $ \a b ->
     withString "contains" a $ \needle -> withString "contains" b $ \hay ->
       alloc $ VBoolean (needle `T.isInfixOf` hay)
-  replaceAddr <- nativeN 3 $ \case
+  replaceAddr <- nativeN "replace" 3 $ \case
     [fromA, toA, sA] -> do
       from <- withString "replace" fromA pure
       to <- withString "replace" toA pure
       withString "replace" sA $ \s ->
         alloc $ VString (if T.null from then s else T.replace from to s)
     args -> arityError "replace" 3 args
-  seqAddr <- native2 $ \a b ->
+  seqAddr <- native2 "seq" $ \a b ->
     withString "seq" a $ \x -> withString "seq" b $ \y -> alloc $ VBoolean (x == y)
-  sneqAddr <- native2 $ \a b ->
+  sneqAddr <- native2 "sneq" $ \a b ->
     withString "sneq" a $ \x -> withString "sneq" b $ \y -> alloc $ VBoolean (x /= y)
 
   -- Booleans.
-  notAddr <- native1 $ \a ->
+  notAddr <- native1 "not" $ \a ->
     withBool "not" a $ \x -> alloc $ VBoolean (not x)
   orAddr <- shortCircuit "||" True
   andAddr <- shortCircuit "&&" False
@@ -976,10 +1014,10 @@ buildInitialEnv _cmdArgs = do
   -- examples of the paper use it, and it means the same as `&&`.
   legacyAndAddr <- shortCircuit "and" False
 
-  forceAddr <- alloc $ VClosure st.sEnv emptyCache Nothing force
-  whnfBuiltinAddr <- alloc $ VClosure st.sEnv emptyCache Nothing whnf
+  forceAddr <- alloc $ VClosure st.sEnv emptyCache (Just (CodeNative Whole "force")) force
+  whnfBuiltinAddr <- alloc $ VClosure st.sEnv emptyCache (Just (CodeNative Whole "whnf")) whnf
   predAddr <- intFun "pred" (subtract 1)
-  assertAddr <- native2 $ \a b ->
+  assertAddr <- native2 "assert" $ \a b ->
     withBool "assert" a $ \ok ->
       if ok
         then alloc VNil
@@ -1021,21 +1059,21 @@ buildInitialEnv _cmdArgs = do
       applyBool :: Text -> Address -> Address -> Interp Bool
       applyBool what f x = applyTo what f x >>= \v -> withBool what v pure
 
-  idAddr <- native1 pure
-  constAddr <- nativeN 2 $ \case
+  idAddr <- native1 "id" pure
+  constAddr <- nativeN "const" 2 $ \case
     [a, _] -> pure a
     args -> arityError "const" 2 args
-  flipAddr <- nativeN 3 $ \case
+  flipAddr <- nativeN "flip" 3 $ \case
     [f, b, a] -> applyTo "flip" f a >>= \g -> applyTo "flip" g b
     args -> arityError "flip" 3 args
-  composeAddr <- nativeN 3 $ \case
+  composeAddr <- nativeN "compose" 3 $ \case
     [g, f, x] -> applyTo "compose" f x >>= applyTo "compose" g
     args -> arityError "compose" 3 args
-  applyAddr <- native2 $ \f x -> applyTo "apply" f x
-  curryAddr <- nativeN 3 $ \case
+  applyAddr <- native2 "apply" $ \f x -> applyTo "apply" f x
+  curryAddr <- nativeN "curry" 3 $ \case
     [f, a, b] -> pairOf a b >>= applyTo "curry" f
     args -> arityError "curry" 3 args
-  uncurryAddr <- native2 $ \f p -> do
+  uncurryAddr <- native2 "uncurry" $ \f p -> do
     p' <- whnf p
     v <- readCell p'
     case v of
@@ -1045,31 +1083,31 @@ buildInitialEnv _cmdArgs = do
   -- Empty arrays are a program-level mistake, not an interpreter bug, and
   -- `head`/`tail` are declared pure, so it is reported as a diagnostic (E0020)
   -- rather than through the catchable `Error` effect.
-  headAddr <- native1 $ \a -> withArray "head" a $ \case
+  headAddr <- native1 "head" $ \a -> withArray "head" a $ \case
     [] -> programError "`head` of an empty array"
     (x:_) -> pure x
-  tailAddr <- native1 $ \a -> withArray "tail" a $ \case
+  tailAddr <- native1 "tail" $ \a -> withArray "tail" a $ \case
     [] -> programError "`tail` of an empty array"
     (_:xs) -> alloc $ VArray xs
-  emptyAddr <- native1 $ \a -> withArray "empty" a $ \xs -> alloc $ VBoolean (null xs)
-  alenAddr <- native1 $ \a -> withArray "alen" a $ \xs -> alloc $ VInt (fromIntegral (length xs))
-  mapAddr <- native2 $ \f a -> withArray "map" a $ \xs -> do
+  emptyAddr <- native1 "empty" $ \a -> withArray "empty" a $ \xs -> alloc $ VBoolean (null xs)
+  alenAddr <- native1 "alen" $ \a -> withArray "alen" a $ \xs -> alloc $ VInt (fromIntegral (length xs))
+  mapAddr <- native2 "map" $ \f a -> withArray "map" a $ \xs -> do
     ys <- mapM (applyTo "map" f) xs
     alloc $ VArray ys
-  filterAddr <- native2 $ \f a -> withArray "filter" a $ \xs -> do
+  filterAddr <- native2 "filter" $ \f a -> withArray "filter" a $ \xs -> do
     flags <- mapM (applyBool "filter" f) xs
     alloc $ VArray [x | (x, True) <- zip xs flags]
-  anyAddr <- native2 $ \f a -> withArray "any" a $ \xs -> do
+  anyAddr <- native2 "any" $ \f a -> withArray "any" a $ \xs -> do
     flags <- mapM (applyBool "any" f) xs
     alloc $ VBoolean (or flags)
-  allAddr <- native2 $ \f a -> withArray "all" a $ \xs -> do
+  allAddr <- native2 "all" $ \f a -> withArray "all" a $ \xs -> do
     flags <- mapM (applyBool "all" f) xs
     alloc $ VBoolean (and flags)
-  foldlAddr <- nativeN 3 $ \case
+  foldlAddr <- nativeN "foldl" 3 $ \case
     [f, z, a] -> withArray "foldl" a $ \xs ->
       foldM (\acc x -> applyTo "foldl" f acc >>= \g -> applyTo "foldl" g x) z xs
     args -> arityError "foldl" 3 args
-  foldrAddr <- nativeN 3 $ \case
+  foldrAddr <- nativeN "foldr" 3 $ \case
     [f, z, a] -> withArray "foldr" a $ \xs -> do
       -- Folded from the right: the accumulator is the last element first.
       let step acc x = do
@@ -1077,14 +1115,14 @@ buildInitialEnv _cmdArgs = do
             applyTo "foldr" g acc
       foldM step z (reverse xs)
     args -> arityError "foldr" 3 args
-  concatAddr' <- native1 $ \a -> withArray "concat" a $ \xs -> do
+  concatAddr' <- native1 "concat" $ \a -> withArray "concat" a $ \xs -> do
     parts <- mapM (\x -> withArray "concat" x pure) xs
     alloc $ VArray (concat parts)
-  zipAddr <- native2 $ \a b -> withArray "zip" a $ \as ->
+  zipAddr <- native2 "zip" $ \a b -> withArray "zip" a $ \as ->
     withArray "zip" b $ \bs -> do
       pairs <- mapM (uncurry pairOf) (zip as bs)
       alloc $ VArray pairs
-  atAddr <- native2 $ \a i -> withArray "at" a $ \xs ->
+  atAddr <- native2 "at" $ \a i -> withArray "at" a $ \xs ->
     withInt "at" i $ \n ->
       if n >= 0 && n < fromIntegral (length xs)
         then pure (xs !! fromIntegral n)
@@ -1092,20 +1130,20 @@ buildInitialEnv _cmdArgs = do
             "`at`: index ", T.pack (show n), " is out of range for an array of ",
             T.pack (show (length xs)), if length xs == 1 then " element" else " elements"
           ]
-  takeAddr <- native2 $ \n a -> withInt "take" n $ \k ->
+  takeAddr <- native2 "take" $ \n a -> withInt "take" n $ \k ->
     withArray "take" a $ \xs ->
       alloc $ VArray (take (max 0 (fromIntegral k)) xs)
-  dropAddr <- native2 $ \n a -> withInt "drop" n $ \k ->
+  dropAddr <- native2 "drop" $ \n a -> withInt "drop" n $ \k ->
     withArray "drop" a $ \xs ->
       alloc $ VArray (drop (max 0 (fromIntegral k)) xs)
 
-  fstAddr <- native1 $ \p -> do
+  fstAddr <- native1 "fst" $ \p -> do
     p' <- whnf p
     v <- readCell p'
     case v of
       VPair l _ -> pure l
       other -> rtError $ "`fst` expected a pair, but got " <> describe other
-  sndAddr <- native1 $ \p -> do
+  sndAddr <- native1 "snd" $ \p -> do
     p' <- whnf p
     v <- readCell p'
     case v of
@@ -1114,7 +1152,7 @@ buildInitialEnv _cmdArgs = do
 
   -- `show` is `say` without the line: the value is forced, because a printed
   -- value is its text, not a reference to a cell.
-  showAddr <- native1 $ \a -> do
+  showAddr <- native1 "show" $ \a -> do
     s <- force a >>= stringify
     alloc $ VString s
 
@@ -1123,7 +1161,7 @@ buildInitialEnv _cmdArgs = do
   -- its value.  The handler is pushed and popped here rather than built by
   -- `TEHandle`, because the body is a value the program passes, not a block the
   -- checker saw: nothing about it is known until it runs.
-  tryAddr <- native2 $ \body onError -> do
+  tryAddr <- native2 "try" $ \body onError -> do
     env <- gets sEnv
     kstack0 <- gets sKstack
     handlerId <- gets sNextHandler
@@ -1325,7 +1363,7 @@ evalChunk chunk = do
           _ -> Just IM.empty
     fn <- makeTopLevelClosure env0 fd
     void $ bindValIn env0 fd.fName $ VClosure env0 cache
-          (Just (CodeFun (map fst $ IR.fArgs fd) (IR.fBlock fd))) fn
+          (Just (CodeFun Whole fd.fName (map fst $ IR.fArgs fd) (IR.fBlock fd))) fn
 
   let mainDecl = findMain chunk
   case mainDecl of
@@ -1345,7 +1383,8 @@ findMain = find $ \case
   _ -> False
 
 makeTopLevelClosure :: EnvId -> IR.FunctDecl -> Interp (Address -> Interp Address)
-makeTopLevelClosure env fd = makeClosureChain env (map fst $ IR.fArgs fd) (IR.fBlock fd)
+makeTopLevelClosure env fd =
+  makeClosureChain env fd.fName (map fst $ IR.fArgs fd) (IR.fBlock fd)
 
 -- | A curried function, as nested lambdas: each argument extends the scope of
 --   the previous one, and the first extends the scope where the function is
@@ -1353,10 +1392,10 @@ makeTopLevelClosure env fd = makeClosureChain env (map fst $ IR.fArgs fd) (IR.fB
 --   call sees only its lexical parents, and a tail call would otherwise append
 --   the caller's environment to the callee's, which made a long loop grow
 --   without bound.
-makeClosureChain :: EnvId -> [Text] -> IR.Block -> Interp (Address -> Interp Address)
-makeClosureChain _ [] _ =
+makeClosureChain :: EnvId -> Text -> [Text] -> IR.Block -> Interp (Address -> Interp Address)
+makeClosureChain _ _ [] _ =
   rtError "internal error: a top-level function was declared with no arguments"
-makeClosureChain env [argName] block = pure $ \argAddr -> do
+makeClosureChain env _ [argName] block = pure $ \argAddr -> do
   outer <- gets sEnv
   eid <- newEnv Env {
       bindings = Map.singleton argName (Val, argAddr),
@@ -1366,7 +1405,7 @@ makeClosureChain env [argName] block = pure $ \argAddr -> do
   result <- evalBlock block pure
   modify $ \s -> s {sEnv = outer}
   pure result
-makeClosureChain env (argName:rest) block = pure $ \argAddr -> do
+makeClosureChain env name (argName:rest) block = pure $ \argAddr -> do
   outer <- gets sEnv
   eid <- newEnv Env {
       bindings = Map.singleton argName (Val, argAddr),
@@ -1374,8 +1413,10 @@ makeClosureChain env (argName:rest) block = pure $ \argAddr -> do
     }
   modify $ \s -> s {sEnv = eid}
   -- The rest of the function closes over this argument's scope.
-  restClosure <- makeClosureChain eid rest block
-  result <- allocClosure eid (Just IM.empty) (CodeFun rest block) restClosure
+  restClosure <- makeClosureChain eid name rest block
+  -- The closure this stage returns is the rest of the function, not the
+  -- function: it is missing an argument, and printing says so.
+  result <- allocClosure eid (Just IM.empty) (CodeFun Partial name rest block) restClosure
   modify $ \s -> s {sEnv = outer}
   pure result
 
@@ -1525,7 +1566,7 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
         opsEnv <- newEnv Env {bindings = Map.empty, parent = Just env}
         forM_ clauses $ \(name, _, _, arity) -> do
           fn <- makeEffectClosure opsEnv arity fx name
-          void $ bindValIn opsEnv name (VClosure opsEnv (Just IM.empty) Nothing fn)
+          void $ bindValIn opsEnv name (VClosure opsEnv (Just IM.empty) (Just (CodeNative Whole name)) fn)
         modify $ \s -> s {sEnv = opsEnv, sKstack = handler : s.sKstack}
         -- The body is evaluated to weak head normal form while the handler is
         -- still installed: a thunk returned by the body must not escape and
@@ -1710,7 +1751,7 @@ makeEffectClosure env arity eff op =
     go acc n =
       pure $ \arg -> case n of
         1 -> callEffect eff op $ reverse (arg : acc)
-        _ -> alloc . VClosure env (Just IM.empty) Nothing =<< go (arg : acc) (n - 1)
+        _ -> alloc . VClosure env (Just IM.empty) (Just (CodeNative Partial op)) =<< go (arg : acc) (n - 1)
 
 makeClause ::
   Int                             -- the handler that owns the clauses
@@ -1905,7 +1946,10 @@ snapshotEnv scope names = do
 codeFreeVars :: Code -> Set Text
 codeFreeVars = \case
   CodeLam lam -> Set.delete lam.lArg (freeVarsBlock lam.lBlock)
-  CodeFun args block -> foldr Set.delete (freeVarsBlock block) args
+  CodeFun _ _ args block -> foldr Set.delete (freeVarsBlock block) args
+  -- A native function's code is Haskell, not a block: it closes over nothing
+  -- the snapshot has to rewrite.
+  CodeNative _ _ -> Set.empty
 
 -- | Переписанный код и функция, собранная из него в окружении env'
 freezeCode :: EnvId -> Code -> Interp (Code, Address -> Interp Address)
@@ -1914,10 +1958,14 @@ freezeCode env' = \case
     let lam' = freezeLambda lam
     fn <- evalLambda env' lam'
     pure (CodeLam lam', fn)
-  CodeFun args block -> do
+  CodeFun stage name args block -> do
     let block' = freezeBlock block
-    fn <- makeClosureChain env' args block'
-    pure (CodeFun args block', fn)
+    fn <- makeClosureChain env' name args block'
+    pure (CodeFun stage name args block', fn)
+  CodeNative _ name -> do
+    -- Unreachable: 'freezeCell' keeps a native function as the atom it is,
+    -- because it captures no bindings for a snapshot to copy.
+    rtError $ "internal error: a snapshot tried to copy the native function `" <> name <> "`"
 
 -- | Замороженная копия ячейки (модель: freezeV). Копирование транзитивно: данные,
 --  thunk'и и код замыканий, достижимые по свободным переменным. Общая таблица
@@ -1940,6 +1988,10 @@ freezeCell a = do
             -- names its effect in its captured Haskell function, and the
             -- interpreter never reads the bindings of their env to apply them.
             Nothing -> share a
+            -- A native function is an atom for the same reason: its code is
+            -- Haskell and it captures no bindings, so a snapshot can keep the
+            -- very value instead of rebuilding it.
+            Just (CodeNative _ _) -> share a
             Just code0 -> do
               a' <- placeholder
               env' <- snapshotEnv env (codeFreeVars code0)

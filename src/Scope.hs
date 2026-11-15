@@ -369,9 +369,9 @@ globalScope _args = do
     tryA <- freshMetaM
     tryR <- freshMetaM
 
-    let t x = TVar x
+    let t = TVar
         -- a function whose latent row is `rw`; an empty row is a pure one
-        fn i o = tfunc i o
+        fn = tfunc
         fnR i o rw = TFunct (Funct i o (RVar rw))
         -- an array of `x` whose elements may cost `rw`
         arr x rw = TArray (TVar x) (RVar rw)
@@ -551,7 +551,10 @@ globalScope _args = do
         , quantified "whnf" [boundWhnf] $ TFunct $ Funct tWhnf tWhnf Eff.empty
         , quantified "say" [boundSay] $ TFunct $ Funct tSay TNil Eff.fxOutput
         , quantified "sayn" [boundSayn] $ TFunct $ Funct tSayn TNil Eff.fxOutput
-        , quantified "trace" [boundTrace] $ TFunct $ Funct tTrace tTrace Eff.fxOutput
+        -- `trace 'label' v`: the label is ordinary text, the value comes back
+        -- unchanged, so `app/std.marr` declares it `String -> `A -> {Output} `A`.
+        , quantified "trace" [boundTrace] $
+            TFunct $ Funct TString (TFunct $ Funct tTrace tTrace Eff.fxOutput) Eff.empty
         , operation "read_int" TNil TInt ["Input"]
         , operation "read_string" TNil TString ["Input"]
         , operation "read_float" TNil TFloat ["Input"]
