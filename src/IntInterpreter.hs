@@ -945,7 +945,11 @@ buildInitialEnv _cmdArgs = do
     withFloat "%." a $ \x -> withFloat "%." b $ \y ->
       if y == 0
         then programError "division by zero"
-        else alloc $ VFloat (x - y * fromInteger (truncate (x / y)))
+        -- The quotient must be computed on `Rational`, not on `Scientific`:
+        -- `Scientific`'s `Fractional` instance goes through `fromRational`,
+        -- which throws on a repeating decimal, so `5.7 %. 6.28` would crash
+        -- the interpreter instead of returning a Float.
+        else alloc $ VFloat (x - y * fromInteger (truncate (toRational x / toRational y)))
   fnegAddr <- floatFun "fneg" negate
   fabsAddr <- floatFun "fabs" abs
   fmaxAddr <- floatOp "fmax" max

@@ -1171,6 +1171,21 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Right out -> filter (not . isReport) (lines out) `shouldBe`
           ["5", "caught: division by zero", "0"]
 
+    it "takes a remainder of decimals whose quotient repeats" $ do
+      -- `%.` computed the quotient with `Scientific`'s `Fractional` instance,
+      -- which goes through `fromRational` and throws on a repeating decimal:
+      -- `5.7 %. 6.28` killed the interpreter instead of returning 5.7.
+      r <- runSourceWithInput "decimal_remainder.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn (5.7 `%.` 6.28);"
+        , "  sayn (fneg 7.5 `%.` 2.0);"
+        , "  sayn (6.28 `%.` 2.0)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`%.` must not crash on 5.7 %. 6.28: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["5.7", "-1.5", "0.28"]
+
     it "an uncaught `error` is a diagnostic with a code of its own" $ do
       r <- runSourceWithInput "uncaught_error.marr" "" $ T.unlines
         [ "funct main () : {Output; Error} () ="
