@@ -88,7 +88,7 @@ walkStat st@(BlockStat sp n) =
     <> case n of
       BExpNode e -> walkExp e
       BBindDefNode b -> walkBindDef b
-      BAssignNode (Assign _ e) -> walkExp e
+      BAssignNode (Assign _ _ e) -> walkExp e
 
 spanCheck :: String -> Span -> [Bad]
 spanCheck what sp

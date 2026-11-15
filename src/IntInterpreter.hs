@@ -1490,14 +1490,16 @@ evalStat stat = atSpan (IR.tStatSpan stat) $ case stat of
         a <- alloc $ VThunk t eid
         when (m == Var) $ logEvent EvCreate
         void $ extendEnv n m a
-  IR.Rebind n t -> do
-    env <- gets sEnv
-    m <- lookupMut env n
-    case m of
-      Var -> void $ rebind n t
-      _ -> rtError $ T.concat [
-          "cannot assign to `", n, "`: it is bound with `", pretty m, "`"
-        ]
+  IR.Rebind n path t -> case path of
+    [] -> do
+      env <- gets sEnv
+      m <- lookupMut env n
+      case m of
+        Var -> void $ rebind n t
+        _ -> rtError $ T.concat [
+            "cannot assign to `", n, "`: it is bound with `", pretty m, "`"
+          ]
+    _ -> void $ rebindPath n path t
   IR.Expr t -> do
     -- модель (S-Expr): оператор-выражение вычисляется до слабой головной нормальной формы;
     -- иначе эффекты в отложенных ветках if и в скобках (...) никогда не выполнятся
@@ -1646,6 +1648,86 @@ rebind x t = do
         "cannot assign to `", x, "`: it is bound with `", pretty m, "`"
       ]
 
+-- | @r@a := t@ and @r@a@b := t@.
+--
+--   The right-hand side is delayed, as it is for a plain rebinding, and it sees
+--   the value the assigned field had before the write.  A field is not a
+--   binding of the current environment, so the old state is presented to the
+--   right-hand side as a shallow copy of every record along the path: the copy
+--   keeps the fields as they are now, and the assigned field of the innermost
+--   copy is the cell that is about to be replaced.  A write to any field of
+--   these records from inside the right-hand side lands in the copy and is not
+--   visible afterwards; that is the price of reading the old state without a
+--   snapshot of the whole store.
+rebindPath :: Text -> [Text] -> TypedExpr -> Interp Address
+rebindPath name names t = do
+  e <- gets sEnv
+  (_, m, addr) <- findBindingEnv e name
+  -- The name is read to reach the record, so a `var` one costs `Read`; the
+  -- assigned field is not read, just as `x := e` does not read `x`.
+  when (m == Var) $ logEvent EvRead
+  levels <- walk addr names
+  -- The copies are built from the inside out: the innermost copy keeps its
+  -- bindings, so the right-hand side reads the assigned field's old value, and
+  -- every outer copy points its own path field at the copy below it.
+  outerAddr <- buildCopies Nothing (reverse levels)
+  rhsEnv <- newEnv Env {
+    bindings = Map.singleton name (m, outerAddr),
+    parent = Just e
+  }
+  let (targetEnv, targetField, _, _) = head (reverse levels)
+  addr' <- alloc $ VThunk t rhsEnv
+  _ <- modifyEnv targetEnv $ \env ->
+    env {bindings = Map.insert targetField (Var, addr') env.bindings}
+  logEvent EvRebind
+  pure addr'
+  where
+    lhs = T.concat [name, T.concat (map (T.append "@") names)]
+
+    -- Every record along the path, from the outermost to the innermost, with
+    -- the field the path takes, that field's mutability and the cell it
+    -- currently holds.
+    walk :: Address -> [Text] -> Interp [(EnvId, Text, Mutability, Address)]
+    walk recAddr path = case path of
+      [] -> rtError $ "internal error: an empty assignment path at `" <> lhs <> "`"
+      (field : rest) -> do
+        recAddr' <- whnf recAddr
+        v <- readCell recAddr'
+        case v of
+          VRecord eid -> do
+            env <- getEnv eid
+            case getCell env field of
+              Nothing -> rtError $ T.concat [
+                  "the record at `", name, "` has no field `", field,
+                  "`, so `", lhs, "` cannot be assigned"
+                ]
+              Just (fm, fa) -> case rest of
+                [] -> pure [(eid, field, fm, fa)]
+                _ -> do
+                  when (fm == Var) $ logEvent EvRead
+                  ((eid, field, fm, fa) :) <$> walk fa rest
+          other -> rtError $ T.concat [
+              "cannot assign to `", lhs, "`: ",
+              describe other, " is not a record, so it has no field `", field, "`"
+            ]
+
+    -- Shallow copies, innermost first, each one's path field pointing at the
+    -- copy below it.  Returns the address of the outermost copy.
+    buildCopies :: Maybe Address -> [(EnvId, Text, Mutability, Address)] -> Interp Address
+    buildCopies _ [] = rtError "internal error: an assignment path is empty"
+    buildCopies inner ((eid, field, fm, _) : rest) = do
+      env <- getEnv eid
+      let bindings' = case inner of
+            -- The innermost copy is not rewritten: its assigned field is the
+            -- old cell the right-hand side must see.
+            Nothing -> env.bindings
+            Just a -> Map.insert field (fm, a) env.bindings
+      eid' <- newEnv Env {bindings = bindings', parent = Nothing}
+      addr' <- alloc (VRecord eid')
+      case rest of
+        [] -> pure addr'
+        _ -> buildCopies (Just addr') rest
+
 -- | Трассировка вычислений: включается переменной окружения MARRAN_TRACE
 traceEval :: String -> Interp ()
 traceEval msg = do
@@ -1772,13 +1854,13 @@ freeVarsBlock (stats, expr) = go Set.empty stats
       in Set.union fvS (go bound' ss)
     statFree bound = \case
       IR.Bind _ n e -> (Set.difference (freeVars e) bound, Set.insert n bound)
-      IR.Rebind n e -> (Set.difference (Set.insert n (freeVars e)) bound, bound)
+      IR.Rebind n _ e -> (Set.difference (Set.insert n (freeVars e)) bound, bound)
       IR.Expr e -> (Set.difference (freeVars e) bound, bound)
 
 freeVarsStat :: IR.Stat -> Set.Set Text
 freeVarsStat = \case
   IR.Bind _ _ e -> freeVars e
-  IR.Rebind _ e -> freeVars e
+  IR.Rebind _ _ e -> freeVars e
   IR.Expr e -> freeVars e
 
 freeVarsHandler :: IR.Handler -> Set.Set Text

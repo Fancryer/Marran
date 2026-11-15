@@ -233,7 +233,7 @@ substituteBlock scope (stats, expr) = do
 substituteStat :: Scope -> TypedIR.Stat -> TypeCheckM TypedIR.Stat
 substituteStat scope = \case
   TypedIR.Bind mut n e -> TypedIR.Bind mut n <$> substituteTypedExpr scope e
-  TypedIR.Rebind n e -> TypedIR.Rebind n <$> substituteTypedExpr scope e
+  TypedIR.Rebind n path e -> TypedIR.Rebind n path <$> substituteTypedExpr scope e
   TypedIR.Expr e -> TypedIR.Expr <$> substituteTypedExpr scope e
 
 substituteHandler :: Scope -> TypedIR.Handler -> TypeCheckM TypedIR.Handler
@@ -269,7 +269,7 @@ countResumeInBlock (stats, e) =
 countResumeInStat :: Types.Stat -> ResumeInfo
 countResumeInStat = \case
   Types.Expr e -> countResumeInExpr e
-  Types.Assign _ e -> countResumeInExpr e
+  Types.Assign _ _ e -> countResumeInExpr e
   Types.Bind _ _ _ e -> countResumeInExpr e
 
 countResumeInExpr :: Expr -> ResumeInfo
@@ -1431,21 +1431,85 @@ inferStatNode scope stat =
         (TypedIR.Bind m n exprForBinding)
         finalFxs
         scope5
-  Types.Assign n e -> do
+  Types.Assign n path e -> do
     (scheme, mut, pending) <- case Scope.findBindingWithRow True scope n of
       Nothing -> throwTypeCheckErrorWithNotes (UndefinedVariable n)
         (maybe [] pure (suggestionNote (Scope.bindingNames scope) n))
       Just (ValueBinding scheme _ mut' row) -> pure (scheme, mut', row)
-    when (mut /= Var) $ throwTypeCheckError $ ImmutableVariableAssignment n
-    (varT, scope') <- instantiateTypeScheme scope scheme
-    InferResult eT eFxs scope'' <- inferExpr scope' e
+    (varT, pending', scope') <- instantiateTypeSchemeWithRow scope scheme pending
+    -- A plain `x := e` rebinds `x` without reading it (T-Rebind).  A path
+    -- assignment has to reach the record first, so the name and the fields on
+    -- the way are read like any other use: their pending row is charged, and a
+    -- `var` one costs `Read`.
+    (scopeW, fieldT, fieldMut, walkedFxs) <- case path of
+      [] -> pure (scope', varT, mut, Eff.empty)
+      _ -> walkAssignmentPath scope' varT path
+            (Eff.unionEffRows pending' (readIfVar mut))
+    when (fieldMut /= Var) $ throwTypeCheckError $
+      ImmutableVariableAssignment (prettyPath n path)
+    InferResult eT eFxs scope'' <- inferExpr scopeW e
     eT' <- typeOfTypedExprUnsafe eT
     -- T-Rebind: the right-hand side is delayed, so its row and its mention row
-    -- must fit into the pending row chosen for the variable.
+    -- must fit into the row that will run it.  For `x := e` that is the pending
+    -- row of the variable, which a `var` binding leaves open and grows with
+    -- every assignment.  For `r@a := e` it is the row the walk already paid: the
+    -- right-hand side runs against the copies the walk made, so reaching the
+    -- field -- the owner's pending row, `Read` for the `var` fields on the way
+    -- and whatever forcing the record itself costs -- is a cost of the
+    -- assignment, not of the delayed value.  That is why `+ r@a 1` needs no
+    -- annotation on `r` beyond what reaching the field already required.
     men <- mentionRow scope'' (fvTyped eT)
-    scopeRow <- subsumesEffRow scope'' (Eff.unionEffRows eFxs men) pending
-    let finalFxs = Eff.unionEffRows eFxs $ Eff.closedOfFlat "Rebind"
-    InferResult (TypedIR.Rebind n eT) finalFxs <$> unifyTypes scopeRow varT eT'
+    let allowed = if null path then pending' else walkedFxs
+    scopeRow <- subsumesEffRow scope'' (Eff.unionEffRows eFxs men) allowed
+    let finalFxs = Eff.unionEffRows
+          (Eff.unionEffRows eFxs walkedFxs)
+          (Eff.closedOfFlat "Rebind")
+    scopeU <- unifyTypes scopeRow fieldT eT'
+    pure $ InferResult (TypedIR.Rebind n path eT) finalFxs scopeU
+
+-- | Walk the fields of a path assignment and return the slot that is written:
+--   its type, its mutability and the row the walk costs.
+--
+--   Every field on the way is read, so each step charges the pending row of the
+--   record and, for a `var` field, `Read`.  The assigned field itself is written
+--   without being read, just as `x := e` does not read `x`; the row therefore
+--   ends with the pending row of the record that owns it, because that is what
+--   forces the field the right-hand side is about to replace.
+walkAssignmentPath :: Scope -> Typ -> [Text] -> EffRow -> TypeCheckM (Scope, Typ, Mutability, EffRow)
+walkAssignmentPath scope typ names fxs = case names of
+  [] -> throwTypeCheckError $ InferenceError "internal error: an empty assignment path"
+  [field] -> do
+    (scope', pending, prop) <- fieldSlot scope typ field
+    pure (scope', tTyp prop, tMut prop, Eff.unionEffRows fxs pending)
+  (field : rest) -> do
+    (scope', pending, prop) <- fieldSlot scope typ field
+    walkAssignmentPath scope' (tTyp prop) rest
+      (Eff.unionEffRows (Eff.unionEffRows fxs pending) (readIfVar (tMut prop)))
+
+-- | Resolve one field of a record type: the substituted scope, the record's
+--   pending row and the field itself.
+fieldSlot :: Scope -> Typ -> Text -> TypeCheckM (Scope, EffRow, TRecordProp)
+fieldSlot scope typ field = do
+  typ' <- applyTypeSubst scope typ
+  case typ' of
+    TRecord props pending -> do
+      pending' <- applyEffRowSubst scope pending
+      case find ((field ==) . tName) props of
+        Just prop -> pure (scope, pending', prop)
+        Nothing -> throwTypeCheckErrorWithNotes
+          (RecordError $ "this record has no field `" <> field <> "`")
+          (maybe [] pure (suggestionNote (map tName props) field))
+    _ -> throwTypeCheckError $ RecordError $ T.pack
+      $ printf "cannot assign to the field `%s` of a value of type `%s`; only records have fields"
+          field (pretty typ')
+
+readIfVar :: Mutability -> EffRow
+readIfVar m = if m == Var then Eff.closedOfFlat "Read" else Eff.empty
+
+-- | @r@a@b@ for diagnostics: the name and every field, in the spelling the
+--   program used.
+prettyPath :: Text -> [Text] -> Text
+prettyPath n path = T.concat [n, T.concat (map (T.append "@") path)]
 
 generalize :: Scope -> Typ -> TypeCheckM TypeScheme
 generalize scope typ = do
@@ -1673,7 +1737,7 @@ isFrozenBlock (stats, expr) = all stat stats && isFrozenExpr expr
   where
     stat = \case
       TypedIR.Bind m _ e -> m /= Var && isFrozenExpr e
-      TypedIR.Rebind _ _ -> False
+      TypedIR.Rebind _ _ _ -> False
       TypedIR.Expr e -> isFrozenExpr e
 
 -- | Упоминание (модель: Men): Read, если среди переменных есть несущая состояние.
@@ -1712,7 +1776,7 @@ fvTypedBlock (stats, expr) = go Set.empty stats
       in Set.union fvS (go bound' ss)
     stat bound = \case
       TypedIR.Bind _ n e -> (Set.difference (fvTyped e) bound, Set.insert n bound)
-      TypedIR.Rebind n e -> (Set.difference (Set.insert n (fvTyped e)) bound, bound)
+      TypedIR.Rebind n _ e -> (Set.difference (Set.insert n (fvTyped e)) bound, bound)
       TypedIR.Expr e -> (Set.difference (fvTyped e) bound, bound)
 
 -- | Может ли значение этого типа держать изменяемое состояние (замыкание, запись,
@@ -1753,7 +1817,7 @@ reachNames stats result = grow (fvTyped result)
       in if acc' == acc then acc else grow acc'
     step acc = \case
       TypedIR.Bind m n e | m /= Imm, Set.member n acc -> Set.union acc (fvTyped e)
-      TypedIR.Rebind n e | Set.member n acc -> Set.union acc (fvTyped e)
+      TypedIR.Rebind n _ e | Set.member n acc -> Set.union acc (fvTyped e)
       _ -> acc
 
 createsCell :: TypedExpr -> Bool
@@ -1947,7 +2011,7 @@ freezeBlock (st, e) = (map freezeStat st, freeze e)
 freezeStat :: TypedIR.Stat -> TypedIR.Stat
 freezeStat = \case
   TypedIR.Bind m n t -> TypedIR.Bind (freezeMutability m) n $ freeze t
-  TypedIR.Rebind _ t -> TypedIR.Expr $ freeze t
+  TypedIR.Rebind _ _ t -> TypedIR.Expr $ freeze t
   TypedIR.Expr t -> TypedIR.Expr $ freeze t
 
 freezeHandler :: TypedIR.Handler -> TypedIR.Handler

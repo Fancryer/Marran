@@ -305,7 +305,7 @@ pattern BBindDef b <- BlockStat _ (BBindDefNode b) where
 
 pattern BAssign :: Assign -> BlockStat
 pattern BAssign a <- BlockStat _ (BAssignNode a) where
-  BAssign a@(Assign _ e) = BlockStat (expSpan e) (BAssignNode a)
+  BAssign a@(Assign _ _ e) = BlockStat (expSpan e) (BAssignNode a)
 
 {-# COMPLETE BExp, BBindDef, BAssign #-}
 
@@ -325,11 +325,16 @@ instance Pretty BlockStatNode where
     BBindDefNode b -> pretty b
     BAssignNode a -> pretty a
 
-data Assign = Assign Text Exp deriving (Eq, Show, Generic)
+-- | @path := expression@.  The path is a name and the fields of records reached
+--   through it: @x := 1@ is @Assign "x" []@, @r@a := 1@ is @Assign "r" ["a"]@.
+--   Only the last field is written; the fields before it are read, exactly as
+--   the checker reads them for a field access.
+data Assign = Assign Text [Text] Exp deriving (Eq, Show, Generic)
 instance Sexp Assign
 
 instance Pretty Assign where
-  pretty (Assign anchor e) = T.append anchor $ pretty e
+  pretty (Assign n path e) =
+    T.concat [n, T.concat (map (T.append "@") path), " := ", pretty e]
 
 data PathExp = PathExp Exp [Text] deriving (Eq, Show)
 

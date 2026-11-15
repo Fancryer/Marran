@@ -265,7 +265,8 @@ elaborateBlockStat renv tenv env st =
 elaborateStatNode :: RowEnv -> TypEnv -> ElabEnv -> Ast.BlockStatNode -> ElabM Types.Stat
 elaborateStatNode renv tenv env = \case
   Ast.BExpNode e -> Types.Expr <$> elaborateExpr renv tenv env e
-  Ast.BAssignNode (Ast.Assign n e) -> Types.Assign n <$> elaborateExpr renv tenv env e
+  Ast.BAssignNode (Ast.Assign n path e) ->
+    Types.Assign n path <$> elaborateExpr renv tenv env e
   Ast.BBindDefNode (Ast.BindDef c (Ast.LambdaParam n t) e) ->
     Types.Bind (elaborateMutability c) n <$> for t (elaborateType' renv tenv env []) <*> elaborateExpr renv tenv env e
 

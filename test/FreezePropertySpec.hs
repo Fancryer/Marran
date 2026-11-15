@@ -415,7 +415,7 @@ blockHasVar (stats, result) = any statHasVar stats || hasVarOrRebind result
 statHasVar :: Stat -> Bool
 statHasVar = \case
   Bind m _ e -> m == Var || hasVarOrRebind e
-  Rebind _ _ -> True
+  Rebind _ _ _ -> True
   Expr e -> hasVarOrRebind e
 
 -- The accessors below avoid depending on the positional constructor of
@@ -624,7 +624,8 @@ genStat :: Int -> Gen Stat
 genStat depth = oneof
   [ Bind <$> elements [Val, Var, Imm]
       <*> elements ["a", "b"] <*> genExpr depth
-  , Rebind <$> elements ["a", "b"] <*> genExpr depth
+  , Rebind <$> elements ["a", "b"] <*> pure [] <*> genExpr depth
+  , Rebind <$> elements ["a", "b"] <*> listOf (elements ["x", "y"]) <*> genExpr depth
   , Expr <$> genExpr depth
   ]
 

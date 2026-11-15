@@ -803,6 +803,116 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Right out -> expectationFailure $
           "an Int is not a Nothing; got output: " ++ take 300 out
 
+  describe "assignment to a path" $ do
+    it "writes a field and the right-hand side sees the old value" $ do
+      -- P1-3: `r@a := + r@a 1` is a rebinding of the field, not an update of
+      -- the record: the right-hand side is delayed, so `r@a` still names the
+      -- old cell while it is being built.
+      r <- runSourceWithInput "path_assign_old.marr" "" $ T.unlines
+        [ "funct main () : {Output; Var; Cell; Read; Rebind} () ="
+        , "  var r = #{ var a = 1; val b = 10 };"
+        , "  r@a := + r@a 1;"
+        , "  sayn r@a;"
+        , "  sayn r@b"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a path assignment must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["2", "10"]
+
+    it "walks a nested path" $ do
+      r <- runSourceWithInput "path_assign_nested.marr" "" $ T.unlines
+        [ "funct main () : {Output; Var; Cell; Read; Rebind} () ="
+        , "  var r = #{ var a = #{ var b = 1 }; val c = 5 };"
+        , "  r@a@b := + r@a@b 10;"
+        , "  sayn r@a@b;"
+        , "  sayn r@c"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a nested path must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["11", "5"]
+
+    it "is seen by a closure that reads the field afterwards" $ do
+      -- The write replaces the binding of the field in the record's
+      -- environment, like S-Rebind does for a name, so an existing closure
+      -- reads the new value.
+      r <- runSourceWithInput "path_assign_closure.marr" "" $ T.unlines
+        [ "funct main () : {Output; Var; Cell; Read; Rebind} () ="
+        , "  var r = #{ var a = 1 };"
+        , "  val g = {r@a};"
+        , "  r@a := 2;"
+        , "  sayn (g ());"
+        , "  sayn r@a"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the closure must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["2", "2"]
+
+    it "writes a var field of a val record" $ do
+      -- The binding of the record and the mutability of the field are separate
+      -- questions: `val r` freezes the name `r`, not the `var` fields inside
+      -- the record it names, so `r@a := 2` is allowed and `r := ...` is not.
+      r <- runSourceWithInput "path_assign_val_record.marr" "" $ T.unlines
+        [ "funct main () : {Output; Cell; Read; Rebind} () ="
+        , "  val r = #{ var a = 1 };"
+        , "  r@a := 2;"
+        , "  sayn r@a"
+        ]
+      case r of
+        Left err -> expectationFailure $
+          "a field of a `val` record is writable when the field is `var`: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["2"]
+
+    it "refuses to write a val field" $ do
+      r <- runSourceWithInput "path_assign_val_field.marr" "" $ T.unlines
+        [ "funct main () : {Output; Cell; Read; Rebind} () ="
+        , "  var r = #{ val a = 1 };"
+        , "  r@a := 2;"
+        , "  sayn r@a"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("r@a" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a `val` field must not be assignable; got output: " ++ take 300 out
+
+    it "refuses to walk into a value that is not a record" $ do
+      r <- runSourceWithInput "path_assign_not_record.marr" "" $ T.unlines
+        [ "funct main () : {Output; Cell; Read; Rebind} () ="
+        , "  var x = 1;"
+        , "  x@a := 2;"
+        , "  sayn x"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Int" `isInfixOf`)
+        Right out -> expectationFailure $
+          "an Int has no fields; got output: " ++ take 300 out
+
+    it "refuses an unknown field" $ do
+      r <- runSourceWithInput "path_assign_no_field.marr" "" $ T.unlines
+        [ "funct main () : {Output; Cell; Read; Rebind} () ="
+        , "  var r = #{ var a = 1 };"
+        , "  r@nope := 2;"
+        , "  sayn r@a"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("nope" `isInfixOf`)
+        Right out -> expectationFailure $
+          "the record has no field `nope`; got output: " ++ take 300 out
+
+    it "pays Rebind, Cell and the walk in the row" $ do
+      -- The row of `r@a := ...` is the row of the right-hand side, the rows of
+      -- the records the path walked (a `var` field on the way costs `Read`) and
+      -- `Rebind`; the construction of the record itself is `Cell` and `Var`.
+      r <- runSourceWithInput "path_assign_row.marr" "" $ T.unlines
+        [ "funct main () : {Output; Cell; Read} () ="
+        , "  var r = #{ var a = 1 };"
+        , "  r@a := 2;"
+        , "  sayn r@a"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Rebind" `isInfixOf`)
+        Right out -> expectationFailure $
+          "the assignment must charge Rebind; got output: " ++ take 300 out
+
   describe "records are updated, not extended" $ do
     it "keeps the fields of the base" $ do
       r <- runSourceWithInput "record_update.marr" "" $ T.unlines

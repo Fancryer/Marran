@@ -327,7 +327,9 @@ data Stat = MkStat {
 -- | The shape of a typed statement, without its position.
 data StatNode =
     BindNode Mutability Text TypedExpr
-  | RebindNode Text TypedExpr
+  -- | @x := e@ or @r@a@b := e@: the leading name, the fields walked from it,
+  --   and the right-hand side.
+  | RebindNode Text [Text] TypedExpr
   | ExprNode TypedExpr
   deriving (Show)
 
@@ -335,9 +337,9 @@ pattern Bind :: Mutability -> Text -> TypedExpr -> Stat
 pattern Bind m n e <- MkStat _ (BindNode m n e) where
   Bind m n e = MkStat (teSpan e) (BindNode m n e)
 
-pattern Rebind :: Text -> TypedExpr -> Stat
-pattern Rebind n e <- MkStat _ (RebindNode n e) where
-  Rebind n e = MkStat (teSpan e) (RebindNode n e)
+pattern Rebind :: Text -> [Text] -> TypedExpr -> Stat
+pattern Rebind n path e <- MkStat _ (RebindNode n path e) where
+  Rebind n path e = MkStat (teSpan e) (RebindNode n path e)
 
 pattern Expr :: TypedExpr -> Stat
 pattern Expr e <- MkStat _ (ExprNode e) where
@@ -358,7 +360,7 @@ instance Pretty Stat where
 instance Pretty StatNode where
   pretty = \case
     BindNode m n e -> T.concat [pretty m, " ", n, " = ", pretty e]
-    RebindNode n e -> n <> " := " <> pretty e
+    RebindNode n path e -> T.concat [n, T.concat (map (T.append "@") path), " := ", pretty e]
     ExprNode e -> pretty e
 
 data FunctDecl = FunctDecl {

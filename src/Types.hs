@@ -596,7 +596,7 @@ data Stat = MkStat {
 -- | The shape of a statement, without its position.
 data StatNode =
     BindNode Mutability Text (Maybe Typ) Expr
-  | AssignNode Text Expr
+  | AssignNode Text [Text] Expr
   | ExprNode Expr
   deriving (Eq, Ord, Show)
 
@@ -604,9 +604,11 @@ pattern Bind :: Mutability -> Text -> Maybe Typ -> Expr -> Stat
 pattern Bind m n t e <- MkStat _ (BindNode m n t e) where
   Bind m n t e = MkStat (exprSpan e) (BindNode m n t e)
 
-pattern Assign :: Text -> Expr -> Stat
-pattern Assign n e <- MkStat _ (AssignNode n e) where
-  Assign n e = MkStat (exprSpan e) (AssignNode n e)
+-- | @x := e@ and @r@a@b := e@: the name, the fields leading to the assigned
+--   field (empty for a plain rebinding), and the right-hand side.
+pattern Assign :: Text -> [Text] -> Expr -> Stat
+pattern Assign n path e <- MkStat _ (AssignNode n path e) where
+  Assign n path e = MkStat (exprSpan e) (AssignNode n path e)
 
 pattern Expr :: Expr -> Stat
 pattern Expr e <- MkStat _ (ExprNode e) where
@@ -624,14 +626,15 @@ instance Pretty Stat where
 instance Pretty StatNode where
   pretty = \case
     BindNode m n t e -> T.concat [pretty m, " ", n, maybe "" ((" " <>) . pretty) t, " = ", pretty e]
-    AssignNode n e -> n <> " := " <> pretty e
+    AssignNode n path e -> T.concat [n, T.concat (map (T.append "@") path), " := ", pretty e]
     ExprNode e -> pretty e
 
 instance Show Stat where
   show = \case
     Bind m name typ expr ->
       show m <> " " <> T.unpack name <> maybe "" ((" " <>) . show) typ <> " = " <> show expr
-    Assign name expr -> T.unpack name <> " := " <> show expr
+    Assign name path expr ->
+      T.unpack name <> concatMap ('@' :) (map T.unpack path) <> " := " <> show expr
     Expr expr -> show expr
 
 -- | A top-level declaration with the region of source it came from.  The

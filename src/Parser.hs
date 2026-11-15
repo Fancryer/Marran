@@ -732,7 +732,11 @@ lambdaParam = do
   LambdaParam n <$> optional (optional colonsym *> typ)
 
 assign :: Parser Assign
-assign = Assign <$> name <* symbol TRebind <*> Parser.exp
+assign = do
+  n <- name
+  path <- many $ symbol TAt *> name
+  symbol TRebind
+  Assign n path <$> Parser.exp
 
 letPattern :: Parser LetPattern
 --letPattern = choice [LPATom <$> atomLetPattern, LPParam <$> lambdaParam]
