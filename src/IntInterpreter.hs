@@ -366,6 +366,7 @@ data InterpState = InterpState
   , sTrace      :: Bool
   , sEvents     :: Map Event Int
   , sNoMemo     :: Bool
+  , sForcing    :: Set Int               -- ^ cells whose value is being computed
   , sSpan       :: Span                  -- ^ where the interpreter currently is
   , sCmdArgs    :: [String]              -- ^ the command line, read by `System@args`
   }
@@ -1619,9 +1620,44 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
         VBoolean False -> cont =<< alloc (VThunk elseExpr env)
         _ -> rtError $ "the condition of an `if` must be a Boolean, but this one is " <> describe condVal
 
+-- | Mark a cell whose value is being computed, and report a cycle when the
+--   same cell is reached again before it has a value.
+--
+--   The cell is not overwritten until its thunk has been evaluated (that is
+--   what call-by-need caches), so a thunk that needs itself -- directly or
+--   through a rebinding, as in @val y = + x 1; x := + y 1@ -- would chase its
+--   own address forever.  The model has no rule for that term: it diverges.
+--   An interpreter can do better than spinning, and a diagnostic with a
+--   position is what a reader can act on.
+withForcing :: Address -> Interp a -> Interp a
+withForcing a action = do
+  forcing <- gets sForcing
+  when (Set.member (addrId a) forcing) $ blackholeError a
+  modify $ \s -> s {sForcing = Set.insert (addrId a) s.sForcing}
+  result <- action
+  modify $ \s -> s {sForcing = Set.delete (addrId a) s.sForcing}
+  pure result
+
+-- | A value that needs itself.  The position is the delayed expression that
+--   formed the cycle, because that is the line a reader has to change.
+blackholeError :: Address -> Interp a
+blackholeError a = do
+  v <- readCell a
+  current <- gets sSpan
+  let sp = case v of
+        VThunk e _ -> teSpan e
+        _ -> current
+      message = T.concat [
+          "the value of this binding depends on itself: computing it needs the ",
+          "same cell again, so it never gets a value. A delayed computation ",
+          "reads a mutable binding as it is when it is forced, so ",
+          "`val y = + x 1; x := + y 1` makes `y` and `x` wait for each other."
+        ]
+  lift $ throwError (InterpError message sp (Just "E0020"))
+
 -- | Приводит VThunk к значению и возвращает его адрес
 force :: Address -> Interp Address
-force addr = do
+force addr = withForcing addr $ do
   v0 <- readCell addr
   case v0 of
     VThunk expr env' -> do
@@ -1671,26 +1707,30 @@ force addr = do
 --   intermediate cells were freshly allocated and are unreachable once the
 --   value is known.
 whnf :: Address -> Interp Address
-whnf addr = go addr
+whnf addr = go Set.empty addr
   where
-    go a = do
+    go seen a = do
       v <- readCell a
       case v of
         VThunk expr env' -> do
+          -- A chain of thunks that comes back to a cell it already visited
+          -- never reaches a value: the cell is only overwritten after the
+          -- chase ends, so the same expression would be entered again.
+          when (Set.member (addrId a) seen) $ blackholeError a
           oldEnv <- gets sEnv
           modify $ \s -> s {sEnv = env'}
           resultAddr <- case expr of
             TEParen b -> evalBlock b pure
             _ -> evalExpr expr pure
           modify $ \s -> s {sEnv = oldEnv}
-          go resultAddr
+          go (Set.insert (addrId a) seen) resultAddr
         _ -> do
           writeCell addr v
           pure addr
 
 -- | Приводит VThunk к значению и возвращает само значение
 forceValue :: Address -> Interp Value
-forceValue addr = do
+forceValue addr = withForcing addr $ do
   v0 <- readCell addr
   case v0 of
     VThunk expr env' -> do
@@ -2396,6 +2436,7 @@ initialInterpState root = InterpState {
   sTrace      = False,
   sEvents     = Map.empty,
   sNoMemo     = False,
+  sForcing    = Set.empty,
   sSpan       = noSpan,
   sCmdArgs    = []
 }

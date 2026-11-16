@@ -1137,6 +1137,27 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
       T.unpack (pretty err) `shouldSatisfy` ("out of memory" `isInfixOf`)
       ieSpan err `shouldSatisfy` (not . isNoSpan)
 
+    it "a value that needs itself is a diagnostic, not a hang" $ do
+      -- `val y = + x 0` closes over the environment before `x` is rebound, so
+      -- `y` reads whatever `x` is when it is forced; after `x := + y 1` the two
+      -- cells wait for each other.  The model has no rule for the term, so the
+      -- interpreter must not spin: it reports the cycle at the delayed
+      -- expression and keeps the position a reader can act on.
+      r <- runSourceWithInput "blackhole.marr" "" $ T.unlines
+        [ "funct main () : {Output; Var; Read; Rebind; Cell} () ="
+        , "  var x = 1;"
+        , "  val y = + x 0;"
+        , "  x := + y 1;"
+        , "  sayn y"
+        ]
+      case r of
+        Left err -> do
+          err `shouldSatisfy` ("E0020" `isInfixOf`)
+          err `shouldSatisfy` ("depends on itself" `isInfixOf`)
+          lines err `shouldSatisfy` any (" --> " `isPrefixOf`)
+        Right out -> expectationFailure $
+          "a cyclic thunk must be a diagnostic, got output: " ++ take 300 out
+
   describe "the standard library" $ do
     it "binds a field of a record to the same function as the flat name" $ do
       -- `Numbers@+` is not a second `+`: the record is a view of the values the

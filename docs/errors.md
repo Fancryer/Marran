@@ -110,6 +110,30 @@ is the unique candidate at that distance; `Prise` next to `Price` is a typo,
 while `Foo` next to `Food` is left alone and stays opaque. A name that is not
 close to anything also stays opaque and fails later at unification.
 
+## Runtime errors
+
+A program that type-checks can still fail while it runs, and those failures go
+through the same renderer: a code, a position and a caret run. The interpreter
+does not raise an exception that unwinds through the user's screen, because a
+message without a position is not something a reader can act on.
+
+Two kinds are expected of a well-typed program:
+
+- `E0020` — the program itself failed. A division by zero in `%`, an uncaught
+  `error` or a failed `assert` of the effect `Error`, or a value that needs
+  itself: `val y = + x 1; x := + y 1` makes the two cells wait for each other,
+  because a delayed computation reads a mutable binding as it is when it is
+  forced. The model has no rule for such a term — it diverges — so the
+  interpreter reports the cycle at the delayed expression instead of spinning
+  forever. `%` and `head`/`tail` of an empty array are reported this way
+  rather than through `Error`, because they are declared pure.
+- `E0019` — the program exhausted memory: the Haskell heap or the stack. The
+  position is the body of `main`, since the exhaustion is not tied to a node.
+
+Anything else the interpreter reports carries no code and is a gap in the
+interpreter: a value of the wrong shape reached a primitive, a handler went
+missing, a native signature arrived as a value.
+
 ## Codes
 
 | Code  | Meaning |
@@ -133,7 +157,7 @@ close to anything also stays opaque and fails later at unification.
 | E0017 | an application or arity error (`with` arguments, an effect parameter list, a non-function head) |
 | E0018 | an inference limitation (an occurs check, an escaping rigid variable, a failed instantiation, a forbidden effect in a constrained row, or an operation name provided by two effects in the same row) |
 | E0019 | the program exhausted memory (the heap or the stack), reported at the body of `main` |
-| E0020 | the program itself failed: an uncaught `error`/failed `assert` of the effect `Error`, or a zero divisor in `%` |
+| E0020 | the program itself failed: an uncaught `error`/failed `assert` of the effect `Error`, a zero divisor in `%`, or a value that needs itself |
 
 Errors raised by the elaborator (the phase between the parser and the type
 checker) carry a message but no code: they are about the shape of the program
