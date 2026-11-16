@@ -43,6 +43,7 @@ import Types(
     pattern XVar, pattern Array, pattern Pair, pattern XLambda, pattern NLambda,
     pattern Apply, pattern Record, pattern With, pattern Handle, pattern Paren,
     pattern Resume, pattern Let, pattern PropAccess, pattern IfElse,
+    pattern Annot,
     exprSpan,
     Handler(..),
     Lambda,
@@ -121,6 +122,7 @@ import TypedIR (
     pattern TEXLambda, pattern TENLambda, pattern TEApply, pattern TERecord,
     pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
     pattern TEPropAccess, pattern TEIfElse,
+    pattern TEAnnot,
     atTypedSpan,
     pattern Bind, pattern Rebind, pattern Expr,
     atTypedStatSpan
@@ -208,6 +210,7 @@ substituteTypedExpr scope = \case
     pure $ TELet pat bound' body'
   TEPropAccess e f -> TEPropAccess <$> substituteTypedExpr scope e <*> pure f
   TEIfElse p t f -> TEIfElse <$> substituteTypedExpr scope p <*> substituteTypedExpr scope t <*> substituteTypedExpr scope f
+  TEAnnot e t -> TEAnnot <$> substituteTypedExpr scope e <*> applyTypeSubst scope t
   TEHandle handler t -> do
     t' <- applyTypeSubst scope t
     handler' <- substituteHandler scope handler
@@ -290,6 +293,7 @@ countResumeInExpr = \case
   Let _ wht whr -> countResumeInExpr wht <> countResumeInExpr whr
   PropAccess e _ -> countResumeInExpr e
   IfElse p t f -> countResumeInExpr p <> countResumeInExpr t <> countResumeInExpr f
+  Annot e _ -> countResumeInExpr e
   _ -> NoResume
 
 countResumeInLambda :: Types.Lambda -> ResumeInfo
@@ -831,6 +835,17 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
       (TEIfElse typP typT typF)
       (Eff.unionEffRows pFxs $ Eff.unionEffRows tFxs fFxs)
       iScope
+  Annot e t -> do
+    InferResult eT eFxs scope1 <- inferExpr scope e
+    actual <- typeOfTypedExprIn scope1 eT
+    -- An annotation on an aggregate is an upper bound, as it is for the return
+    -- type of a function and for the type of a binding: a value whose pending
+    -- row is smaller fits, and `[] : [Int]` refines the empty array.  The
+    -- declared type is what the expression has afterwards, so a later use sees
+    -- the refinement rather than the type inference would have guessed.
+    scope2 <- subsumesType scope1 actual t
+    declared <- applyTypeSubst scope2 t
+    pure $ InferResult (TEAnnot eT declared) eFxs scope2
 
 -- | Bind the names of a @let@ pattern at the type they must have.
 --
@@ -1736,6 +1751,7 @@ isFrozenExpr = \case
   TELet _ bound body -> isFrozenExpr bound && isFrozenExpr body
   TEPropAccess e _ -> isFrozenExpr e
   TEIfElse p t f -> isFrozenExpr p && isFrozenExpr t && isFrozenExpr f
+  TEAnnot e _ -> isFrozenExpr e
   _ -> True
 
 isFrozenBlock :: TypedIR.Block -> Bool
@@ -1771,6 +1787,7 @@ fvTyped = \case
   TELet _ bound body -> Set.union (fvTyped bound) (fvTyped body)
   TEPropAccess e _ -> fvTyped e
   TEIfElse p t f -> Set.unions [fvTyped p, fvTyped t, fvTyped f]
+  TEAnnot e _ -> fvTyped e
   _ -> Set.empty
 
 fvTypedBlock :: TypedIR.Block -> Set.Set Text
@@ -1840,6 +1857,7 @@ createsCell = \case
   TELet _ wht whr -> any createsCell [wht, whr]
   TEIfElse p t f -> any createsCell [p, t, f]
   TEPropAccess e _ -> createsCell e
+  TEAnnot e _ -> createsCell e
   _ -> False
 
 freeze :: TypedExpr -> TypedExpr
@@ -1861,6 +1879,10 @@ freeze = \case
   TELet lp wht whr -> TELet lp (freeze wht) (freeze whr)
   TEPropAccess t x -> TEPropAccess (freeze t) x
   TEIfElse p t f -> TEIfElse (freeze p) (freeze t) (freeze f)
+  -- The annotation is a check at its source site, not part of the value: the
+  -- frozen binding records the frozen type its scheme has, and the type stored
+  -- in the node would describe the state the snapshot no longer carries.
+  TEAnnot e _ -> freeze e
   e -> e
 
 -- | Заморозка типа: var-поля записей становятся val, из рядов стрелок убираются

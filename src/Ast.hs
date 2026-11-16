@@ -54,6 +54,7 @@ module Ast (
   pattern EResume,
   pattern EParen,
   pattern EWith,
+  pattern EAnnot,
   binExp,
   HandlerClause(..),
   Literal(..),
@@ -462,6 +463,8 @@ data ExpNode =
   | NResume Exp
   | NParen Block
   | NWith Exp TypeApps EffApps
+  -- | @e : T@: the type the reader claims for an expression.
+  | NAnnot Exp Typ
   deriving (Eq, Show, Generic)
 
 instance Sexp Exp where sexp = sexp . expNode
@@ -527,8 +530,12 @@ pattern EWith :: Exp -> TypeApps -> EffApps -> Exp
 pattern EWith e ts es <- Exp _ (NWith e ts es) where
   EWith e ts es = Exp (expSpan e) (NWith e ts es)
 
+pattern EAnnot :: Exp -> Typ -> Exp
+pattern EAnnot e t <- Exp _ (NAnnot e t) where
+  EAnnot e t = Exp noSpan (NAnnot e t)
+
 {-# COMPLETE EName, EApply, EDollar, ELiteral, EPair, ELet, EBacktick
-   , EPropAccess, EIfThenElse, EUnder, EResume, EParen, EWith #-}
+   , EPropAccess, EIfThenElse, EUnder, EResume, EParen, EWith, EAnnot #-}
 
 -- | A node covering both children.
 binExp :: (Exp -> Exp -> ExpNode) -> Exp -> Exp -> Exp
@@ -552,6 +559,7 @@ instance Pretty ExpNode where
     NResume e -> T.append "resume " $ pretty e
     NParen b -> T.concat ["(", pretty b, ")"]
     NWith e tas eas -> T.concat [pretty e, " with ", pretty tas, pretty eas]
+    NAnnot e t -> T.concat [pretty e, " : ", pretty t]
 
 data ExpPrecedence =
   PrecResume

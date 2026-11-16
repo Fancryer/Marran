@@ -14,6 +14,7 @@ module TypedIR(
   pattern TEXLambda, pattern TENLambda, pattern TEApply, pattern TERecord,
   pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
   pattern TEPropAccess, pattern TEIfElse,
+  pattern TEAnnot,
   atTypedSpan,
   teSpan,
   Block,
@@ -131,6 +132,9 @@ data TypedExprNode =
   | TELetNode LetPattern TypedExpr TypedExpr
   | TEPropAccessNode TypedExpr Text
   | TEIfElseNode TypedExpr TypedExpr TypedExpr
+  -- | @e : T@.  The annotation is transparent at run time: the expression is
+  --   evaluated as if it were written alone.
+  | TEAnnotNode TypedExpr Typ
   deriving (Show)
 
 pattern TEInt :: Integer -> TypedExpr
@@ -207,9 +211,15 @@ pattern TEIfElse p t f <- MkTypedExpr _ (TEIfElseNode p t f) where
   TEIfElse p t f =
     MkTypedExpr (mergeSpan (teSpan p) (mergeSpan (teSpan t) (teSpan f))) (TEIfElseNode p t f)
 
+-- | @e : T@.  The span is the one of the annotated expression, so an error
+--   inside the annotation is reported where the reader reads it.
+pattern TEAnnot :: TypedExpr -> Typ -> TypedExpr
+pattern TEAnnot e t <- MkTypedExpr _ (TEAnnotNode e t) where
+  TEAnnot e t = MkTypedExpr (teSpan e) (TEAnnotNode e t)
+
 {-# COMPLETE TEInt, TEFloat, TEBoolean, TEString, TENil, TEXVar, TEArray
    , TEPair, TEXLambda, TENLambda, TEApply, TERecord, TEHandle, TEParen
-   , TEResume, TELet, TEPropAccess, TEIfElse #-}
+   , TEResume, TELet, TEPropAccess, TEIfElse, TEAnnot #-}
 
 -- | Move a typed expression to the given span.
 atTypedSpan :: Span -> TypedExpr -> TypedExpr
@@ -236,6 +246,7 @@ instance Show TypedExpr where
     TELet pat bound body -> "(Let " <> show pat <> " " <> show bound <> " " <> show body <> ")"
     TEPropAccess expr field -> "(Prop " <> show expr <> " " <> show field <> ")"
     TEIfElse cond thenExpr elseExpr -> "(If " <> show cond <> " " <> show thenExpr <> " " <> show elseExpr <> ")"
+    TEAnnot e t -> "(Annot " <> show e <> " " <> show t <> ")"
 
 instance Pretty TypedExpr where
   pretty = \case
@@ -258,6 +269,7 @@ instance Pretty TypedExpr where
     -- -- Let LetPattern TypedExpr TypedExpr
     -- PropAccess e n -> pretty e <> "@" <> n
     TEIfElse p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
+    TEAnnot e t -> pretty e <> " : " <> pretty t
     e -> T.pack $ show e
 
 data TERecordProp = TERecordProp {
@@ -490,6 +502,7 @@ typeOfTypedExpr = \case
           Nothing -> Left $ "Field " <> field <> " not found"
       r -> Left $ "PropAccess on non-record: " <> T.pack (show r)
   TEIfElse _ thenExpr _ -> typeOfTypedExpr thenExpr
+  TEAnnot _ t -> Right t
 
 typeOfTypedBlock :: TypedIR.Block -> Either Text Typ
 typeOfTypedBlock = typeOfTypedExpr . snd

@@ -38,6 +38,7 @@ import TypedIR (
     pattern TEXLambda, pattern TENLambda, pattern TEApply, pattern TERecord,
     pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
     pattern TEPropAccess, pattern TEIfElse,
+    pattern TEAnnot,
     Lambda(..), Block, TERecordProp(..))
 import Control.Monad.State.Strict
 import Control.Monad (foldM, forM, forM_, void, unless, when)
@@ -1619,6 +1620,7 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
         VBoolean True -> cont =<< alloc (VThunk thenExpr env)
         VBoolean False -> cont =<< alloc (VThunk elseExpr env)
         _ -> rtError $ "the condition of an `if` must be a Boolean, but this one is " <> describe condVal
+    TEAnnot e _ -> evalExpr e cont
 
 -- | Mark a cell whose value is being computed, and report a cycle when the
 --   same cell is reached again before it has a value.
@@ -2291,6 +2293,7 @@ freeVars = \case
     in Set.union boundFV (Set.difference bodyFV patternVars)
   TEPropAccess e _ -> freeVars e
   TEIfElse p t f -> Set.unions [freeVars p, freeVars t, freeVars f]
+  TEAnnot e _ -> freeVars e
   _ -> Set.empty
 
 -- | Свободные переменные блока: имена, связанные его операторами, исключаются

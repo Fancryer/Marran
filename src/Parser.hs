@@ -822,7 +822,7 @@ effArg :: Parser EffArg
 effArg = choice [EACons <$> effCons, EARow <$> (symbol TEllipsis *> effRow)]
 
 exp :: Parser Exp
-exp = resumeExp --do
+exp = annotExp
   -- e <- applyExp
   -- e' <- parsePostfixOps e
   -- e'' <- parseBackticks e'
@@ -830,6 +830,38 @@ exp = resumeExp --do
   -- e <- prefixExp >>= parsePostfix
   -- es <- many $ prefixExp >>= parsePostfix
   -- pure $ foldl EApply e es
+
+-- | @e : T@.  The annotation binds loosest of all, so @f x : Int@ is
+--   @(f x) : Int@ and @[1, 2, 3] : [Int]@ annotates the array, not an
+--   element.  The one exception is the right operand of @$@, which takes the
+--   annotation first: @sayn $ [] : [Int]@ is @sayn ([] : [Int])@, because
+--   that is the whole reason to write @$@ instead of parentheses.
+--
+--   The type is a single atom or an arrow, never a bare comma pair:
+--   otherwise @(f x : Int, y)@ would annotate @f x@ with the pair type
+--   @(Int, y)@ instead of building a pair.  A pair type needs parentheses,
+--   @e : (Int, String)@, which is how a reader writes it anyway.
+annotExp :: Parser Exp
+annotExp = do
+  e <- resumeExp
+  m <- optional (colonsym *> annotType)
+  case m of
+    Nothing -> pure e
+    Just t -> withSpanFrom (expSpan e) (NAnnot e t)
+
+annotType :: Parser Typ
+annotType = do
+  from <- typAtom
+  m <- optional $ try $ do
+    symbol TArrow
+    choice [
+        try $ do
+          row <- arrowEffRow
+          TFunct <$> (Funct from <$> annotType <*> pure row),
+        TFunct <$> (Funct from <$> annotType <*> pure (ERSugar [] Nothing))
+      ]
+  pure $ fromMaybe from m
+
 resumeExp :: Parser Exp
 resumeExp = try (loc $ NResume <$> (keyword KWResume *> resumeExp)) <|> dollarExp
 
@@ -837,7 +869,9 @@ resumeExp = try (loc $ NResume <$> (keyword KWResume *> resumeExp)) <|> dollarEx
 dollarExp :: Parser Exp
 dollarExp = do
   e <- backtickExp
-  m <- optional (symbol TDollar *> (EDollar e <$> dollarExp))
+  -- The right operand is parsed by 'annotExp', so `f $ x : T` annotates `x`;
+  -- an annotation that follows the whole chain is then attached by the caller.
+  m <- optional (symbol TDollar *> (EDollar e <$> annotExp))
   pure $ fromMaybe e m
 
 backtickExp :: Parser Exp

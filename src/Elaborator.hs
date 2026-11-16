@@ -329,6 +329,10 @@ elaborateNode renv tenv env = \case
       <*> forM ras (elaborateEffRow' renv tenv env)
   Ast.EUnder u -> elaborateUnder renv tenv env u
   Ast.EParen b -> Types.Paren <$> elaborateBlock renv tenv env b
+  Ast.EAnnot e t ->
+    Types.Annot
+      <$> elaborateExpr renv tenv env e
+      <*> elaborateType' renv tenv env [] t
 
 elaborateUnder :: RowEnv -> TypEnv -> ElabEnv -> Ast.Under -> ElabM Types.Expr
 elaborateUnder renv tenv env = \case

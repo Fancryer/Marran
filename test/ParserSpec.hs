@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | The lexer's treatment of operators and the shape of syntax errors.  Both are
 --   about the surface of the language: an operator is a name, and a failure is
@@ -8,8 +9,16 @@ module ParserSpec (pSpec) where
 import qualified Data.Text as T
 import Test.Hspec
 
+import qualified Ast
+import Ast (Typ (..), pattern EAnnot, pattern EApply, pattern EName)
 import Lexer (Keyword (..), Token (..))
 import Parser (chunk, parseFromTextNamed, parseTokensUnposed)
+import qualified Parser
+
+-- | The expression parser, for tests that care about the shape of a node
+--   rather than about a whole program.
+exp_ :: Parser.Parser Ast.Exp
+exp_ = Parser.exp
 
 -- | Parse a program and return the rendered error, failing the test if the
 --   program unexpectedly parses.
@@ -48,6 +57,34 @@ pSpec = do
     it "keeps an underscore out of a name, so `_x` is a wildcard and `x`" $ do
       lexemes "_x" `shouldBe` Right [TUnderscore, TName "x"]
       lexemes "or_else" `shouldBe` Right [TName "or_else"]
+
+  describe "annotations" $ do
+    it "parses `e : T` around the whole expression" $ do
+      -- The annotation is looser than application: `f x : Int` is
+      -- `(f x) : Int`, so `f` is applied before the type is attached.
+      case parseFromTextNamed "demo.marr" exp_ "f x : Int" of
+        Left e -> expectationFailure e
+        Right (EAnnot (EApply (EName "f") (EName "x")) (TFlat "Int")) -> pure ()
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
+
+    it "parses an annotation on an aggregate literal" $ do
+      case parseFromTextNamed "demo.marr" exp_ "[1, 2] : [Int]" of
+        Left e -> expectationFailure e
+        Right (EAnnot _ (TArray (TFlat "Int"))) -> pure ()
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
+
+    it "needs a type after the colon" $ do
+      -- A bare `:` is a syntax error like any other unfinished statement, and
+      -- it is reported at the statement, not reinterpreted as something else.
+      ls <- parseFailure $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val x = 1 :;"
+        , "  sayn x"
+        ]
+      take 2 ls `shouldBe`
+        [ "error[E0013]: unexpected `val`"
+        , " --> demo.marr:2:3"
+        ]
 
   describe "syntax errors" $ do
     it "reports an unexpected token with its code and position" $ do

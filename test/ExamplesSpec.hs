@@ -294,6 +294,71 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
           filter (not . isReport) (lines out) `shouldBe` ["5"]
           out `shouldSatisfy` ("EVENTS: licensed" `isInfixOf`)
 
+  describe "annotations on expressions" $ do
+    it "lets an annotation refine an aggregate the checker could not pin down" $ do
+      -- `[]` on its own has element type `Nothing`; the annotation says which
+      -- array the reader means, and `head` then has something to return.
+      r <- runSourceWithInput "annot_empty_array.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val xs = [] : [Int];"
+        , "  sayn xs;"
+        , "  sayn (1 : Int, 2)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the annotation must refine the type: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["[]", "(1, 2)"]
+
+    it "rejects an annotation that the expression cannot have" $ do
+      r <- runSourceWithInput "annot_mismatch.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn (1 : Boolean)"
+        ]
+      case r of
+        Left err -> do
+          err `shouldSatisfy` ("E0003" `isInfixOf`)
+          err `shouldSatisfy` ("1 : Boolean" `isInfixOf`)
+        Right _ -> expectationFailure "the checker must reject `1 : Boolean`"
+
+    it "rejects an annotation that hides the latent effects of a function" $ do
+      r <- runSourceWithInput "annot_pure_arrow.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn ({(x) = sayn x} : Int -> {} ())"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Output" `isInfixOf`)
+        Right _ -> expectationFailure
+          "the body prints, so a pure arrow row must be rejected"
+
+    it "annotates the whole application, not its argument" $ do
+      -- `inc 1 : Int` is `(inc 1) : Int`.  A weaker precedence would make the
+      -- annotation apply to `1` in some positions and to the call in others.
+      r <- runSourceWithInput "annot_application.marr" "" $ T.unlines
+        [ "funct inc (x Int) : Int = + x 1"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (inc 1 : Int);"
+        , "  sayn (let y = 5 in y : Int);"
+        , "  sayn ((1, 2) : (Int, Int))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the annotation must parse and run: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["2", "5", "(1, 2)"]
+
+    it "does not disturb the colon of a lambda head" $ do
+      r <- runSourceWithInput "annot_lambda_head.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  val f = {(x) : Int = + x 1};"
+        , "  sayn (f 2);"
+        -- An annotation covers the whole expression, so a function that is
+        -- annotated has to be bound before it can be applied: there is no
+        -- `((f : T) 4)` shape, and `f : T 4` would annotate `f 4`.
+        , "  val g = {(x : Int) = x} : Int -> Int;"
+        , "  sayn (g 4)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a lambda head still parses as a head: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["3", "4"]
+
   describe "pending rows of local bindings" $ do
     it "gives a closure over a local alias of a var the Read effect" $ do
       r <- runSourceWithInput "alias_closure.marr" "" $ T.unlines

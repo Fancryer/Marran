@@ -115,6 +115,7 @@ walkExp (Exp sp n) = spanCheck (tag n <> " expression") sp <> walkChildren n
       NResume _ -> "resume"
       NParen _ -> "parenthesised block"
       NWith _ _ _ -> "with"
+      NAnnot _ _ -> "annotation"
 
 walkChildren :: ExpNode -> [Bad]
 walkChildren = \case
@@ -131,6 +132,7 @@ walkChildren = \case
   NResume e -> walkExp e
   NParen b -> walkBlock b
   NWith e _ _ -> walkExp e
+  NAnnot e _ -> walkExp e
 
 walkLiteral :: Literal -> [Bad]
 walkLiteral = \case

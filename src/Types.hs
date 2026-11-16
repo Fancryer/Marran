@@ -33,6 +33,7 @@ module Types (
   pattern Let,
   pattern PropAccess,
   pattern IfElse,
+  pattern Annot,
   atSpan,
   -- Scope(..),
   Block,
@@ -325,6 +326,8 @@ data ExprNode =
   | LetNode LetPattern Expr Expr
   | PropAccessNode Expr Text
   | IfElseNode Expr Expr Expr
+  -- | @e : T@: the type the reader claims for an expression.
+  | AnnotNode Expr Typ
   deriving (Eq, Ord, Show)
 
 pattern Int :: Integer -> Expr
@@ -405,9 +408,13 @@ pattern IfElse p t f <- MkExpr _ (IfElseNode p t f) where
   IfElse p t f =
     MkExpr (mergeSpan (exprSpan p) (mergeSpan (exprSpan t) (exprSpan f))) (IfElseNode p t f)
 
+pattern Annot :: Expr -> Typ -> Expr
+pattern Annot e t <- MkExpr _ (AnnotNode e t) where
+  Annot e t = MkExpr (exprSpan e) (AnnotNode e t)
+
 {-# COMPLETE Int, Float, Boolean, String, Nil, XVar, Array, Pair, XLambda
    , NLambda, Apply, Record, With, Handle, Paren, Resume, Let, PropAccess
-   , IfElse #-}
+   , IfElse, Annot #-}
 
 -- | Move an expression to a different span.  Used by the elaborator, which
 --   knows the span of the AST node a node came from.
@@ -444,6 +451,7 @@ instance Pretty ExprNode where
     LetNode p w b -> "let " <> prettyLetPattern p <> " = " <> pretty w <> " in " <> pretty b
     PropAccessNode e n -> pretty e <> "@" <> n
     IfElseNode p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
+    AnnotNode e t -> pretty e <> " : " <> pretty t
 
 prettyERecordProp :: ERecordProp -> Text
 prettyERecordProp p = T.concat [
