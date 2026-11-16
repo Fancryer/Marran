@@ -1167,6 +1167,168 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
       Right out -> expectationFailure $
         "expected a type error, got output: " ++ take 300 out
 
+  describe "enums and match" $ do
+    it "builds a value by applying its constructor, and prints it without `#`" $ do
+      r <- runSourceWithInput "enum_print.marr" "" $ T.unlines
+        [ "enum Maybe[a] | Some (val v : a) | None"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (Some 5);"
+        , "  sayn None"
+        ]
+      case r of
+        Left err -> expectationFailure $ "an enum value must print: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["Some 5", "None"]
+
+    it "selects the clause whose constructor matches" $ do
+      r <- runSourceWithInput "enum_match.marr" "" $ T.unlines
+        [ "enum Maybe[a] | Some (val v : a) | None"
+        , ""
+        , "funct value (m Maybe[Int]) : Int ="
+        , "  match (m) to"
+        , "    | #Some x => x"
+        , "    | #None => 0"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (value (Some 3));"
+        , "  sayn (value None)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`match` must select a clause: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["3", "0"]
+
+    it "lets the first clause that fits win, and a guard decide" $ do
+      r <- runSourceWithInput "match_guard.marr" "" $ T.unlines
+        [ "funct classify (n Int) : String ="
+        , "  match (n) to"
+        , "    | x if (ieq x 0) => 'zero'"
+        , "    | 1 => 'one'"
+        , "    | 2 3 => 'two or three'"
+        , "    | _ => 'other'"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (classify 0);"
+        , "  sayn (classify 1);"
+        , "  sayn (classify 3);"
+        , "  sayn (classify 9)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a guarded clause must decide: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["zero", "one", "two or three", "other"]
+
+    it "binds the whole subject with `as`" $ do
+      r <- runSourceWithInput "match_as.marr" "" $ T.unlines
+        [ "funct name (n Int) : String ="
+        , "  match (n) to"
+        , "    | 1 as one => 'one'"
+        , "    | other => 'other'"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (name 1);"
+        , "  sayn (name 2)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`as` must bind the subject: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["one", "other"]
+
+    it "compares against a value the program already has with `val`" $ do
+      r <- runSourceWithInput "match_val.marr" "" $ T.unlines
+        [ "funct same (n Int) (m Int) : Boolean ="
+        , "  match (n) to"
+        , "    | val m => true"
+        , "    | _ => false"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (same 1 1);"
+        , "  sayn (same 1 2)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "`val` must compare with `==`: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["true", "false"]
+
+    it "splits a string with `|->` and `<-|`" $ do
+      r <- runSourceWithInput "match_split.marr" "" $ T.unlines
+        [ "funct tail_of (s String) : String ="
+        , "  match (s) to"
+        , "    | 'ab' |-> rest => rest"
+        , "    | rest <-| 'yz' => rest"
+        , "    | _ => 'none'"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (tail_of 'abcdef');"
+        , "  sayn (tail_of 'wxyz');"
+        , "  sayn (tail_of 'nope')"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a split pattern must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["cdef", "wx", "none"]
+
+    it "tells an exact array, a head and a tail, and at least two apart" $ do
+      r <- runSourceWithInput "match_array.marr" "" $ T.unlines
+        [ "funct shape (xs [Int]) : String ="
+        , "  match (xs) to"
+        , "    | [a b] => 'two'"
+        , "    | [a; rest] => 'head'"
+        , "    | [] => 'empty'"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (shape [1, 2]);"
+        , "  sayn (shape [1, 2, 3]);"
+        , "  sayn (shape [])"
+        ]
+      case r of
+        Left err -> expectationFailure $ "an array pattern must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["two", "head", "empty"]
+
+    it "reads a var field of an enum and charges Read" $ do
+      r <- runSourceWithInput "enum_var_read.marr" "" $ T.unlines
+        [ "enum Mut | Box (var x : Int) | Empty"
+        , ""
+        , "funct unbox (b Mut) : {Read} Int ="
+        , "  match (b) to"
+        , "    | #Box x => x"
+        , "    | #Empty => 0"
+        , ""
+        , "funct main () : {Output; Var; Read} () ="
+        , "  sayn (unbox (Box 7));"
+        , "  sayn (unbox Empty)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a var field must be readable: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["7", "0"]
+
+    it "rejects a match that leaves a constructor unhandled" $ do
+      r <- runSourceWithInput "match_gap.marr" "" $ T.unlines
+        [ "enum Maybe[a] | Some (val v : a) | None"
+        , ""
+        , "funct value (m Maybe[Int]) : Int ="
+        , "  match (m) to"
+        , "    | #Some x => x"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (value (Some 1))"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("E0021" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a missing constructor is a static error; got output: " ++ take 300 out
+
+    it "compares two values structurally with `==` and by identity with `===`" $ do
+      -- `===` is the value itself, not its content: the two `1`s are two
+      -- values, so `1 === 1` is false while `== 1 1` is true.
+      r <- runSourceWithInput "builtin_compare.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn (== 1 1);"
+        , "  sayn (=== 1 1);"
+        , "  sayn (!= 1 2);"
+        , "  sayn (!== 1 1)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the comparisons must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe`
+          ["true", "false", "true", "true"]
+
   describe "memory" $ do
     it "a long tail-recursive loop finishes and prints its result" $ do
       r <- runSourceWithInput "long_loop.marr" "" $ T.unlines

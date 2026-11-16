@@ -106,6 +106,8 @@ data TypeCheckError =
   | EffectError Text
   | MultipleResumeError Text Int
   | TodoError Text
+  -- | A @match@ that does not accept every value of its subject's type.
+  | NonExhaustiveMatch Text
   deriving (Show, Eq)
 
 data TypeCheckState = TypeCheckState {
@@ -212,6 +214,7 @@ skolemEscapesType target = \case
   TRecord props r ->
     any (\(TRecordProp _ _ t) -> skolemEscapesType target t) props
       || skolemEscapesRow target r
+  TEnum _ args -> any (skolemEscapesTypeArg target) args
   TForall _ _ _ _ _ t -> skolemEscapesType target t
   _ -> False
 
@@ -222,6 +225,7 @@ skolemEscapesTypeArg target = \case
   TAPair l r -> skolemEscapesTypeArg target l || skolemEscapesTypeArg target r
   TAFunct i o -> skolemEscapesTypeArg target i || skolemEscapesTypeArg target o
   TARecord props -> any (\(TARecordProp _ _ t) -> skolemEscapesTypeArg target t) props
+  TAEnum _ args -> any (skolemEscapesTypeArg target) args
   _ -> False
 
 skolemEscapesEffCons :: Int -> EffCons -> Bool
@@ -249,6 +253,7 @@ lowerTypeTo target = \case
     TFunct $ Funct (lowerTypeTo target i) (lowerTypeTo target o) $ lowerRowTo target row
   TRecord props r ->
       TRecord [TRecordProp m n $ lowerTypeTo target t | TRecordProp m n t <- props] $ lowerRowTo target r
+  TEnum n args -> TEnum n $ map (lowerTypeArgTo target) args
   TForall ts es rs els rls t -> TForall ts es rs els rls $ lowerTypeTo target t
   t -> t
 
@@ -261,6 +266,7 @@ lowerTypeArgTo target = \case
     TAFunct (lowerTypeArgTo target i) $ lowerTypeArgTo target o
   TARecord props ->
       TARecord [TARecordProp m n $ lowerTypeArgTo target t | TARecordProp m n t <- props]
+  TAEnum n args -> TAEnum n $ map (lowerTypeArgTo target) args
   t -> t
 
 lowerEffConsTo :: Int -> EffCons -> EffCons
@@ -391,6 +397,7 @@ applyTypeSubst scope = go (0 :: Int)
        ) props
      r' <- applyEffRowSubst scope r
      pure $ TRecord props' r'
+   TEnum n args -> TEnum n <$> traverse (applyTypeArgSubst scope) args
    TForall ts es rs els rls t -> do
      let scope' = scope {
          typeSubst = foldr Map.delete scope.typeSubst ts,
@@ -421,6 +428,7 @@ applyTypeArgSubst scope = \case
         TARecordProp mut name <$> applyTypeArgSubst scope typ
       ) props
     pure $ TARecord props'
+  TAEnum n args -> TAEnum n <$> traverse (applyTypeArgSubst scope) args
   t -> pure t
 
 -- | Unify the type of an argument with the type its parameter expects.
@@ -474,6 +482,9 @@ subsumesType scope actual declared = do
     (TRecord pa fa, TRecord pd fd) -> do
       s <- subsumesRecords scope pa pd
       subsumesEffRow s fa fd
+    (TEnum n1 a1, TEnum n2 a2)
+      | n1 == n2 && length a1 == length a2 ->
+          foldM (\sc (x, y) -> unifyTypeArgs sc x y) scope (zip a1 a2)
     _ -> unifyTypes scope actual declared
 
 -- | The least type that both values have, used where two expressions must
@@ -514,6 +525,21 @@ joinTypes scope t1 t2 = do
           (f, s') <- joinRows s f1 f2
           pure (TRecord ps f, s')
         Nothing -> unifyThen scope t1' t2'
+    (TEnum n1 a1, TEnum n2 a2)
+      | n1 == n2 && length a1 == length a2 -> do
+          (as, s) <- foldM joinArg ([], scope) (zip a1 a2)
+          pure (TEnum n1 as, s)
+      where
+        joinArg (acc, s) (x, y) = do
+          -- A type argument has no join of its own: it is joined as the type
+          -- it denotes, and comes back as an argument whenever it has that
+          -- shape (an effect row never does, and an enum's arguments may not
+          -- mention one).
+          (t, s') <- joinTypes s (typeArgToTyp x) (typeArgToTyp y)
+          case typToTypeArg t of
+            Just a -> pure (acc <> [a], s')
+            Nothing -> unifyThen s (typeArgToTyp x) (typeArgToTyp y) >>= \_ ->
+              throwTypeCheckError $ TypeArgUnificationError x y
     _ -> unifyThen scope t1' t2'
   where
     joinField :: ([TRecordProp], Scope) -> (TRecordProp, TRecordProp) -> TypeCheckM ([TRecordProp], Scope)
@@ -618,6 +644,9 @@ unifyTypes scope t1 t2 = do
     (TRecord props1 f1, TRecord props2 f2) -> do
       scope' <- unifyRecords scope props1 props2
       unifyEffRows scope' f1 f2
+    (TEnum n1 a1, TEnum n2 a2)
+      | n1 == n2 && length a1 == length a2 ->
+          foldM (\sc (x, y) -> unifyTypeArgs sc x y) scope (zip a1 a2)
     _ -> throwTypeCheckError $ TypeUnificationError t1' t2'
 
 unifyRecords :: Scope -> [TRecordProp] -> [TRecordProp] -> TypeCheckM Scope
@@ -918,6 +947,9 @@ unifyTypeArgs scope t1 t2 = do
       scope' <- unifyTypeArgs scope i2 i1
       unifyTypeArgs scope' o1 o2
     (TARecord props1, TARecord props2) -> unifyRecordArgs scope props1 props2
+    (TAEnum n1 a1, TAEnum n2 a2)
+      | n1 == n2 && length a1 == length a2 ->
+          foldM (\sc (x, y) -> unifyTypeArgs sc x y) scope (zip a1 a2)
     _ -> throwTypeCheckError $ TypeArgUnificationError t1' t2'
 
 unifyRecordArgs :: Scope -> [TARecordProp] -> [TARecordProp] -> TypeCheckM Scope
@@ -1036,6 +1068,7 @@ instance Pretty TypeCheckError where
     MultipleResumeError e n ->
       T.concat ["`", e, "` resumes ", pretty n, " times; a handler clause may resume at most once"]
     TodoError e -> e
+    NonExhaustiveMatch e -> e
 
 -- | The stable code a diagnostic carries.  Users can search for it, and it
 --   does not change when the wording of the message does.
@@ -1058,3 +1091,4 @@ errorCode = \case
   EffectError _ -> Just "E0010"
   MultipleResumeError _ _ -> Just "E0011"
   TodoError _ -> Just "E0012"
+  NonExhaustiveMatch _ -> Just "E0021"

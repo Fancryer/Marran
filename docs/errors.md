@@ -158,6 +158,7 @@ missing, a native signature arrived as a value.
 | E0018 | an inference limitation (an occurs check, an escaping rigid variable, a failed instantiation, a forbidden effect in a constrained row, or an operation name provided by two effects in the same row) |
 | E0019 | the program exhausted memory (the heap or the stack), reported at the body of `main` |
 | E0020 | the program itself failed: an uncaught `error`/failed `assert` of the effect `Error`, a zero divisor in `%`, or a value that needs itself |
+| E0021 | a `match` does not cover every value of its subject's type |
 
 Errors raised by the elaborator (the phase between the parser and the type
 checker) carry a message but no code: they are about the shape of the program

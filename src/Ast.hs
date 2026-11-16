@@ -10,6 +10,7 @@ module Ast (
   Chunk(..),
   TopLevelStat(..),
   topLevelSpan,
+  EnumCase(..),
   EffectOp(..),
   FunctArg(..),
   Typ(..),
@@ -40,6 +41,9 @@ module Ast (
   RecordTypeArgProp(..),
   Exp(..),
   ExpNode(..),
+  Pattern(..),
+  PatternNode(..),
+  MatchClause(..),
   -- Read-only views of 'ExpNode', for destructuring.
   pattern EName,
   pattern EApply,
@@ -55,6 +59,7 @@ module Ast (
   pattern EParen,
   pattern EWith,
   pattern EAnnot,
+  pattern EMatch,
   binExp,
   HandlerClause(..),
   Literal(..),
@@ -115,6 +120,7 @@ data TopLevelStat =
   TypeDef Span Text TypeParams {-EffParams-} Typ
   | EffectDef Span Text TypeParams [EffectOp]
   | RowDef Span Text EffRow
+  | EnumDef Span Text TypeParams [EnumCase]
   | FunctDef Span Text TypeParams EffParams [FunctArg] (Maybe EffRow) Typ Block
   deriving (Eq, Show, Generic)
 instance Sexp TopLevelStat where sexp = show
@@ -125,7 +131,110 @@ topLevelSpan = \case
   TypeDef s _ _ _ -> s
   EffectDef s _ _ _ -> s
   RowDef s _ _ -> s
+  EnumDef s _ _ _ -> s
   FunctDef s _ _ _ _ _ _ _ -> s
+
+-- | One case of an @enum@: the constructor's name and its fields.
+--
+--   A field is a name, a mutability and a type; the mutability is @val@ when
+--   the declaration omits it, because a field of a constructor is a value the
+--   pattern reads, not a place the program may assign.
+data EnumCase = EnumCase Text [(ConstantQualifier, Text, Typ)]
+  deriving (Eq, Show, Generic)
+instance Sexp EnumCase where sexp = show
+
+instance Pretty EnumCase where
+  pretty (EnumCase n fs) = T.concat [
+      "| ", n, T.concat (map prettyField fs)
+    ]
+    where
+      prettyField (q, f, t) = T.concat [" (", pretty q, " ", f, " : ", pretty t, ")"]
+
+-- | A pattern of a @match@ clause.
+--
+--   Patterns are their own node kind because they bind names and cannot be
+--   evaluated: a pattern is checked against the scouted type, not run.
+data Pattern = MkPattern {
+    patSpan :: Span
+  , patNode :: PatternNode
+  } deriving (Eq, Show, Generic)
+
+instance Sexp Pattern where sexp = sexp . patNode
+
+data PatternNode =
+    PInt Integer
+  | PFloat Scientific
+  | PString Text
+  | PNil
+  | PBoolean Bool
+  -- | A bare name binds the component it stands for: `#Some x` binds the
+  --   field of the constructor to @x@.
+  | PName Text
+  -- | @val n@ or @val r@a@: the value must equal the one the name already
+  --   holds, compared with @==@.
+  | PVal Exp [Text]
+  | PArray [Pattern] (Maybe Pattern)
+  | PTuple [Pattern]
+  -- | @#Some x y@: the constructor and the components bound by the fields.
+  | PCon Text [Pattern]
+  -- | @p as n@: match @p@ and bind the whole value to @n@ as well.
+  | PAs Pattern Text
+  -- | @p : T@: the pattern is checked against a narrower type.
+  | PCast Pattern Typ
+  | PWildcard
+  | PParen Pattern
+  -- | @front |-> rest@: the string starts with @front@, @rest@ is the rest.
+  | PStarts Pattern Pattern
+  -- | @rest <-| back@: the string ends with @back@, @rest@ is the rest.
+  | PEnds Pattern Pattern
+  deriving (Eq, Show, Generic)
+
+instance Sexp PatternNode
+
+instance Pretty Pattern where
+  pretty (MkPattern _ n) = pretty n
+
+instance Pretty PatternNode where
+  pretty = \case
+    PInt i -> T.pack $ show i
+    PFloat f -> T.pack $ show f
+    PString s -> T.concat ["'", s, "'"]
+    PNil -> "()"
+    PBoolean b -> if b then "true" else "false"
+    PName n -> n
+    PVal e ns -> T.concat ["val ", pretty (PathExp e ns)]
+    PArray es tailP -> T.concat [
+        "[",
+        T.unwords $ map pretty es,
+        maybe "" (("; " <>) . pretty) tailP,
+        "]"
+      ]
+    PTuple ps -> T.intercalate ", " $ map pretty ps
+    PCon n ps -> T.unwords $ ("#" <> n) : map pretty ps
+    PAs p n -> T.concat [pretty p, " as ", n]
+    PCast p t -> T.concat [pretty p, " : ", pretty t]
+    PWildcard -> "_"
+    PParen p -> T.concat ["(", pretty p, ")"]
+    PStarts l r -> T.concat [pretty l, " |-> ", pretty r]
+    PEnds l r -> T.concat [pretty l, " <-| ", pretty r]
+
+-- | A clause of a @match@.
+--
+--   A primitive clause is several patterns in one clause (@| 1 2 3 as n@):
+--   the value matches when it matches any of them, and the alias, if written,
+--   binds the value itself.
+data MatchClause = MatchClause [Pattern] (Maybe Exp) Block
+  deriving (Eq, Show, Generic)
+instance Sexp MatchClause
+
+instance Pretty MatchClause where
+  pretty (MatchClause ps g b) = T.concat [
+      "| ",
+      T.unwords $ map pretty ps,
+      maybe "" ((" if " <>) . pretty) g,
+      " => ",
+      pretty b
+    ]
 
 instance Pretty TopLevelStat where
   pretty = \case
@@ -135,6 +244,8 @@ instance Pretty TopLevelStat where
       T.concat ["effect ", n, prettyTs ts, " ", T.unwords $ map pretty ops, " end"]
     RowDef _ n row ->
       T.concat ["row ", n, " = ", pretty row]
+    EnumDef _ n ts cs ->
+      T.concat ["enum ", n, prettyTs ts, T.concat (map ((" " <>) . pretty) cs)]
     FunctDef _ n ts es args fxs t b ->
       T.concat [
         "funct ",
@@ -465,6 +576,8 @@ data ExpNode =
   | NWith Exp TypeApps EffApps
   -- | @e : T@: the type the reader claims for an expression.
   | NAnnot Exp Typ
+  -- | @match e to clauses@: the subject and the clauses.
+  | NMatch Exp [MatchClause]
   deriving (Eq, Show, Generic)
 
 instance Sexp Exp where sexp = sexp . expNode
@@ -534,8 +647,13 @@ pattern EAnnot :: Exp -> Typ -> Exp
 pattern EAnnot e t <- Exp _ (NAnnot e t) where
   EAnnot e t = Exp noSpan (NAnnot e t)
 
+pattern EMatch :: Exp -> [MatchClause] -> Exp
+pattern EMatch e cs <- Exp _ (NMatch e cs) where
+  EMatch e cs = Exp noSpan (NMatch e cs)
+
 {-# COMPLETE EName, EApply, EDollar, ELiteral, EPair, ELet, EBacktick
-   , EPropAccess, EIfThenElse, EUnder, EResume, EParen, EWith, EAnnot #-}
+   , EPropAccess, EIfThenElse, EUnder, EResume, EParen, EWith, EAnnot
+   , EMatch #-}
 
 -- | A node covering both children.
 binExp :: (Exp -> Exp -> ExpNode) -> Exp -> Exp -> Exp
@@ -560,6 +678,9 @@ instance Pretty ExpNode where
     NParen b -> T.concat ["(", pretty b, ")"]
     NWith e tas eas -> T.concat [pretty e, " with ", pretty tas, pretty eas]
     NAnnot e t -> T.concat [pretty e, " : ", pretty t]
+    NMatch e cs -> T.concat [
+        "match ", pretty e, " to ", T.concat (map ((" " <>) . pretty) cs)
+      ]
 
 data ExpPrecedence =
   PrecResume

@@ -64,6 +64,7 @@ cases =
   , ("record_update",     ["#{val a = 1; val b = 2}", "#{val a = 1; val b = 2; val c = 3}", "1", "#{val a = 10; val b = 2}", "1"])
   , ("path_assign",       ["2", "10", "21"])
   , ("lazy_and",          ["false"])
+  , ("enums",             ["Some 5", "None", "5", "none", "cdef", "two"])
   , ("long_loop",         ["30000", "0", "300000"])
   , ("collections",       [ "5"
                           , "hello"

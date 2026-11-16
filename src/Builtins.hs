@@ -130,6 +130,14 @@ builtins = [
     Builtin "force" Native,
     Builtin "whnf" Native,
 
+    -- comparing two values of one type: `==` and `!=` compare content,
+    -- `===` and `!==` compare the values themselves.  They are polymorphic,
+    -- which is why they are not fields of a record yet (see the note above).
+    Builtin "==" Native,
+    Builtin "===" Native,
+    Builtin "!=" Native,
+    Builtin "!==" Native,
+
     -- the polymorphic groups of `app/std.marr`, unpacked (see the note above):
     -- `Functions`
     Builtin "id" Native,

@@ -3,7 +3,8 @@
 {-# LANGUAGE LambdaCase #-}
 
 module Config (
-  resolveConfig
+  resolveConfig,
+  parseOutputFormat
 )
 where
 
@@ -17,19 +18,15 @@ import Data.Aeson (
     fieldLabelModifier,
     genericParseJSON,
     defaultOptions,
-    genericToJSON, eitherDecode
+    genericToJSON,
+    eitherDecode
   )
-import Data.Maybe (fromMaybe)
 import qualified Data.ByteString.Lazy as BS
 -- import Data.Aeson.Types (Parser)
 import Options.Applicative (execParser, (<|>), Alternative (many), ReadM, eitherReader, optional, option, Parser, long, metavar, help, strOption, short, value, showDefault, switch, ParserInfo, info, helper, (<**>), fullDesc, progDesc, header, auto, strArgument)
 import qualified Data.Map as Map
-import Data.Text.Encoding (encodeUtf8)
-import Data.Bifunctor (Bifunctor(first))
-import Data.Either (fromLeft)
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.FilePath ((</>))
-import Control.Monad (when)
 import Text.Read (readMaybe)
 import Text.Printf (printf)
 

@@ -34,6 +34,7 @@ module Types (
   pattern PropAccess,
   pattern IfElse,
   pattern Annot,
+  pattern Match,
   atSpan,
   -- Scope(..),
   Block,
@@ -71,6 +72,17 @@ module Types (
   LetPattern(..),
   LetPatternRecordProp(..),
   HandlerClause,
+  Pattern(..),
+  PatternNode(..),
+  MatchClause(..),
+  EnumDef(..),
+  EnumCase(..),
+  enumName,
+  enumParams,
+  enumCases,
+  enumCaseName,
+  enumCaseFields,
+  constructorTyp,
   TasteMap,
   tasteName,
   metaLevel,
@@ -146,6 +158,10 @@ data Typ =
   | TPair Typ Typ EffRow
   | TFunct Funct                -- arg -> row ret
   | TRecord [TRecordProp] EffRow
+  -- | A declared enumeration: its name and the arguments of its parameters.
+  --   The type is nominal -- two enums that happen to have the same cases are
+  --   still two types -- so the name is compared before the arguments.
+  | TEnum Text [TypeArg]
   | TForall
     [Taste] [Taste] [Taste]
     (TasteMap (Set Text))
@@ -169,6 +185,8 @@ instance Pretty Typ where
     TFunct f -> pretty f
     TRecord props r ->
       "#{" <> T.intercalate "; " (map pretty props) <>  "}" <> prettyPending r
+    TEnum n args ->
+      n <> if null args then "" else T.concat ["[", T.intercalate "; " (map pretty args), "]"]
     TForall ts es rs els rls t -> T.concat [
         "forall ",
         "[", T.unwords $ map tasteName ts, "]",
@@ -328,6 +346,8 @@ data ExprNode =
   | IfElseNode Expr Expr Expr
   -- | @e : T@: the type the reader claims for an expression.
   | AnnotNode Expr Typ
+  -- | @match e to clauses@.
+  | MatchNode Expr [MatchClause]
   deriving (Eq, Ord, Show)
 
 pattern Int :: Integer -> Expr
@@ -412,9 +432,13 @@ pattern Annot :: Expr -> Typ -> Expr
 pattern Annot e t <- MkExpr _ (AnnotNode e t) where
   Annot e t = MkExpr (exprSpan e) (AnnotNode e t)
 
+pattern Match :: Expr -> [MatchClause] -> Expr
+pattern Match e cs <- MkExpr _ (MatchNode e cs) where
+  Match e cs = MkExpr (exprSpan e) (MatchNode e cs)
+
 {-# COMPLETE Int, Float, Boolean, String, Nil, XVar, Array, Pair, XLambda
    , NLambda, Apply, Record, With, Handle, Paren, Resume, Let, PropAccess
-   , IfElse, Annot #-}
+   , IfElse, Annot, Match #-}
 
 -- | Move an expression to a different span.  Used by the elaborator, which
 --   knows the span of the AST node a node came from.
@@ -452,6 +476,9 @@ instance Pretty ExprNode where
     PropAccessNode e n -> pretty e <> "@" <> n
     IfElseNode p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
     AnnotNode e t -> pretty e <> " : " <> pretty t
+    MatchNode e cs -> T.concat [
+        "match ", pretty e, " to ", T.concat (map ((" " <>) . pretty) cs)
+      ]
 
 prettyERecordProp :: ERecordProp -> Text
 prettyERecordProp p = T.concat [
@@ -493,13 +520,33 @@ data TypeArg =
   | TAPair TypeArg TypeArg
   | TAFunct TypeArg TypeArg
   | TARecord [TARecordProp]
+  -- | A declared enumeration used as a type argument, @Maybe[Int]@.
+  | TAEnum Text [TypeArg]
   | TAVar Taste
   deriving (Eq, Ord, Show, Generic)
 
 instance Sexp TypeArg
 
 instance Pretty TypeArg where
-  pretty = T.pack . show
+  pretty = \case
+    TAInt -> "Int"
+    TAFloat -> "Float"
+    TABoolean -> "Boolean"
+    TANil -> "()"
+    TANothing -> "Nothing"
+    TAString -> "String"
+    TAFlat n -> n
+    TAArray t -> T.concat ["[", pretty t, "]"]
+    TAPair l r -> T.concat ["(", pretty l, ", ", pretty r, ")"]
+    TAFunct i o -> T.concat [pretty i, " -> ", pretty o]
+    TARecord props -> T.concat [
+        "#{",
+        T.intercalate "; " [T.unwords [pretty m, n, ":", pretty t] | TARecordProp m n t <- props],
+        "}"
+      ]
+    TAEnum n args ->
+      n <> if null args then "" else T.concat ["[", T.intercalate "; " (map pretty args), "]"]
+    TAVar v -> tasteName v
 
 data TARecordProp = TARecordProp Mutability Text TypeArg deriving (Eq, Ord, Show, Generic)
 instance Sexp TARecordProp
@@ -645,6 +692,132 @@ instance Show Stat where
       T.unpack name <> concatMap ('@' :) (map T.unpack path) <> " := " <> show expr
     Expr expr -> show expr
 
+-- | A pattern of a @match@ clause, after elaboration.
+--
+--   The elaborator resolves the types a @val@ pattern walks and the type of a
+--   cast, so a pattern carries no syntax of its own that the checker would
+--   have to look up again.
+data Pattern = MkPattern {
+    patSpan :: Span
+  , patNode :: PatternNode
+  } deriving (Eq, Ord, Show)
+
+data PatternNode =
+    PInt Integer
+  | PFloat Scientific
+  | PString Text
+  | PNil
+  | PBoolean Bool
+  -- | A bare name binds the component it stands for.
+  | PName Text
+  -- | @val r@a@b@: the value must equal the one the path already holds.
+  | PVal Expr [Text]
+  | PArray [Pattern] (Maybe Pattern)
+  | PTuple [Pattern]
+  | PCon Text [Pattern]
+  | PAs Pattern Text
+  | PCast Pattern Typ
+  | PWildcard
+  | PStarts Pattern Pattern
+  | PEnds Pattern Pattern
+  deriving (Eq, Ord, Show)
+
+instance Pretty Pattern where
+  pretty (MkPattern _ n) = pretty n
+
+instance Pretty PatternNode where
+  pretty = \case
+    PInt i -> T.pack $ show i
+    PFloat f -> T.pack $ show f
+    PString s -> T.concat ["'", s, "'"]
+    PNil -> "()"
+    PBoolean b -> if b then "true" else "false"
+    PName n -> n
+    PVal e ns -> T.concat ["val ", pretty e, T.concat (map ("@" <>) ns)]
+    PArray ps t ->
+      T.concat ["[", T.unwords $ map pretty ps, maybe "" (("; " <>) . pretty) t, "]"]
+    PTuple ps -> T.intercalate ", " $ map pretty ps
+    PCon n ps -> T.unwords $ ("#" <> n) : map pretty ps
+    PAs p n -> T.concat [pretty p, " as ", n]
+    PCast p t -> T.concat [pretty p, " : ", pretty t]
+    PWildcard -> "_"
+    PStarts l r -> T.concat [pretty l, " |-> ", pretty r]
+    PEnds l r -> T.concat [pretty l, " <-| ", pretty r]
+
+-- | A clause of a @match@: the patterns it accepts (more than one for a
+--   primitive clause), an optional guard and the block it selects.
+data MatchClause = MatchClause [Pattern] (Maybe Expr) Block
+  deriving (Eq, Ord, Show)
+
+instance Pretty MatchClause where
+  pretty (MatchClause ps g b) = T.concat [
+      "| ", T.unwords $ map pretty ps,
+      maybe "" ((" if " <>) . pretty) g,
+      " => ", pretty b
+    ]
+
+-- | One case of a declared enumeration: the constructor and its fields.
+--
+--   A field is a name, a mutability and a type.  The mutability is how the
+--   value the field holds is reached: @val@ is a value, @var@ is a cell the
+--   constructor creates, and @imm@ is a snapshot.
+data EnumCase = EnumCase Text [(Mutability, Text, Typ)]
+  deriving (Eq, Ord, Show)
+
+instance Pretty EnumCase where
+  pretty (EnumCase n fs) = T.concat [
+      "| ", n,
+      T.concat [T.concat [" (", pretty m, " ", f, " : ", pretty t, ")"]
+               | (m, f, t) <- fs]
+    ]
+
+-- | A declared enumeration after elaboration.
+--
+--   The type parameters are the rigid variables their fields mention, so a
+--   constructor's scheme quantifies exactly them and `Maybe[Int]` substitutes
+--   the argument for the variable in every field at once.
+data EnumDef = EnumDef Text [Taste] [EnumCase]
+  deriving (Eq, Ord, Show)
+
+enumName :: EnumDef -> Text
+enumName (EnumDef n _ _) = n
+
+enumParams :: EnumDef -> [Taste]
+enumParams (EnumDef _ ps _) = ps
+
+enumCases :: EnumDef -> [EnumCase]
+enumCases (EnumDef _ _ cs) = cs
+
+enumCaseName :: EnumCase -> Text
+enumCaseName (EnumCase n _) = n
+
+enumCaseFields :: EnumCase -> [(Mutability, Text, Typ)]
+enumCaseFields (EnumCase _ fs) = fs
+
+-- | The type of a constructor: one arrow per field, ending in the enum
+--   applied to the declaration's parameters.
+constructorTyp :: EnumDef -> EnumCase -> Typ
+constructorTyp def c =
+  buildCurriedEnum
+    [t | (_, _, t) <- enumCaseFields c]
+    (TEnum (enumName def) (map TAVar (enumParams def)))
+  where
+    -- A constructor with a `var` field creates a cell, so applying it is what
+    -- performs `Var`; the row sits on the arrow that yields the value.
+    createsCell = any (\(m, _, _) -> m == Var) (enumCaseFields c)
+    outRow = if createsCell then RClosed [EffCons $ ECons "Var" []] else RClosed []
+    buildCurriedEnum fs out = case fs of
+      [] -> out
+      [t] -> TFunct (Funct t out outRow)
+      (t:ts) -> tfunc t (buildCurriedEnum ts out)
+
+instance Pretty EnumDef where
+  pretty (EnumDef n ps cs) = T.concat [
+      "enum ", n,
+      if null ps then "" else T.concat ["[", T.unwords (map tasteName ps), "]"],
+      T.concat (map ((" " <>) . pretty) cs)
+    ]
+
 -- | A top-level declaration with the region of source it came from.  The
 --   type checker reports duplicates, which are found after elaboration has
 --   thrown the syntax away, so the position has to travel with the node.
@@ -653,6 +826,7 @@ data TopLevelStat =
   | STypeDef Span Text [Text] {-[String]-} Typ
   | SEffDef Span EffDef
   | SRowDef Span RowDef
+  | SEnumDef Span EnumDef
   deriving (Show, Generic)
 instance Sexp TopLevelStat where sexp = show
 
@@ -663,12 +837,14 @@ topLevelSpan = \case
   STypeDef s _ _ _ -> s
   SEffDef s _ -> s
   SRowDef s _ -> s
+  SEnumDef s _ -> s
 
 instance Pretty TopLevelStat where
   pretty = \case
     SFunctDef _ f -> pretty f
     SRowDef _ r -> pretty r
     SEffDef _ e -> pretty e
+    SEnumDef _ e -> pretty e
     s -> T.pack $ show s
 
 data FunctDecl = FunctDecl {
@@ -778,6 +954,7 @@ typeArgToTyp = \case
   TAPair l r -> TPair (typeArgToTyp l) (typeArgToTyp r) (RClosed [])
   TAFunct i o -> TFunct (Funct (typeArgToTyp i) (typeArgToTyp o) (RClosed []))
   TARecord props -> TRecord [TRecordProp m n (typeArgToTyp t) | TARecordProp m n t <- props] (RClosed [])
+  TAEnum n args -> TEnum n args
   TAVar v -> TVar v
 
 -- | A type seen as a type argument, when it has a type-argument shape.
@@ -799,6 +976,7 @@ typToTypeArg = \case
   TFunct (Funct i o (RClosed [])) -> TAFunct <$> typToTypeArg i <*> typToTypeArg o
   TRecord props (RClosed []) ->
     TARecord <$> traverse (\(TRecordProp m n t) -> TARecordProp m n <$> typToTypeArg t) props
+  TEnum n args -> Just (TAEnum n args)
   TVar v -> Just (TAVar v)
   _ -> Nothing
 

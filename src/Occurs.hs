@@ -7,7 +7,7 @@ module Occurs (
   rowOccursInEffRow,
   typeContainsEffects
 ) where
-import Types (Typ(..), EffRow(..), Taste, EffRow, TRecordProp (..), Funct (..), TypeArg (..), TARecordProp (TARecordProp), EffCons (..), ECons (..))
+import Types (Typ(..), EffRow(..), Taste, EffRow, TRecordProp (..), Funct (..), TypeArg (..), TARecordProp (TARecordProp), EffCons (..), ECons (..), typeArgToTyp)
 
 -- | Does the type (or the pending row of an aggregate) mention this type
 --   variable?
@@ -22,6 +22,7 @@ typeOccursInType x = \case
   TRecord props r ->
     any (\(TRecordProp _ _ typ) -> typeOccursInType x typ) props
       || typeOccursInEffRow x r
+  TEnum _ args -> any (typeOccursInTypeArg x) args
   _ -> False
 
 typeOccursInTypeArg :: Taste -> TypeArg -> Bool
@@ -31,6 +32,7 @@ typeOccursInTypeArg x = \case
   TAPair l r -> any (typeOccursInTypeArg x) [l, r]
   TAFunct i o -> any (typeOccursInTypeArg x) [i, o]
   TARecord props -> any (\(TARecordProp _ _ typ) -> typeOccursInTypeArg x typ) props
+  TAEnum _ args -> any (typeOccursInTypeArg x) args
   _ -> False
 
 typeOccursInEffRow :: Taste -> EffRow -> Bool
@@ -55,4 +57,5 @@ typeContainsEffects = \case
   TPair l r _ -> any typeContainsEffects [l, r]
   TForall _ es rs _ _ t -> es /= [] || rs /= [] || typeContainsEffects t
   TRecord props _ -> any (\(TRecordProp _ _ typ) -> typeContainsEffects typ) props
+  TEnum _ args -> any (typeContainsEffects . typeArgToTyp) args
   _ -> False

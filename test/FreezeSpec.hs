@@ -63,6 +63,7 @@ emptyScope = Scope
   { types = Map.empty
   , values = Map.empty
   , effects = Map.empty
+  , enums = Map.empty
   , handlerSig = Nothing
   , typeSubst = Map.empty
   , typeArgSubst = Map.empty

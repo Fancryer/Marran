@@ -18,7 +18,8 @@ import Types (
     LetPattern(..),
     AtomLetPattern(..),
     LetPatternRecordProp(..),
-    LambdaParam(..), EffRow (..)
+    LambdaParam(..), EffRow (..),
+    enumCases, enumCaseName, enumCaseFields
   )
 import qualified Data.Map as Map
 import Data.Map (Map)
@@ -39,10 +40,12 @@ import TypedIR (
     pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
     pattern TEPropAccess, pattern TEIfElse,
     pattern TEAnnot,
+    pattern TEMatch,
+    TPattern(..), TPatternNode(..), TMatchClause(..),
     Lambda(..), Block, TERecordProp(..))
 import Control.Monad.State.Strict
-import Control.Monad (foldM, forM, forM_, void, unless, when)
-import Infer (freezeMutability, freeze, freezeBlock, freezeLambda)
+import Control.Monad (foldM, forM, forM_, void, unless, when, zipWithM)
+import Infer (freezeMutability, freeze, freezeBlock, freezeLambda, touches)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import qualified Eff
@@ -89,6 +92,11 @@ data Value
   | VArray [Address]
   | VPair Address Address
   | VRecord EnvId
+  -- | A value of a declared enumeration: the constructor it was built with
+  --   and its fields.  The mutability of a field is part of the value, because
+  --   a constructor with a `var` field creates a cell and reading it costs
+  --   `Read`, exactly as a `var` field of a record does.
+  | VEnum Text [(Mutability, Address)]
   | VClosure EnvId (Maybe (IntMap Address)) (Maybe Code) (Address -> Interp Address)
   | VThunk TypedExpr EnvId
   | VBThunk Block EnvId
@@ -105,6 +113,7 @@ instance Show Value where
     VArray as -> concat ["(VArray [", unwords $ map show as, "])"]
     VPair l r -> concat ["(VPair ", show l, " ", show r, ")"]
     VRecord fields -> "!record" <> show fields <> "!"
+    VEnum n fs -> concat ["(VEnum ", T.unpack n, " [", unwords $ map (show . snd) fs, "])"]
     VClosure _ _ code _ -> T.unpack (codeName code)
     VThunk te _ -> "!vthunk" <> show te <> "!"
     VBThunk b _ -> "!bthunk" <> show b <> "!"
@@ -121,6 +130,7 @@ instance Pretty Value where
     VPair l r -> T.concat ["(", pretty l, ", ", pretty r, ")"]
     VArray vals -> "[" <> T.intercalate ", " (map pretty vals) <> "]"
     VRecord eid -> "!record[" <> pretty eid <> "]!"
+    VEnum n fs -> T.intercalate " " (n : map (pretty . snd) fs)
     VClosure _ _ code _ -> codeName code
     VThunk e _env -> T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> T.concat ["!vthunk: ", pretty b,"!"]
@@ -157,6 +167,11 @@ instance Stringify Value where
             Just p -> do
               e <- getEnv p
               go e bindings'
+    -- An enum prints as its constructor applied to its fields, without the
+    -- `#` the pattern writes: `Some 5`, `None`.
+    VEnum n fs -> do
+      fields <- mapM (stringify . snd) fs
+      pure $ T.intercalate " " (n : fields)
     VClosure _ _ code _ -> pure $ codeName code
     VThunk e _env -> pure $ T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> pure $ T.concat ["!bthunk: ", pretty b,"!"]
@@ -772,6 +787,7 @@ describe = \case
   VArray _ -> "an array"
   VPair _ _ -> "a pair"
   VRecord _ -> "a record"
+  VEnum _ _ -> "an enum value"
   VClosure {} -> "a function"
   VThunk _ _ -> "an unevaluated expression"
   VBThunk _ _ -> "an unevaluated expression"
@@ -1162,6 +1178,25 @@ buildInitialEnv _cmdArgs = do
     s <- force a >>= stringify
     alloc $ VString s
 
+  -- `==` and `!=` compare two values of one type structurally; `===` and
+  -- `!==` compare the values themselves, so `1 === 1` is false: the two 1s are
+  -- two values.  The structural comparison forces both sides, because a value
+  -- is what is compared, not a reference to a cell.
+  eqAddr <- native2 "==" $ \a b -> do
+    same <- equalValues Set.empty a b
+    alloc $ VBoolean same
+  neqAddr <- native2 "!=" $ \a b -> do
+    same <- equalValues Set.empty a b
+    alloc $ VBoolean (not same)
+  refEqAddr <- native2 "===" $ \a b -> do
+    a' <- whnf a
+    b' <- whnf b
+    alloc $ VBoolean (addrId a' == addrId b')
+  refNeqAddr <- native2 "!==" $ \a b -> do
+    a' <- whnf a
+    b' <- whnf b
+    alloc $ VBoolean (addrId a' /= addrId b')
+
   -- `try body on_error` runs `body` with a handler for `Error` installed: a
   -- caught message goes to `on_error`, and a body that finishes normally keeps
   -- its value.  The handler is pushed and popped here rather than built by
@@ -1273,6 +1308,10 @@ buildInitialEnv _cmdArgs = do
           ("fst", fstAddr),
           ("snd", sndAddr),
           ("show", showAddr),
+          ("==", eqAddr),
+          ("!=", neqAddr),
+          ("===", refEqAddr),
+          ("!==", refNeqAddr),
           ("try", tryAddr)
         ]
 
@@ -1370,6 +1409,15 @@ evalChunk chunk = do
     fn <- makeTopLevelClosure env0 fd
     void $ bindValIn env0 fd.fName $ VClosure env0 cache
           (Just (CodeFun Whole fd.fName (map fst $ IR.fArgs fd) (IR.fBlock fd))) fn
+
+  -- The constructors of a declared enumeration are ordinary functions of the
+  -- program's scope, so a value is built by applying one: `Some 5`.
+  let enumDefs = [ed | IR.SEnumDef ed <- chunk]
+  forM_ enumDefs $ \def ->
+    forM_ (enumCases def) $ \c -> do
+      let muts = [m | (m, _, _) <- enumCaseFields c]
+      ctor <- makeConstructor env0 (enumCaseName c) muts
+      void $ bindValAddrIn env0 (enumCaseName c) ctor
 
   let mainDecl = findMain chunk
   case mainDecl of
@@ -1620,6 +1668,46 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
         VBoolean True -> cont =<< alloc (VThunk thenExpr env)
         VBoolean False -> cont =<< alloc (VThunk elseExpr env)
         _ -> rtError $ "the condition of an `if` must be a Boolean, but this one is " <> describe condVal
+    -- `match e to clauses`: the first clause whose patterns all accept the
+    -- subject and whose guard holds runs, and its block is the value.  A
+    -- missing clause is a mistake the checker proves away ('NonExhaustiveMatch'),
+    -- so reaching the end here means the program did not follow its own types.
+    TEMatch subject _ clauses -> do
+      traceEval "evalExpr [TEMatch]"
+      subjectAddr <- whnf =<< evalExpr subject pure
+      subjectEnv <- gets sEnv
+      -- The patterns of one clause are alternatives of the same value: the
+      -- first one that accepts it supplies the names the block sees.
+      let tryPatterns [] = pure Nothing
+          tryPatterns (p : ps) =
+            matchTPattern p subjectAddr >>= \case
+              Nothing -> tryPatterns ps
+              Just bindings -> pure $ Just [(n, (Val, a)) | (n, a) <- bindings]
+          runClauses [] =
+            rtError "no clause of this `match` accepts the value, although the checker proved one must"
+          runClauses (TMatchClause ps guard block : rest) = do
+            tryPatterns ps >>= \case
+              Nothing -> runClauses rest
+              Just bindings -> do
+                clauseEnv <- newEnv Env {bindings = Map.fromList bindings, parent = Just subjectEnv}
+                oldEnv <- gets sEnv
+                modify $ \s -> s {sEnv = clauseEnv}
+                guardOk <- case guard of
+                  Nothing -> pure True
+                  Just g -> do
+                    gAddr <- whnf =<< evalExpr g pure
+                    readCell gAddr >>= \case
+                      VBoolean b -> pure b
+                      _ -> rtError "the guard of a `match` clause is not a Boolean"
+                if guardOk
+                  then do
+                    result <- evalBlock block pure
+                    modify $ \s -> s {sEnv = oldEnv}
+                    cont result
+                  else do
+                    modify $ \s -> s {sEnv = oldEnv}
+                    runClauses rest
+      runClauses clauses
     TEAnnot e _ -> evalExpr e cont
 
 -- | Mark a cell whose value is being computed, and report a cycle when the
@@ -1695,6 +1783,9 @@ force addr = withForcing addr $ do
           case env.parent of
             Just p -> go p
             _ -> pure eid'
+    VEnum _ fs -> do
+      mapM_ (force . snd) fs
+      pure addr
     _ -> do
       traceEval $ "force | No need to force " <> T.unpack (pretty addr)
       pure addr
@@ -2070,6 +2161,14 @@ freezeCell a = do
           eid' <- newEnv Env {bindings = Map.fromList bs, parent = Nothing}
           setCell a' (VRecord eid')
           pure a'
+        VEnum n fs -> do
+          a' <- placeholder
+          fs' <- forM fs $ \(m, x) -> do
+            when (m == Var) $ logEvent EvSnapRead
+            x' <- freezeCell x
+            pure (freezeMutability m, x')
+          setCell a' (VEnum n fs')
+          pure a'
         _ -> share a
   where
     remember x y = modify $ \s -> s {sFreezeMemo = IM.insert (addrId x) y s.sFreezeMemo}
@@ -2294,7 +2393,26 @@ freeVars = \case
   TEPropAccess e _ -> freeVars e
   TEIfElse p t f -> Set.unions [freeVars p, freeVars t, freeVars f]
   TEAnnot e _ -> freeVars e
+  TEMatch e _ cs ->
+    Set.unions $ freeVars e : map clauseVars cs
   _ -> Set.empty
+  where
+    clauseVars (TMatchClause ps g b) =
+      Set.unions $
+        map patternVars ps
+          <> maybe [] (pure . freeVars) g
+          <> [freeVarsBlock b]
+
+    patternVars (MkTPattern _ node) = case node of
+      TPValue e -> freeVars e
+      TPArray ps t -> Set.unions (map patternVars ps <> maybe [] (pure . patternVars) t)
+      TPTuple ps -> Set.unions (map patternVars ps)
+      TPCon _ ps -> Set.unions (map patternVars ps)
+      TPAs p _ _ -> patternVars p
+      TPCast p _ -> patternVars p
+      TPStarts l r -> Set.union (patternVars l) (patternVars r)
+      TPEnds l r -> Set.union (patternVars l) (patternVars r)
+      _ -> Set.empty
 
 -- | Свободные переменные блока: имена, связанные его операторами, исключаются
 --  (привязки последовательны и не рекурсивны).
@@ -2351,6 +2469,182 @@ needsValue = \case
     ALPNil -> False
     ALPUnderscore -> False
 
+-- | A constructor of a declared enumeration, as a curried function.
+--
+--   `Some 5` is an ordinary application: the checker binds every constructor
+--   as a function in the program's scope, and the interpreter builds the value
+--   the same way.  A `var` field is a cell the constructor creates, so the
+--   mutability travels with the field and reading it later costs `Read`,
+--   exactly as a `var` field of a record does.
+makeConstructor :: EnvId -> Text -> [Mutability] -> Interp Address
+makeConstructor env name muts = go muts []
+  where
+    go [] acc = alloc $ VEnum name (reverse acc)
+    go (m : rest) acc =
+      alloc $ VClosure env Nothing
+        (Just (CodeNative (if null acc then Whole else Partial) name)) $ \arg ->
+          go rest ((m, arg) : acc)
+
+-- | Decide whether a value is the one a pattern accepts, and return the names
+--   the pattern binds.
+--
+--   The pattern inspects the subject, so it forces what it has to look at; a
+--   name, `_` and an alias of them bind the address as it is, which keeps the
+--   components of a matched value as lazy as the value itself.
+matchTPattern :: TPattern -> Address -> Interp (Maybe [(Text, Address)])
+matchTPattern (MkTPattern _ node) addr = go node
+  where
+    go = \case
+      TPWildcard -> pure $ Just []
+      TPName n _ -> pure $ Just [(n, addr)]
+      TPInt i -> literal $ \case VInt i' -> i == i'; _ -> False
+      TPFloat f -> literal $ \case VFloat f' -> f == f'; _ -> False
+      TPString s -> literal $ \case VString s' -> s == s'; _ -> False
+      TPBoolean b -> literal $ \case VBoolean b' -> b == b'; _ -> False
+      TPNil -> literal $ \case VNil -> True; _ -> False
+      -- @val x@: the value must equal the one the path holds, compared with
+      -- `==`, so two records with the same fields are the same value here.
+      TPValue e -> do
+        other <- evalExpr e pure
+        equal <- equalValues Set.empty addr other
+        pure $ if equal then Just [] else Nothing
+      -- @[a b]@ is exactly two elements, @[a; rest]@ is a head and a tail and
+      -- @[a b; rest]@ is at least two; the parser records which was written.
+      TPArray ps tailP -> do
+        v <- readCell =<< whnf addr
+        case v of
+          VArray xs -> case tailP of
+            Nothing
+              | length ps /= length xs -> pure Nothing
+              | otherwise -> allBinds [matchTPattern p x | (p, x) <- zip ps xs]
+            Just tailPat
+              | length xs < length ps -> pure Nothing
+              | otherwise -> do
+                  headsB <- allBinds [matchTPattern p x | (p, x) <- zip ps xs]
+                  case headsB of
+                    Nothing -> pure Nothing
+                    Just bs -> do
+                      rest <- alloc $ VArray (drop (length ps) xs)
+                      tailB <- matchTPattern tailPat rest
+                      pure $ (bs <>) <$> tailB
+          _ -> pure Nothing
+      TPTuple [l, r] -> do
+        v <- readCell =<< whnf addr
+        case v of
+          VPair addrL addrR -> do
+            lb <- matchTPattern l addrL
+            rb <- matchTPattern r addrR
+            pure $ (<>) <$> lb <*> rb
+          _ -> pure Nothing
+      TPTuple _ -> pure Nothing
+      TPCon n ps -> do
+        v <- readCell =<< whnf addr
+        case v of
+          VEnum n' fs
+            | n == n' && length ps == length fs ->
+                allBinds
+                  [ do
+                      -- A `var` field is a cell: looking inside it is a read.
+                      when (m == Var && touches p) $ logEvent EvRead
+                      matchTPattern p x
+                  | (p, (m, x)) <- zip ps fs
+                  ]
+          _ -> pure Nothing
+      TPAs p n _ -> do
+        bs <- matchTPattern p addr
+        pure $ (\bs' -> bs' <> [(n, addr)]) <$> bs
+      TPCast p _ -> matchTPattern p addr
+      -- @front |-> rest@: the value starts with @front@ and @rest@ is the
+      -- remainder.  The split is the first one that satisfies both patterns,
+      -- which for a literal prefix is the only one there is.
+      TPStarts l r -> do
+        v <- readCell =<< whnf addr
+        case v of
+          VString s -> firstMatch
+            [ do
+                prefix <- alloc $ VString (T.take k s)
+                suffix <- alloc $ VString (T.drop k s)
+                lb <- matchTPattern l prefix
+                rb <- matchTPattern r suffix
+                pure $ (<>) <$> lb <*> rb
+            | k <- [0 .. T.length s]
+            ]
+          _ -> pure Nothing
+      -- @rest <-| back@: the value ends with @back@ and @rest@ is what comes
+      -- before it.
+      TPEnds l r -> do
+        v <- readCell =<< whnf addr
+        case v of
+          VString s -> firstMatch
+            [ do
+                rest <- alloc $ VString (T.take (T.length s - k) s)
+                back <- alloc $ VString (T.drop (T.length s - k) s)
+                lb <- matchTPattern l rest
+                rb <- matchTPattern r back
+                pure $ (<>) <$> lb <*> rb
+            | k <- [0 .. T.length s]
+            ]
+          _ -> pure Nothing
+
+    literal accepts = do
+      v <- forceValue addr
+      pure $ if accepts v then Just [] else Nothing
+
+    -- Every sub-pattern has to accept the component it is given; one refusal
+    -- refuses the whole pattern.
+    allBinds [] = pure $ Just []
+    allBinds (attempt : attempts) = attempt >>= \case
+      Nothing -> pure Nothing
+      Just bs -> fmap (bs <>) <$> allBinds attempts
+
+    firstMatch [] = pure Nothing
+    firstMatch (attempt : attempts) = attempt >>= \case
+      Just bs -> pure (Just bs)
+      Nothing -> firstMatch attempts
+
+-- | Structural equality of two values: what `==` prints as one value.
+--
+--   The set of pairs already being compared breaks cycles, so a record that
+--   contains itself is equal to a copy of itself rather than a loop.
+equalValues :: Set (Int, Int) -> Address -> Address -> Interp Bool
+equalValues seen a b
+  | addrId a == addrId b = pure True
+  | Set.member (addrId a, addrId b) seen = pure True
+  | otherwise = do
+      va <- forceValue a
+      vb <- forceValue b
+      let seen' = Set.insert (addrId a, addrId b) seen
+      case (va, vb) of
+        (VInt x, VInt y) -> pure $ x == y
+        (VFloat x, VFloat y) -> pure $ x == y
+        (VBoolean x, VBoolean y) -> pure $ x == y
+        (VString x, VString y) -> pure $ x == y
+        (VNil, VNil) -> pure True
+        (VArray xs, VArray ys)
+          | length xs == length ys -> and <$> zipWithM (equalValues seen') xs ys
+          | otherwise -> pure False
+        (VPair l1 r1, VPair l2 r2) ->
+          (&&) <$> equalValues seen' l1 l2 <*> equalValues seen' r1 r2
+        -- An enum is equal when it is the same case with equal fields; the
+        -- mutability of a field is how it is reached, not what it holds.
+        (VEnum n1 fs1, VEnum n2 fs2)
+          | n1 == n2 && length fs1 == length fs2 ->
+              and <$> zipWithM (\(_, x) (_, y) -> equalValues seen' x y) fs1 fs2
+          | otherwise -> pure False
+        (VRecord e1, VRecord e2) -> do
+          env1 <- getEnv e1
+          env2 <- getEnv e2
+          let keys1 = Map.keys env1.bindings
+              keys2 = Map.keys env2.bindings
+          if keys1 /= keys2
+            then pure False
+            else and <$> forM keys1 (\k -> case (getRef env1 k, getRef env2 k) of
+                    (Just x, Just y) -> equalValues seen' x y
+                    _ -> pure False)
+        -- Two functions are the same value only when they are the same cell,
+        -- which the check above already settled.
+        _ -> pure False
+
 matchPattern :: LetPattern -> Address -> Interp [(Text, Mutability, Address)]
 matchPattern pat addr = do
   v <- readCell addr
@@ -2392,6 +2686,8 @@ isImmutableValue v = evalStateT (go v) IntMap.empty
     go = \case
       VArray addrs -> foldM (\acc a -> (acc &&) <$> checkAddr a ) True addrs
       VPair l r -> (&&) <$> checkAddr l <*> checkAddr r
+      VEnum _ fs -> foldM (\acc (m, a) ->
+        if m == Var then pure False else (acc &&) <$> checkAddr a) True fs
       VRecord eid -> do
         env <- lift $ getEnv eid
         foldM

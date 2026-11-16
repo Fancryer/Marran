@@ -1,9 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wno-unused-top-binds #-}
+-- {-# OPTIONS_GHC -Wno-unused-top-binds #-}
 {-# LANGUAGE OrPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE ExplicitForAll #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -16,6 +15,7 @@ module Parser(
   parseTokens,
   parseTokensUnposed,
   parseTok,
+  parseExp,
   parseFromText,
   parseFromTextNamed,
   parseTokensNamed,
@@ -27,6 +27,7 @@ module Parser(
   renderParseErrorIn,
   sourceMapFor,
   currentPos,
+  lastConsumedEnd,
   Parser.exp,
   letExp,
   number,
@@ -235,7 +236,7 @@ instance TraversableStream [LToken] where
     in (Nothing, posState')
 
 parseTokens :: Text -> Either String [LToken]
-parseTokens input = parseTokensNamed "<test>" input
+parseTokens = parseTokensNamed "<test>"
 
 parseTokensUnposed :: Text -> Either String [Token]
 parseTokensUnposed input = map ltToken <$> parseTokensNamed "<test>" input
@@ -472,7 +473,7 @@ chunk :: Parser Chunk
 chunk = Chunk <$> many topLevelStat <* eof
 
 topLevelStat :: Parser TopLevelStat
-topLevelStat = locTop $ choice [typeDef, effDef, rowDef, functDef]
+topLevelStat = locTop $ choice [typeDef, enumDef, effDef, rowDef, functDef]
 
 -- | Run a declaration parser and give the result the span it covers.  The
 --   declaration parsers build their node without a position, so the start is
@@ -496,6 +497,193 @@ typeDef = do
 
 typeParams :: Parser TypeParams
 typeParams = TypeParams <$> brackets (some name)
+
+-- | @enum Maybe[T] | None | Some (val x : T)@: a declared enumeration.
+--
+--   Each case is introduced by @|@, so a declaration with no cases cannot be
+--   told apart from a misspelling; at least one case is required.  A field's
+--   type is required, because a field of a constructor is not a fresh
+--   variable: the constructor is one function for the whole enum, so a field
+--   without a type would have no type at all.
+enumDef :: Parser (Span -> TopLevelStat)
+enumDef = do
+  keyword KWEnum
+  n <- name
+  ts <- fromMaybe mempty <$> optional typeParams
+  cs <- some enumCase
+  pure $ \sp -> EnumDef sp n ts cs
+
+enumCase :: Parser EnumCase
+enumCase = do
+  pipesym
+  cn <- name
+  fields <- many $ parens $ do
+    q <- constantQualifier
+    fn <- name
+    _ <- optional colonsym
+    (q, fn,) <$> typ
+  pure $ EnumCase cn fields
+
+-- | @match e to clauses@.  The subject is a block, so @match (say 1; v) to ...@
+--   reads the way every other block-taking form does.
+matchExp :: Parser Exp
+matchExp = do
+  start <- currentPos
+  keyword KWMatch
+  subject <- blockExp
+  keyword KWTo
+  cs <- some matchClause
+  withSpanFrom (spanFromPositions start start) (NMatch subject cs)
+
+-- | A block seen as an expression.  The node is the same one `( ... )` builds,
+--   so the checker and the interpreter need no separate case for it.
+blockExp :: Parser Exp
+blockExp = do
+  start <- currentPos
+  withSpanFrom (spanFromPositions start start) . NParen =<< block
+
+-- | One clause: the patterns it accepts, an optional guard and the block it
+--   selects.
+--
+--   A primitive clause (@| 1 2 3 as n@) is several patterns in one clause, and
+--   the alias belongs to the clause: it names the value whichever of the
+--   alternatives matched, so it becomes the alias of every alternative.
+matchClause :: Parser MatchClause
+matchClause = do
+  pipesym
+  -- `as` is an ordinary name, so a pattern would happily take it as a binder;
+  -- here it belongs to the clause.  A pattern is therefore only tried when the
+  -- next token is not `as`.
+  ps <- some (try (notFollowedBy symbolAs *> patternNoAs))
+  alias <- optional $ do
+    symbolAs
+    name
+  guard' <- optional (keyword KWIf *> Parser.exp)
+  symbol TMatchArrow
+  b <- block
+  let ps' = maybe ps (\n -> map (withAlias' n) ps) alias
+  pure $ MatchClause ps' guard' b
+  where
+    withAlias' n p = MkPattern (patSpan p) (PAs p n)
+
+-- | @as@ is a name, not a keyword: a program may still call a function `as`,
+--   and only a pattern position needs the word here.
+symbolAs :: Parser ()
+symbolAs = tok $ \case
+  TName "as" -> Just ()
+  _ -> Nothing
+
+-- | A pattern that may carry a trailing @as@.
+pattern :: Parser Pattern
+pattern = do
+  p <- patternNoAs
+  m <- optional (symbolAs *> name)
+  pure $ maybe p (withAlias p) m
+
+withAlias :: Pattern -> Text -> Pattern
+withAlias p n = MkPattern (patSpan p) (PAs p n)
+
+-- | A pattern without a trailing @as@.  Nested positions use the full
+--   'pattern', so @(a as x)@ still binds both names.
+patternNoAs :: Parser Pattern
+patternNoAs = patternStarts <|> patternTuple <|> patternSuffix
+
+-- | @front |-> rest@ is right-associative and @rest <-| back@ is
+--   left-associative, as the grammar says: a chain of prefixes reads left to
+--   right, and each prefix narrows what the next one sees.
+patternStarts :: Parser Pattern
+patternStarts = do
+  l <- patternSuffix
+  try (do
+        symbolOp "|->"
+        r <- patternStarts
+        pure $ MkPattern (mergeSpan (patSpan l) (patSpan r)) (PStarts l r))
+    <|> try (do
+        symbolOp "<-|"
+        r <- patternSuffix
+        pure $ MkPattern (mergeSpan (patSpan l) (patSpan r)) (PEnds l r))
+    <|> pure l
+
+symbolOp :: Text -> Parser ()
+symbolOp op = tok $ \case
+  TName n | n == op -> Just ()
+  _ -> Nothing
+
+patternTuple :: Parser Pattern
+patternTuple = do
+  l <- patternSuffix
+  m <- optional (commasym *> patternNoAs)
+  case m of
+    Nothing -> pure l
+    Just r ->
+      let xs = flattenTuple l <> flattenTuple r
+          sp = mergeSpan (patSpan l) (patSpan r)
+      in pure $ MkPattern sp (PTuple xs)
+  where
+    flattenTuple p = case patNode p of
+      PTuple ps -> ps
+      _ -> [p]
+
+-- | The suffixes of a pattern: a cast to a narrower type.
+patternSuffix :: Parser Pattern
+patternSuffix = do
+  p <- patternAtom
+  m <- optional (colonsym *> annotType)
+  pure $ maybe p (\t -> MkPattern (patSpan p) (PCast p t)) m
+
+patternAtom :: Parser Pattern
+patternAtom = locPattern $ choice [
+    try (PInt <$> intLiteral),
+    try (PFloat <$> floatLiteral),
+    try (PString <$> stringLiteral),
+    try (PNil <$ nil),
+    try (PBoolean <$> bool),
+    try (uncurry PVal <$> (keyword KWVal *> valPath)),
+    try (uncurry PArray <$> brackets arrayPatternTail),
+    try charCon,
+    try (PWildcard <$ symbol TUnderscore),
+    try (do
+      symbol TParenL
+      p <- pattern
+      symbol TParenR
+      pure $ patNode p),
+    try (PName <$> name)
+  ]
+
+-- | @val r@a@b@: the path whose value the pattern compares against.
+valPath :: Parser (Exp, [Text])
+valPath = do
+  start <- currentPos
+  n <- name
+  base <- withSpanFrom (spanFromPositions start start) (NName n)
+  path <- many (symbol TAt *> name)
+  pure (base, path)
+
+-- | The inside of an array pattern: @[]@, @[a b]@ (exactly two), @[a; rest]@
+--   (head and tail) or @[a b; rest]@ (at least two).
+arrayPatternTail :: Parser ([Pattern], Maybe Pattern)
+arrayPatternTail = do
+  heads <- many pattern
+  tailP <- optional (semisym *> pattern)
+  pure (heads, tailP)
+
+-- | @#Some x y@, @#None@.
+charCon :: Parser PatternNode
+charCon = do
+  symbol TSharp
+  n <- name
+  -- `#Some x as whole` is the constructor pattern and then an alias of the
+  -- whole clause, not `Some` applied to three fields: `as` belongs to the
+  -- clause, so a field is only tried when the next token is not `as`.
+  args <- many (try (notFollowedBy symbolAs *> patternNoAs))
+  pure $ PCon n args
+
+locPattern :: Parser PatternNode -> Parser Pattern
+locPattern p = do
+  start <- currentPos
+  n <- p
+  sp <- spanUpToHere (spanFromPositions start start)
+  pure $ MkPattern sp n
 
 effParams :: Parser EffParams
 effParams = do
@@ -929,9 +1117,10 @@ prefixExp =
       try ifExp
   <|> try letExp
   <|> try under
+  <|> try matchExp
   <|> try (loc $ NLiteral <$> literal)
   <|> try parensThing
-  <|> (loc $ NName <$> name)
+  <|> loc (NName <$> name)
 
 -- Постфикс и инфикс операторы
 parsePostfix :: Exp -> Parser Exp

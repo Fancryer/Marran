@@ -16,6 +16,7 @@ module Infer (
   inferBlock,
   inferChunk,
   freezeMutability,
+  touches,
   freeze,
   freezeTyp,
   freezeBlock,
@@ -44,6 +45,7 @@ import Types(
     pattern Apply, pattern Record, pattern With, pattern Handle, pattern Paren,
     pattern Resume, pattern Let, pattern PropAccess, pattern IfElse,
     pattern Annot,
+    pattern Match,
     exprSpan,
     Handler(..),
     Lambda,
@@ -68,6 +70,7 @@ import Types(
     Chunk,
     TopLevelStat(..),
     effName,
+    enumName, enumParams, enumCases, enumCaseName, enumCaseFields, constructorTyp,
     FunctDecl(..),
     tfunc, ECons (..), countArgs, monoScheme, EffDef(..),
     TARecordProp(TARecordProp),
@@ -86,6 +89,7 @@ import Unify (
     subsumesType,
     applyTypeSubst,
     freshMetaTypeM,
+    freshMetaTypeArgM,
     freshMetaM,
     freshMetaRowM,
     removeConsFromRow,
@@ -96,7 +100,7 @@ import Unify (
   )
 import qualified Eff
 import qualified Scope
-import Control.Monad (foldM, when, forM)
+import Control.Monad (foldM, when, forM, unless)
 import Scope (enterScope)
 import Utils (uniqPreserveOrder, Pretty (pretty))
 import qualified Data.Text as T
@@ -123,6 +127,15 @@ import TypedIR (
     pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
     pattern TEPropAccess, pattern TEIfElse,
     pattern TEAnnot,
+    pattern TEMatch,
+    Pattern(..),
+    PatternNode(..),
+    MatchClause(..),
+    TPattern(..),
+    TPatternNode(..),
+    TMatchClause(..),
+    EnumDef(..),
+    EnumCase(..),
     atTypedSpan,
     pattern Bind, pattern Rebind, pattern Expr,
     atTypedStatSpan
@@ -145,6 +158,7 @@ type InferM a = TypeCheckM (InferResult a)
 isTypeMonomorphic :: Scope -> Typ -> Bool
 isTypeMonomorphic scope = \case
   TForall{} -> False
+  TEnum _ args -> all (isTypeArgMonomorphic scope) args
   TVar v -> maybe False (isTypeMonomorphic scope) $ Map.lookup v $ typeSubst scope
   TArray t r -> isTypeMonomorphic scope t && isEffRowMonomorphic scope r
   TPair l r fx ->
@@ -161,6 +175,7 @@ isTypeArgMonomorphic scope = \case
   TAPair l r -> isTypeArgMonomorphic scope l && isTypeArgMonomorphic scope r
   TAFunct i o -> isTypeArgMonomorphic scope i && isTypeArgMonomorphic scope o
   TARecord props -> all (isTypeArgMonomorphic scope . taTypeArg) props
+  TAEnum _ args -> all (isTypeArgMonomorphic scope) args
   _ -> True
 
 isEffConsMonomorphic :: Scope -> EffCons -> Bool
@@ -211,6 +226,11 @@ substituteTypedExpr scope = \case
   TEPropAccess e f -> TEPropAccess <$> substituteTypedExpr scope e <*> pure f
   TEIfElse p t f -> TEIfElse <$> substituteTypedExpr scope p <*> substituteTypedExpr scope t <*> substituteTypedExpr scope f
   TEAnnot e t -> TEAnnot <$> substituteTypedExpr scope e <*> applyTypeSubst scope t
+  TEMatch e t cs -> do
+    e' <- substituteTypedExpr scope e
+    t' <- applyTypeSubst scope t
+    cs' <- mapM (substituteMatchClause scope) cs
+    pure $ TEMatch e' t' cs'
   TEHandle handler t -> do
     t' <- applyTypeSubst scope t
     handler' <- substituteHandler scope handler
@@ -220,6 +240,34 @@ substituteTypedExpr scope = \case
       <$> applyTypeSubst scope i
       <*> applyTypeSubst scope o
       <*> applyEffRowSubst scope r)
+
+-- | Apply the substitution to the types a checked pattern carries.
+substituteTPattern :: Scope -> TPattern -> TypeCheckM TPattern
+substituteTPattern scope (MkTPattern sp node) = MkTPattern sp <$> go node
+  where
+    go = \case
+      TPInt i -> pure (TPInt i)
+      TPFloat f -> pure (TPFloat f)
+      TPString s -> pure (TPString s)
+      TPBoolean b -> pure (TPBoolean b)
+      TPNil -> pure TPNil
+      TPName n t -> TPName n <$> applyTypeSubst scope t
+      TPValue e -> TPValue <$> substituteTypedExpr scope e
+      TPArray ps t -> TPArray <$> mapM (substituteTPattern scope) ps <*> mapM (substituteTPattern scope) t
+      TPTuple ps -> TPTuple <$> mapM (substituteTPattern scope) ps
+      TPCon n ps -> TPCon n <$> mapM (substituteTPattern scope) ps
+      TPAs p n t -> TPAs <$> substituteTPattern scope p <*> pure n <*> applyTypeSubst scope t
+      TPCast p t -> TPCast <$> substituteTPattern scope p <*> applyTypeSubst scope t
+      TPWildcard -> pure TPWildcard
+      TPStarts l r -> TPStarts <$> substituteTPattern scope l <*> substituteTPattern scope r
+      TPEnds l r -> TPEnds <$> substituteTPattern scope l <*> substituteTPattern scope r
+
+substituteMatchClause :: Scope -> TMatchClause -> TypeCheckM TMatchClause
+substituteMatchClause scope (TMatchClause ps g b) = do
+  ps' <- mapM (substituteTPattern scope) ps
+  g' <- mapM (substituteTypedExpr scope) g
+  b' <- substituteBlock scope b
+  pure $ TMatchClause ps' g' b'
 
 substituteRecordProp :: Scope -> TERecordProp -> TypeCheckM TERecordProp
 substituteRecordProp scope (TERecordProp mut name t e) = do
@@ -294,6 +342,11 @@ countResumeInExpr = \case
   PropAccess e _ -> countResumeInExpr e
   IfElse p t f -> countResumeInExpr p <> countResumeInExpr t <> countResumeInExpr f
   Annot e _ -> countResumeInExpr e
+  Match e cs ->
+    countResumeInExpr e
+      <> foldr (\(MatchClause _ g b) acc ->
+                  (maybe NoResume countResumeInExpr g <> countResumeInBlock b) <> acc
+               ) NoResume cs
   _ -> NoResume
 
 countResumeInLambda :: Types.Lambda -> ResumeInfo
@@ -400,6 +453,23 @@ inferChunk args chunk = do
   let programScope = enterScope globalScope
   -- Первый проход: регистрируем только эффекты и функции (с предварительными схемами)
   (scope1, funSigs) <- foldM (\(sc, sigs) stat -> case stat of
+      Types.SEnumDef sp enumDef -> withDeclFrame ("enum " <> enumName enumDef) sp $ do
+        sc' <- Scope.addEnum enumDef sc
+        -- The constructors are ordinary functions of the program's scope: a
+        -- value is built as `Some 5`, and nothing marks it as an enum at the
+        -- use site.  Each one is polymorphic in the declaration's parameters.
+        foldM (\sc'' c -> do
+            let name = enumCaseName c
+            when (Scope.hasBinding False sc'' name) $
+              throwTypeCheckError $ DuplicateDefinition $
+                "the constructor `" <> name <> "` of `" <> enumName enumDef
+                  <> "` collides with another definition"
+            let typ = constructorTyp enumDef c
+                scheme = Scheme (enumParams enumDef) [] [] Map.empty Map.empty typ
+            Scope.addBinding name scheme (XVar name) Val sc''
+          ) sc' (enumCases enumDef)
+        >>= \sc'' -> pure (sc'', sigs)
+
       Types.SEffDef sp effDef -> withDeclFrame ("effect " <> effName effDef) sp $ do
         when (Scope.hasEff False sc (effName effDef)) $
           throwTypeCheckError $ DuplicateDefinition $ "the effect `" <> effName effDef <> "` is defined twice"
@@ -530,6 +600,7 @@ inferChunk args chunk = do
     Types.STypeDef _ name params typ -> pure $ Just $ TypedIR.STypeDef name params typ
     Types.SEffDef _ effDef -> pure $ Just $ TypedIR.SEffDef effDef
     Types.SRowDef _ rowDef -> pure $ Just $ TypedIR.SRowDef rowDef
+    Types.SEnumDef _ enumDef -> pure $ Just $ TypedIR.SEnumDef enumDef
     Types.SFunctDef _ _ -> pure Nothing
 
   pure $ catMaybes (otherStats <> map Just typedFuns)
@@ -846,6 +917,383 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
     scope2 <- subsumesType scope1 actual t
     declared <- applyTypeSubst scope2 t
     pure $ InferResult (TEAnnot eT declared) eFxs scope2
+  Match subject clauses -> do
+    InferResult subjectT subjectFxs scope1 <- inferExpr scope subject
+    subjectTyp <- typeOfTypedExprIn scope1 subjectT
+    -- Every clause opens a scope of its own: the names its patterns bind are
+    -- visible to its guard and its block, and a later clause starts from the
+    -- subject again.  Substitutions are carried between clauses, because the
+    -- first clause may be what pins the subject's type down (`Some x` says a
+    -- type variable is an enum).
+    (clauses', clauseFxs, resultTyp, scope') <-
+      inferClauses scope1 subjectTyp [] Eff.empty Nothing clauses
+    -- A value with no clause to take it is a mistake the checker can prove, so
+    -- it is reported here rather than as a stuck interpreter later.
+    subjectResolved <- applyTypeSubst scope' subjectTyp
+    let rows = [ps | TMatchClause ps g _ <- clauses', isNothing g]
+    exhaustive <- matchIsExhaustive scope' subjectResolved rows
+    unless exhaustive $
+      throwTypeCheckError $ NonExhaustiveMatch $ pretty subjectResolved
+    finalTyp <- applyTypeSubst scope' resultTyp
+    pure $ InferResult (TEMatch subjectT finalTyp clauses')
+        (Eff.unionEffRows subjectFxs clauseFxs) scope'
+
+-- | Check the clauses of a @match@ one after another.
+--
+--   The result type starts as `Nothing`: an empty array is the bottom of every
+--   aggregate, so `match ... to | 0 => [] | _ => [1]` gets `[Int]` whichever
+--   clause comes first.  The row is the union of the rows of the clauses,
+--   because any of them may be the one that runs.
+inferClauses
+  :: Scope
+  -> Typ
+  -> [TMatchClause]
+  -> EffRow
+  -> Maybe Typ
+  -> [MatchClause]
+  -> TypeCheckM ([TMatchClause], EffRow, Typ, Scope)
+inferClauses scope _ acc rowAcc typAcc [] =
+  pure (acc, rowAcc, fromMaybe TNothing typAcc, scope)
+inferClauses scope subject acc rowAcc typAcc (MatchClause ps guard body : rest) = do
+  -- A clause opens a scope of its own: the names its patterns bind are visible
+  -- to its guard and its block, and they shadow an outer name of the same
+  -- name instead of clashing with it.
+  let clauseScope = enterScope scope
+  (patterns, patternRow, scope1) <- checkClausePatterns clauseScope subject ps
+  (guardT, guardFxs, guardScope) <- case guard of
+    Nothing -> pure (Nothing, Eff.empty, scope1)
+    Just g -> do
+      InferResult gT gFxs gScope <- inferExpr scope1 g
+      gTyp <- typeOfTypedExprIn gScope gT
+      gScope' <- unifyTypes gScope TBoolean gTyp
+      pure (Just gT, gFxs, gScope')
+  -- The block is checked in the clause's scope, and its bindings do not
+  -- escape: `inferBlock` opens a scope of its own and keeps the substitutions.
+  InferResult bodyT bodyFxs bodyScope <- inferBlock guardScope body
+  bodyTyp <- typeOfTypedBlockIn bodyScope bodyT
+  (resultTyp, scope2) <- case typAcc of
+    Nothing -> pure (bodyTyp, bodyScope)
+    Just accT -> do
+      accT' <- applyTypeSubst bodyScope accT
+      (joined, sc) <- joinTypes bodyScope accT' bodyTyp
+      pure (joined, sc)
+  let clauseRow = Eff.unionEffRows patternRow (Eff.unionEffRows guardFxs bodyFxs)
+      -- Back to the scope the clause started in, with what it decided.  The
+      -- next clause is checked at the same level, not one nesting deeper.
+      resumed = Scope.keepSubst scope2 scope
+  inferClauses resumed subject
+    (acc <> [TMatchClause patterns guardT bodyT])
+    (Eff.unionEffRows rowAcc clauseRow)
+    (Just resultTyp)
+    rest
+
+-- | Check the patterns of one clause and bind the names they introduce.
+--
+--   Every alternative of a primitive clause must bind the same names at the
+--   same types: the clause has one block, so a name that only one alternative
+--   bound would be missing in the other.
+checkClausePatterns
+  :: Scope
+  -> Typ
+  -> [Pattern]
+  -> TypeCheckM ([TPattern], EffRow, Scope)
+checkClausePatterns scope subject ps = do
+  checked <- mapM (inferPattern scope subject) ps
+  let names = [map fst bs | (_, bs, _, _) <- checked]
+      firstNames = case names of
+        (n:_) -> n
+        [] -> []
+  when (any (/= firstNames) names) $
+    throwTypeCheckError $ TypeError
+      "the alternatives of one `match` clause must bind the same names"
+  -- The alternatives are independent readings of the same value, so a name
+  -- they share is bound at one type: `| #A x #B x` needs both fields to have
+  -- the subject's type.
+  scope1 <- case checked of
+    [] -> pure scope
+    ((_, firstBs, _, _):alternatives) ->
+      foldM (\sc (_, bs, _, _) ->
+          foldM (\sc' ((_, t), (_, t')) -> unifyTypes sc' t t')
+            sc (zip firstBs bs)
+        ) scope alternatives
+  let patterns = [p | (p, _, _, _) <- checked]
+      bindings = case checked of
+        ((_, bs, _, _):_) -> bs
+        [] -> []
+      boundNames = map fst bindings
+      rows = foldl Eff.unionEffRows Eff.empty [r | (_, _, r, _) <- checked]
+  when (length (nub boundNames) /= length boundNames) $
+    throwTypeCheckError $ TypeError
+      "a pattern binds the same name twice"
+  scope2 <- foldM (\sc (n, t) -> do
+      t' <- applyTypeSubst sc t
+      pure $ Scope.bindLocal n (monoScheme t') (XVar n) Val sc
+    ) scope1 bindings
+  pure (patterns, rows, scope2)
+
+-- | Check one pattern against the type of the subject it inspects.
+--
+--   The names the pattern binds are returned rather than inserted: the clause
+--   owns the scope its block sees, so it can require every alternative to
+--   agree on them first.  The row is what deciding the pattern costs: reading a
+--   cell to look inside it, and whatever the expression of a @val@ pattern
+--   costs to compute.
+inferPattern :: Scope -> Typ -> Pattern -> TypeCheckM (TPattern, [(Text, Typ)], EffRow, Scope)
+inferPattern scope subject (MkPattern sp node) = do
+  subject' <- applyTypeSubst scope subject
+  go scope subject' node
+  where
+    finish sc node' bs row = pure (MkTPattern sp node', bs, row, sc)
+
+    -- Check a list of sub-patterns against the types they must have, threading
+    -- the substitutions through the list.
+    checkAll sc0 pairs = foldM (\(done, bs, row, sc) (t, p) -> do
+        (p', bs', row', sc') <- inferPattern sc t p
+        pure (done <> [p'], bs <> bs', Eff.unionEffRows row row', sc')
+      ) ([], [], Eff.empty, sc0) pairs
+
+    go :: Scope -> Typ -> PatternNode -> TypeCheckM (TPattern, [(Text, Typ)], EffRow, Scope)
+    go sc0 t = \case
+      PInt i -> do
+        sc <- unifyTypes sc0 t TInt
+        finish sc (TPInt i) [] Eff.empty
+      PFloat f -> do
+        sc <- unifyTypes sc0 t TFloat
+        finish sc (TPFloat f) [] Eff.empty
+      PString s -> do
+        sc <- unifyTypes sc0 t TString
+        finish sc (TPString s) [] Eff.empty
+      PBoolean b -> do
+        sc <- unifyTypes sc0 t TBoolean
+        finish sc (TPBoolean b) [] Eff.empty
+      PNil -> do
+        sc <- unifyTypes sc0 t TNil
+        finish sc TPNil [] Eff.empty
+      PWildcard -> finish sc0 TPWildcard [] Eff.empty
+      -- A bare name binds the component it stands for.  The value is not
+      -- inspected, so nothing is read; a `var` component reached through the
+      -- name is read only when the block reads it.
+      PName n -> do
+        when (Scope.hasBinding False sc0 n) $
+          throwTypeCheckError $ SameScopeBindingShadowing n
+        finish sc0 (TPName n t) [(n, t)] Eff.empty
+      PVal e path -> do
+        -- The path names the value the pattern compares against, so the
+        -- comparison is an ordinary field access from a name the program
+        -- already has.
+        InferResult eT eFxs sc1 <- inferExpr sc0 e
+        let eT' = foldl
+              (\typed field -> atTypedSpan (teSpan typed) (TEPropAccess typed field))
+              eT path
+        eTyp <- typeOfTypedExprIn sc1 eT'
+        sc2 <- unifyTypes sc1 t eTyp
+        -- Comparing two values of a type that holds cells reads those cells.
+        reads <- typeHoldsCell sc2 t
+        let row = if reads then Eff.unionEffRows eFxs (Eff.closedOfFlat "Read") else eFxs
+        finish sc2 (TPValue eT') [] row
+      -- @[a b]@ is exactly two elements, @[a; rest]@ is a head and a tail, and
+      -- @[a b; rest]@ is at least two; the parser records which of the three
+      -- was written, and the shapes agree on inspection.
+      PArray ps tailP -> do
+        elemT <- freshMetaTypeM
+        elemRow <- freshMetaRowM
+        sc1 <- unifyTypes sc0 t (TArray elemT elemRow)
+        (inspected, bs, rows, sc2) <- checkAll sc1 [(elemT, p) | p <- ps]
+        (tailChecked, tailBs, tailRow, sc3) <- case tailP of
+          Nothing -> pure (Nothing, [], Eff.empty, sc2)
+          Just p -> do
+            (p', bs', row', sc') <- inferPattern sc2 (TArray elemT elemRow) p
+            pure (Just p', bs', row', sc')
+        finish sc3 (TPArray inspected tailChecked) (bs <> tailBs)
+          (Eff.unionEffRows rows tailRow)
+      PTuple [l, r] -> do
+        lT <- freshMetaTypeM
+        rT <- freshMetaTypeM
+        pairRow <- freshMetaRowM
+        sc1 <- unifyTypes sc0 t (TPair lT rT pairRow)
+        (l', lbs, lRow, sc2) <- inferPattern sc1 lT l
+        (r', rbs, rRow, sc3) <- inferPattern sc2 rT r
+        finish sc3 (TPTuple [l', r']) (lbs <> rbs) (Eff.unionEffRows lRow rRow)
+      PTuple _ -> throwTypeCheckError $ TypeError
+        "a tuple pattern must name exactly two components: pairs have two"
+      PCon n ps -> do
+        (def, enumCase) <- case Scope.enumOfConstructor True sc0 n of
+          Nothing -> throwTypeCheckError $ TypeError $ T.concat [
+              "there is no constructor `", n, "` in scope"
+            ]
+          Just found -> pure found
+        -- The expected type may still be a variable: the constructor then
+        -- decides it is this enum, and fresh arguments stand for the
+        -- declaration's parameters.
+        args <- case t of
+          TEnum name given | name == enumName def -> pure given
+          _ -> do
+            freshArgs <- mapM (const freshMetaTypeArgM) (enumParams def)
+            _ <- unifyTypes sc0 t (TEnum (enumName def) freshArgs)
+            pure freshArgs
+        let fieldTypes = [ substTypeArgs (zip (enumParams def) args) ft
+                         | (_, _, ft) <- enumCaseFields enumCase]
+        when (length ps /= length fieldTypes) $
+          throwTypeCheckError $ TypeError $ T.concat [
+              "the constructor `", n, "` takes ", T.pack (show (length fieldTypes)),
+              " field(s), but the pattern names ", T.pack (show (length ps))
+            ]
+        (checked, bs, rows, sc1) <- checkAll sc0 (zip fieldTypes ps)
+        -- A `var` field of an enum is a cell, and the pattern is the access to
+        -- it: taking the field out is what reads it, exactly as `r@a` reads a
+        -- `var` field of a record.  A wildcard asks for nothing and costs
+        -- nothing; every other sub-pattern reaches the field, even a plain
+        -- name, which hands the cell on to the block.
+        let muts = [m | (m, _, _) <- enumCaseFields enumCase]
+            readRow =
+              if or (zipWith (\m p -> m == Var && touches p) muts checked)
+                then Eff.closedOfFlat "Read"
+                else Eff.empty
+        finish sc1 (TPCon n checked) bs (Eff.unionEffRows rows readRow)
+      PAs p n -> do
+        (p', bs, row, sc1) <- inferPattern sc0 t p
+        when (Scope.hasBinding False sc0 n) $
+          throwTypeCheckError $ SameScopeBindingShadowing n
+        t' <- applyTypeSubst sc1 t
+        finish sc1 (TPAs p' n t') (bs <> [(n, t')]) row
+      PCast p declared -> do
+        sc1 <- unifyTypes sc0 t declared
+        finish' <- inferPattern sc1 declared p
+        let (p', bs, row, sc2) = finish'
+        declared' <- applyTypeSubst sc2 declared
+        finish sc2 (TPCast p' declared') bs row
+      PStarts l r -> do
+        sc1 <- unifyTypes sc0 t TString
+        (l', lbs, lRow, sc2) <- inferPattern sc1 TString l
+        (r', rbs, rRow, sc3) <- inferPattern sc2 TString r
+        finish sc3 (TPStarts l' r') (lbs <> rbs) (Eff.unionEffRows lRow rRow)
+      PEnds l r -> do
+        sc1 <- unifyTypes sc0 t TString
+        (l', lbs, lRow, sc2) <- inferPattern sc1 TString l
+        (r', rbs, rRow, sc3) <- inferPattern sc2 TString r
+        finish sc3 (TPEnds l' r') (lbs <> rbs) (Eff.unionEffRows lRow rRow)
+
+-- | Does the pattern reach the component at all?
+--
+--   A `var` field of an enum is a cell, and a pattern that takes the field out
+--   reads it: `#Box x` hands the value to the block, which is a read of the
+--   cell the same way `r@a` is.  Only `_` declines the component, so only a
+--   wildcard costs nothing.
+touches :: TPattern -> Bool
+touches (MkTPattern _ node) = case node of
+  TPWildcard -> False
+  TPAs p _ _ -> touches p
+  TPCast p _ -> touches p
+  _ -> True
+
+-- | Substitute type arguments for the parameters of a declaration.
+substTypeArgs :: [(Taste, TypeArg)] -> Typ -> Typ
+substTypeArgs su = go
+  where
+    go = \case
+      TVar v -> maybe (TVar v) typeArgToTyp (lookup v su)
+      TArray t r -> TArray (go t) r
+      TPair l r fx -> TPair (go l) (go r) fx
+      TFunct (Funct i o fxs) -> TFunct (Funct (go i) (go o) fxs)
+      TRecord props r -> TRecord [p {tTyp = go (tTyp p)} | p <- props] r
+      TEnum n args -> TEnum n (map goArg args)
+      TForall ts es rs els rls t -> TForall ts es rs els rls (go t)
+      t -> t
+    goArg = \case
+      TAVar v -> maybe (TAVar v) id (lookup v su)
+      TAArray t -> TAArray (goArg t)
+      TAPair l r -> TAPair (goArg l) (goArg r)
+      TAFunct i o -> TAFunct (goArg i) (goArg o)
+      TARecord props -> TARecord [TARecordProp m n (goArg t) | TARecordProp m n t <- props]
+      TAEnum n args -> TAEnum n (map goArg args)
+      t -> t
+
+-- | Does the value of this type hold a cell that inspecting it would read?
+typeHoldsCell :: Scope -> Typ -> TypeCheckM Bool
+typeHoldsCell scope = \case
+  TEnum n args -> case Scope.findEnum True scope n of
+    Nothing -> pure False
+    Just def -> do
+      let fieldTypes =
+            [ substTypeArgs (zip (enumParams def) args) ft
+            | c <- enumCases def
+            , (_, _, ft) <- enumCaseFields c
+            ]
+          hasVarField = any (any (\(m, _, _) -> m == Var) . enumCaseFields) (enumCases def)
+      if hasVarField
+        then pure True
+        else or <$> mapM (typeHoldsCell scope) fieldTypes
+  TRecord props _ -> or <$> mapM (\(TRecordProp m _ t) ->
+      if m == Var then pure True else typeHoldsCell scope t) props
+  TArray t _ -> typeHoldsCell scope t
+  TPair l r _ -> (||) <$> typeHoldsCell scope l <*> typeHoldsCell scope r
+  _ -> pure False
+
+-- | Check that the clauses without a guard accept every value of the subject
+--   type.
+--
+--   An enum is covered when every constructor appears with irrefutable fields,
+--   or when one clause accepts anything at all.  A Boolean needs both
+--   literals.  Every other type has no literals to enumerate, so only a
+--   catch-all clause covers it.
+matchIsExhaustive :: Scope -> Typ -> [[TPattern]] -> TypeCheckM Bool
+matchIsExhaustive scope subject rows =
+  if any (any irrefutable) rows
+    then pure True
+    else case subject of
+      TEnum n _ -> case Scope.findEnum True scope n of
+        Nothing -> pure False
+        Just def -> do
+          let constructors = map enumCaseName (enumCases def)
+              covered c = any (any (coversConstructor c)) rows
+          pure $ all covered constructors
+      TBoolean -> pure $ any (any (isBoolean True)) rows && any (any (isBoolean False)) rows
+      TNil -> pure $ any (any isNil) rows
+      TArray _ _ -> pure $ coversAllLengths [p | row <- rows, p <- row]
+      _ -> pure False
+  where
+    -- An array is covered when some pattern accepts every length from some
+    -- point on, and every shorter length has a pattern that accepts it whole:
+    -- `[]`, `[a; rest]` together accept every array, and `[a b]` fills the one
+    -- length in between.
+    coversAllLengths ps =
+      let exact = [length xs | MkTPattern _ (TPArray xs Nothing) <- ps, all irrefutable xs]
+          fromAt = [length xs | MkTPattern _ (TPArray xs (Just t)) <- ps,
+                               all irrefutable xs, irrefutable t]
+      in case fromAt of
+           [] -> False
+           ms -> any (\m -> all (`elem` exact) [0 .. m - 1]) ms
+
+    irrefutable (MkTPattern _ node) = case node of
+      TPName {} -> True
+      TPWildcard -> True
+      TPAs p _ _ -> irrefutable p
+      TPCast p _ -> irrefutable p
+      _ -> False
+
+    -- A constructor whose every field is a binder accepts every value of that
+    -- constructor, but not the other constructors.  An alias and a cast add
+    -- names or a type, not a condition, so they are looked through.
+    coversConstructor c p = case strip p of
+      MkTPattern _ (TPCon n ps) -> n == c && all irrefutable ps
+      _ -> False
+
+    isBoolean b (MkTPattern _ node) = case node of
+      TPBoolean b' -> b == b'
+      _ -> False
+
+    isNil (MkTPattern _ node) = case node of
+      TPNil -> True
+      _ -> False
+
+    -- An alias (`p as n`) and a cast (`p : T`) add a name or a type to what a
+    -- pattern accepts; they do not change which values it takes.
+    strip (MkTPattern sp node) = case node of
+      TPAs p _ _ -> strip p
+      TPCast p _ -> strip (MkTPattern sp (nodeOf p))
+      _ -> MkTPattern sp node
+      where
+        nodeOf (MkTPattern _ n) = n
 
 -- | Bind the names of a @let@ pattern at the type they must have.
 --
@@ -1578,6 +2026,7 @@ collectTvarsFromType except typ =
     TRecord props fx ->
       concatMap (collectTvarsFromType except . tTyp) props
         <> collectTvarsFromEffRow except fx
+    TEnum _ args -> concatMap (collectTvarsFromTypeArg except) args
     TVar v -> ([v | v `notElem` except])
     _ -> []
 
@@ -1588,6 +2037,7 @@ collectTvarsFromTypeArg except typ =
     TAPair l r -> collectTvarsFromTypeArg except l <> collectTvarsFromTypeArg except r
     TAFunct i o -> collectTvarsFromTypeArg except i <> collectTvarsFromTypeArg except o
     TARecord props -> concatMap (collectTvarsFromTypeArg except . taTypeArg) props
+    TAEnum _ args -> concatMap (collectTvarsFromTypeArg except) args
     TAVar v -> ([v | v `notElem` except])
     _ -> []
 
@@ -1617,6 +2067,17 @@ collectEvarsFromType except typ =
     TRecord props fx ->
       concatMap (collectEvarsFromType except . tTyp) props
         <> collectEvarsFromEffRow except fx
+    TEnum _ args -> concatMap (collectEvarsFromTypeArg except) args
+    _ -> []
+
+collectEvarsFromTypeArg :: [Taste] -> TypeArg -> [Taste]
+collectEvarsFromTypeArg except typ =
+  uniqPreserveOrder $ case typ of
+    TAArray t -> collectEvarsFromTypeArg except t
+    TAPair l r -> collectEvarsFromTypeArg except l <> collectEvarsFromTypeArg except r
+    TAFunct i o -> collectEvarsFromTypeArg except i <> collectEvarsFromTypeArg except o
+    TARecord props -> concatMap (collectEvarsFromTypeArg except . taTypeArg) props
+    TAEnum _ args -> concatMap (collectEvarsFromTypeArg except) args
     _ -> []
 
 collectEvarsFromEffRow :: [Taste] -> EffRow -> [Taste]
@@ -1648,6 +2109,17 @@ collectRvarsFromType except typ =
     TRecord props fx ->
       concatMap (collectRvarsFromType except . tTyp) props
         <> collectRvarsFromEffRow except fx
+    TEnum _ args -> concatMap (collectRvarsFromTypeArg except) args
+    _ -> []
+
+collectRvarsFromTypeArg :: [Taste] -> TypeArg -> [Taste]
+collectRvarsFromTypeArg except typ =
+  uniqPreserveOrder $ case typ of
+    TAArray t -> collectRvarsFromTypeArg except t
+    TAPair l r -> collectRvarsFromTypeArg except l <> collectRvarsFromTypeArg except r
+    TAFunct i o -> collectRvarsFromTypeArg except i <> collectRvarsFromTypeArg except o
+    TARecord props -> concatMap (collectRvarsFromTypeArg except . taTypeArg) props
+    TAEnum _ args -> concatMap (collectRvarsFromTypeArg except) args
     _ -> []
 
 collectRvarsFromEffRow :: [Taste] -> EffRow -> [Taste]
@@ -1752,7 +2224,23 @@ isFrozenExpr = \case
   TEPropAccess e _ -> isFrozenExpr e
   TEIfElse p t f -> isFrozenExpr p && isFrozenExpr t && isFrozenExpr f
   TEAnnot e _ -> isFrozenExpr e
+  TEMatch e _ cs ->
+    isFrozenExpr e && all clauseFrozen cs
   _ -> True
+  where
+    clauseFrozen (TMatchClause ps g b) =
+      all patternFrozen ps && maybe True isFrozenExpr g && isFrozenBlock b
+
+    patternFrozen (MkTPattern _ node) = case node of
+      TPValue e -> isFrozenExpr e
+      TPArray ps t -> all patternFrozen ps && maybe True patternFrozen t
+      TPTuple ps -> all patternFrozen ps
+      TPCon _ ps -> all patternFrozen ps
+      TPAs p _ _ -> patternFrozen p
+      TPCast p _ -> patternFrozen p
+      TPStarts l r -> patternFrozen l && patternFrozen r
+      TPEnds l r -> patternFrozen l && patternFrozen r
+      _ -> True
 
 isFrozenBlock :: TypedIR.Block -> Bool
 isFrozenBlock (stats, expr) = all stat stats && isFrozenExpr expr
@@ -1788,7 +2276,26 @@ fvTyped = \case
   TEPropAccess e _ -> fvTyped e
   TEIfElse p t f -> Set.unions [fvTyped p, fvTyped t, fvTyped f]
   TEAnnot e _ -> fvTyped e
+  TEMatch e _ cs ->
+    Set.unions $ fvTyped e : map clauseVars cs
   _ -> Set.empty
+  where
+    clauseVars (TMatchClause ps g b) =
+      Set.unions $
+        map patternVars ps
+          <> [fvTyped g' | Just g' <- [g]]
+          <> [fvTypedBlock b]
+
+    patternVars (MkTPattern _ node) = case node of
+      TPValue e -> fvTyped e
+      TPArray ps t -> Set.unions (map patternVars ps <> maybe [] (pure . patternVars) t)
+      TPTuple ps -> Set.unions (map patternVars ps)
+      TPCon _ ps -> Set.unions (map patternVars ps)
+      TPAs p _ _ -> patternVars p
+      TPCast p _ -> patternVars p
+      TPStarts l r -> Set.union (patternVars l) (patternVars r)
+      TPEnds l r -> Set.union (patternVars l) (patternVars r)
+      _ -> Set.empty
 
 fvTypedBlock :: TypedIR.Block -> Set.Set Text
 fvTypedBlock (stats, expr) = go Set.empty stats
@@ -1826,6 +2333,9 @@ canHoldState = \case
   TRecord props r ->
     any (\p -> tMut p == Var || canHoldState (tTyp p)) props
       || effRowBearsState [] r
+  -- An enum's fields are values the constructor holds, so an enum holds state
+  -- exactly when one of its arguments does.
+  TEnum _ args -> any (canHoldState . typeArgToTyp) args
   TFunct (Funct _ _ row) -> effRowBearsState [] row
   TVar _ -> True
   _ -> True
@@ -1858,7 +2368,28 @@ createsCell = \case
   TEIfElse p t f -> any createsCell [p, t, f]
   TEPropAccess e _ -> createsCell e
   TEAnnot e _ -> createsCell e
+  TEMatch e _ cs ->
+    createsCell e || any (\(TMatchClause ps _ b) ->
+      any patternCreatesCell ps || blockCreatesCell b) cs
   _ -> False
+  where
+    patternCreatesCell (MkTPattern _ node) = case node of
+      TPValue e -> createsCell e
+      TPArray ps t -> any patternCreatesCell ps || maybe False patternCreatesCell t
+      TPTuple ps -> any patternCreatesCell ps
+      TPCon _ ps -> any patternCreatesCell ps
+      TPAs p _ _ -> patternCreatesCell p
+      TPCast p _ -> patternCreatesCell p
+      TPStarts l r -> patternCreatesCell l || patternCreatesCell r
+      TPEnds l r -> patternCreatesCell l || patternCreatesCell r
+      _ -> False
+
+    blockCreatesCell (stats, e) = any statCreatesCell stats || createsCell e
+
+    statCreatesCell = \case
+      TypedIR.Bind _ _ e -> createsCell e
+      TypedIR.Rebind _ _ e -> createsCell e
+      TypedIR.Expr e -> createsCell e
 
 freeze :: TypedExpr -> TypedExpr
 freeze = \case
@@ -1883,7 +2414,22 @@ freeze = \case
   -- frozen binding records the frozen type its scheme has, and the type stored
   -- in the node would describe the state the snapshot no longer carries.
   TEAnnot e _ -> freeze e
+  TEMatch e t cs -> TEMatch (freeze e) t (map freezeClause cs)
   e -> e
+  where
+    freezeClause (TMatchClause ps g b) =
+      TMatchClause (map freezePattern ps) (freeze <$> g) (freezeBlock b)
+
+    freezePattern (MkTPattern sp node) = MkTPattern sp $ case node of
+      TPValue e -> TPValue (freeze e)
+      TPArray ps t -> TPArray (map freezePattern ps) (freezePattern <$> t)
+      TPTuple ps -> TPTuple (map freezePattern ps)
+      TPCon n ps -> TPCon n (map freezePattern ps)
+      TPAs p n t -> TPAs (freezePattern p) n t
+      TPCast p t -> TPCast (freezePattern p) t
+      TPStarts l r -> TPStarts (freezePattern l) (freezePattern r)
+      TPEnds l r -> TPEnds (freezePattern l) (freezePattern r)
+      node' -> node'
 
 -- | Заморозка типа: var-поля записей становятся val, из рядов стрелок убираются
 --   Var, Read, Rebind, Cell (модель: freeze на типах)
@@ -1995,12 +2541,22 @@ rowVarsInCons = \case
   EVar v -> [v]
   EffCons (ECons _ _) -> []
 
+rowVarsInTypeArg :: TypeArg -> [Taste]
+rowVarsInTypeArg = \case
+  TAArray t -> rowVarsInTypeArg t
+  TAPair l r -> rowVarsInTypeArg l <> rowVarsInTypeArg r
+  TAFunct i o -> rowVarsInTypeArg i <> rowVarsInTypeArg o
+  TARecord props -> concatMap (rowVarsInTypeArg . taTypeArg) props
+  TAEnum _ args -> concatMap rowVarsInTypeArg args
+  _ -> []
+
 rowVarsInTyp :: Typ -> [Taste]
 rowVarsInTyp = \case
   TArray t r -> rowVarsInTyp t <> rowVarsInRow r
   TPair l r fx -> rowVarsInTyp l <> rowVarsInTyp r <> rowVarsInRow fx
   TFunct (Funct i o row) -> rowVarsInTyp i <> rowVarsInTyp o <> rowVarsInRow row
   TRecord props r -> concatMap (rowVarsInTyp . tTyp) props <> rowVarsInRow r
+  TEnum _ args -> concatMap rowVarsInTypeArg args
   TForall _ _ _ _ _ t -> rowVarsInTyp t
   _ -> []
 

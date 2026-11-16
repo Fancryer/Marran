@@ -58,6 +58,14 @@ pSpec = do
       lexemes "_x" `shouldBe` Right [TUnderscore, TName "x"]
       lexemes "or_else" `shouldBe` Right [TName "or_else"]
 
+    it "reads `==` and `===` as names, not as two assignments" $ do
+      -- `==` is a function like `+`: `== 1 1` is an application.  Since `=`
+      -- starts an assignment, the longer names have to be tried first.
+      lexemes "== 1 1" `shouldBe` Right [TName "==", TInt 1, TInt 1]
+      lexemes "=== 1 1" `shouldBe` Right [TName "===", TInt 1, TInt 1]
+      lexemes "!= 1 2" `shouldBe` Right [TName "!=", TInt 1, TInt 2]
+      lexemes "a = 1" `shouldBe` Right [TName "a", TAssign, TInt 1]
+
   describe "annotations" $ do
     it "parses `e : T` around the whole expression" $ do
       -- The annotation is looser than application: `f x : Int` is
@@ -85,6 +93,42 @@ pSpec = do
         [ "error[E0013]: unexpected `val`"
         , " --> demo.marr:2:3"
         ]
+
+  describe "match and patterns" $ do
+    it "parses the clauses of a match, each with its own block" $ do
+      case parseFromTextNamed "demo.marr" chunk $ T.unlines
+        [ "funct f (n Int) : Int ="
+        , "  match (n) to"
+        , "    | 1 => 10"
+        , "    | other => other"
+        ] of
+        Left e -> expectationFailure e
+        Right _ -> pure ()
+
+    it "reads a primitive clause as alternatives of one clause" $ do
+      -- `| 1 2 3 => ...` is one block for three values, not three clauses, so
+      -- the alias after the patterns belongs to all three.
+      case parseFromTextNamed "demo.marr" exp_ $ T.unlines
+        [ "match (n) to"
+        , "  | 1 2 3 as n => n"
+        , "  | _ => 0"
+        ] of
+        Left e -> expectationFailure e
+        Right (Ast.EMatch _ (clause : _)) ->
+          case clause of
+            Ast.MatchClause ps _ _ -> length ps `shouldBe` 3
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
+
+    it "parses the split patterns and `#` constructors" $ do
+      case parseFromTextNamed "demo.marr" exp_ $ T.unlines
+        [ "match (s) to"
+        , "  | 'ab' |-> rest => rest"
+        , "  | rest <-| 'yz' => rest"
+        , "  | #Some x => x"
+        , "  | _ => ''"
+        ] of
+        Left e -> expectationFailure e
+        Right _ -> pure ()
 
   describe "syntax errors" $ do
     it "reports an unexpected token with its code and position" $ do

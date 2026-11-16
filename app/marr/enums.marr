@@ -1,0 +1,31 @@
+//| Энумы и `match`: конструктор — обычная функция (`Some 5`), а образец
+//| пишет `#`.  Ожидается 6 строк: Some 5 / None / 5 / none / cdef / two
+enum Maybe[a] | Some (val v : a) | None
+
+funct value (m Maybe[Int]) : Int =
+  match (m) to
+    | #Some x => x
+    | #None => 0
+
+funct label (m Maybe[Int]) : String =
+  match (m) to
+    | #Some x as whole => if ieq x 0 then 'zero' else 'some'
+    | #None => 'none'
+
+funct tail_of (s String) : String =
+  match (s) to
+    | 'ab' |-> rest => rest
+    | _ => 'other'
+
+funct shape (xs [Int]) : String =
+  match (xs) to
+    | [a b] => 'two'
+    | _ => 'other'
+
+funct main () : {Output} () =
+  sayn (Some 5);
+  sayn None;
+  sayn (value (Some 5));
+  sayn (label None);
+  sayn (tail_of 'abcdef');
+  sayn (shape [1, 2])

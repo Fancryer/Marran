@@ -116,6 +116,7 @@ walkExp (Exp sp n) = spanCheck (tag n <> " expression") sp <> walkChildren n
       NParen _ -> "parenthesised block"
       NWith _ _ _ -> "with"
       NAnnot _ _ -> "annotation"
+      NMatch _ _ -> "match"
 
 walkChildren :: ExpNode -> [Bad]
 walkChildren = \case
@@ -133,6 +134,33 @@ walkChildren = \case
   NParen b -> walkBlock b
   NWith e _ _ -> walkExp e
   NAnnot e _ -> walkExp e
+  NMatch e cs -> walkExp e <> concatMap walkClause cs
+
+walkClause :: MatchClause -> [Bad]
+walkClause (MatchClause ps g b) =
+  concatMap walkPattern ps <> maybe [] walkExp g <> walkBlock b
+
+-- | A pattern is a node too: a diagnostic about a pattern (`val` compares a
+--   value, a split names two parts) has to point into the source.
+walkPattern :: Pattern -> [Bad]
+walkPattern (MkPattern sp n) =
+  spanCheck "pattern" sp <> case n of
+    PInt _ -> []
+    PFloat _ -> []
+    PString _ -> []
+    PNil -> []
+    PBoolean _ -> []
+    PName _ -> []
+    PVal e _ -> walkExp e
+    PArray ps t -> concatMap walkPattern ps <> maybe [] walkPattern t
+    PTuple ps -> concatMap walkPattern ps
+    PCon _ ps -> concatMap walkPattern ps
+    PAs p _ -> walkPattern p
+    PCast p _ -> walkPattern p
+    PWildcard -> []
+    PParen p -> walkPattern p
+    PStarts l r -> walkPattern l <> walkPattern r
+    PEnds l r -> walkPattern l <> walkPattern r
 
 walkLiteral :: Literal -> [Bad]
 walkLiteral = \case

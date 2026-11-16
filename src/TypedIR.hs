@@ -15,6 +15,15 @@ module TypedIR(
   pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
   pattern TEPropAccess, pattern TEIfElse,
   pattern TEAnnot,
+  pattern TEMatch,
+  Pattern(..),
+  PatternNode(..),
+  MatchClause(..),
+  TPattern(..),
+  TPatternNode(..),
+  TMatchClause(..),
+  EnumDef(..),
+  EnumCase(..),
   atTypedSpan,
   teSpan,
   Block,
@@ -53,7 +62,8 @@ import Types (
     Funct(..),
     -- NativeLambdaSign(NativeLambdaSign),
     RowDef,
-    EffCons, NativeLambdaSign (..), TasteMap
+    EffCons, NativeLambdaSign (..), TasteMap,
+    Pattern(..), PatternNode(..), MatchClause(..), EnumDef(..), EnumCase(..)
   )
 import Data.Scientific (Scientific)
 import qualified Data.Text as T
@@ -93,6 +103,10 @@ data Scope = Scope {
   types         :: TypeScope,
   values        :: ValueScope,
   effects       :: EffScope,
+  -- | The declarations of the enumerations in scope.  A type is enough to
+  --   name an enum, but a @match@ has to know its cases to be checked for
+  --   exhaustiveness, so the declaration is kept next to the type.
+  enums         :: TextMap EnumDef,
 
   handlerSig    :: Maybe HandlerSig,
 
@@ -135,6 +149,10 @@ data TypedExprNode =
   -- | @e : T@.  The annotation is transparent at run time: the expression is
   --   evaluated as if it were written alone.
   | TEAnnotNode TypedExpr Typ
+  -- | @match e to clauses@: the subject, the type the whole form has, and the
+  --   clauses, each with the patterns it accepts, an optional guard and the
+  --   block it selects.
+  | TEMatchNode TypedExpr Typ [TMatchClause]
   deriving (Show)
 
 pattern TEInt :: Integer -> TypedExpr
@@ -217,9 +235,13 @@ pattern TEAnnot :: TypedExpr -> Typ -> TypedExpr
 pattern TEAnnot e t <- MkTypedExpr _ (TEAnnotNode e t) where
   TEAnnot e t = MkTypedExpr (teSpan e) (TEAnnotNode e t)
 
+pattern TEMatch :: TypedExpr -> Typ -> [TMatchClause] -> TypedExpr
+pattern TEMatch e t cs <- MkTypedExpr _ (TEMatchNode e t cs) where
+  TEMatch e t cs = MkTypedExpr (teSpan e) (TEMatchNode e t cs)
+
 {-# COMPLETE TEInt, TEFloat, TEBoolean, TEString, TENil, TEXVar, TEArray
    , TEPair, TEXLambda, TENLambda, TEApply, TERecord, TEHandle, TEParen
-   , TEResume, TELet, TEPropAccess, TEIfElse, TEAnnot #-}
+   , TEResume, TELet, TEPropAccess, TEIfElse, TEAnnot, TEMatch #-}
 
 -- | Move a typed expression to the given span.
 atTypedSpan :: Span -> TypedExpr -> TypedExpr
@@ -247,6 +269,7 @@ instance Show TypedExpr where
     TEPropAccess expr field -> "(Prop " <> show expr <> " " <> show field <> ")"
     TEIfElse cond thenExpr elseExpr -> "(If " <> show cond <> " " <> show thenExpr <> " " <> show elseExpr <> ")"
     TEAnnot e t -> "(Annot " <> show e <> " " <> show t <> ")"
+    TEMatch e t cs -> "(Match " <> show e <> " " <> show t <> " " <> show (length cs) <> ")"
 
 instance Pretty TypedExpr where
   pretty = \case
@@ -270,6 +293,9 @@ instance Pretty TypedExpr where
     -- PropAccess e n -> pretty e <> "@" <> n
     TEIfElse p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
     TEAnnot e t -> pretty e <> " : " <> pretty t
+    TEMatch e _ cs -> T.concat [
+        "match ", pretty e, " to ", T.concat (map ((" " <>) . pretty) cs)
+      ]
     e -> T.pack $ show e
 
 data TERecordProp = TERecordProp {
@@ -453,6 +479,7 @@ data TopLevelStat =
   | STypeDef Text [Text] {-[String]-} Typ
   | SEffDef EffDef
   | SRowDef RowDef
+  | SEnumDef EnumDef
   deriving (Show)
 
 instance Pretty TopLevelStat where
@@ -463,10 +490,75 @@ instance Pretty TopLevelStat where
       T.concat ["type ", n, ts', " = ", pretty t]
     SEffDef e -> pretty e
     SRowDef r -> pretty r
+    SEnumDef e -> pretty e
 
 type Chunk = [TopLevelStat]
 
 instance Pretty Chunk where pretty sts = T.intercalate "\n" $ map pretty sts
+
+-- | A pattern of a @match@ clause, after checking.
+--
+--   The checker resolves what a name binds and what a @val@ pattern compares
+--   against, so the interpreter never has to look anything up: the comparison
+--   is already a typed expression, and every name carries the type it binds.
+data TPattern = MkTPattern {
+    tpSpan :: Span
+  , tpNode :: TPatternNode
+  } deriving (Show)
+
+data TPatternNode =
+    TPInt Integer
+  | TPFloat Scientific
+  | TPString Text
+  | TPBoolean Bool
+  | TPNil
+  -- | A name binds the component it stands for, at the type it has there.
+  | TPName Text Typ
+  -- | @val e@a@: the value must equal the one the path holds, by @==@.
+  | TPValue TypedExpr
+  | TPArray [TPattern] (Maybe TPattern)
+  | TPTuple [TPattern]
+  | TPCon Text [TPattern]
+  | TPAs TPattern Text Typ
+  | TPCast TPattern Typ
+  | TPWildcard
+  | TPStarts TPattern TPattern
+  | TPEnds TPattern TPattern
+  deriving (Show)
+
+instance Pretty TPattern where
+  pretty (MkTPattern _ n) = pretty n
+
+instance Pretty TPatternNode where
+  pretty = \case
+    TPInt i -> T.pack $ show i
+    TPFloat f -> T.pack $ show f
+    TPString s -> T.concat ["'", s, "'"]
+    TPBoolean b -> if b then "true" else "false"
+    TPNil -> "()"
+    TPName n _ -> n
+    TPValue e -> T.concat ["val ", pretty e]
+    TPArray ps t ->
+      T.concat ["[", T.unwords (map pretty ps), maybe "" (("; " <>) . pretty) t, "]"]
+    TPTuple ps -> T.intercalate ", " $ map pretty ps
+    TPCon n ps -> T.unwords $ ("#" <> n) : map pretty ps
+    TPAs p n _ -> T.concat [pretty p, " as ", n]
+    TPCast p t -> T.concat [pretty p, " : ", pretty t]
+    TPWildcard -> "_"
+    TPStarts l r -> T.concat [pretty l, " |-> ", pretty r]
+    TPEnds l r -> T.concat [pretty l, " <-| ", pretty r]
+
+-- | One clause of a @match@: the patterns it accepts, an optional guard and
+--   the block it selects.
+data TMatchClause = TMatchClause [TPattern] (Maybe TypedExpr) Block
+  deriving (Show)
+
+instance Pretty TMatchClause where
+  pretty (TMatchClause ps g b) = T.concat [
+      "| ", T.unwords $ map pretty ps,
+      maybe "" ((" if " <>) . pretty) g,
+      " => ", pretty b
+    ]
 
 typeOfTypedExpr :: TypedExpr -> Either Text Typ
 typeOfTypedExpr = \case
@@ -503,6 +595,9 @@ typeOfTypedExpr = \case
       r -> Left $ "PropAccess on non-record: " <> T.pack (show r)
   TEIfElse _ thenExpr _ -> typeOfTypedExpr thenExpr
   TEAnnot _ t -> Right t
+  -- The checker stores the type of the whole form in the node: every clause
+  -- has that type already, and the clauses may be empty of a common subject.
+  TEMatch _ t _ -> Right t
 
 typeOfTypedBlock :: TypedIR.Block -> Either Text Typ
 typeOfTypedBlock = typeOfTypedExpr . snd

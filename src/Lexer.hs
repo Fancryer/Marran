@@ -190,6 +190,9 @@ token = choice [
     sym "@" TAt,
     sym "#[" TSharpSquareL, sym "[" TSquareL, sym "]" TSquareR,
     sym "#{" TSharpBraceL,  sym "{" TBraceL,  sym "}" TBraceR,
+    -- A constructor pattern writes `#Some x`.  The two long forms above are
+    -- tried first, so `#[` and `#{` never reach this.
+    sym "#" TSharp,
     sym "(" TParenL,        sym ")" TParenR,
     sym ":=" TRebind,
     sym ":" TColon,
@@ -198,12 +201,19 @@ token = choice [
     sym "..." TEllipsis,
     sym "=>" TMatchArrow,
     sym "==>" THRPArrow,
+    -- `==` and `===` are ordinary names, like `+` or `!=`: `== 1 1` applies
+    -- the function `==`.  `sym "="` below would otherwise split them into two
+    -- assignments, so the longer names are tried first.  `==>` is matched
+    -- above and never reaches here.
+    try $ lexeme $ TName <$> L.symbol sc "===",
+    try $ lexeme $ TName <$> L.symbol sc "==",
     sym "=" TAssign,
     sym "_" TUnderscore,
     sym "->" TArrow,
     kw "effect" KWEffect,
     kw "else" KWElse,
     kw "end" KWEnd,
+    kw "enum" KWEnum,
     choice $ map (`kw` KWFalse) ["false", "⊥"],
     choice $ map (`kw` KWForall) ["forall", "∀"],
     kw "funct" KWFunct,
@@ -257,6 +267,7 @@ data Token =
   | TBraceL       | TBraceR
   | TSquareL      | TSquareR
   | TSharpBraceL  | TSharpSquareL
+  | TSharp
 
   | TAssign
   | TRebind
@@ -298,6 +309,7 @@ instance Pretty Token where
     TSquareR      -> "]"
     TSharpBraceL  -> "#{"
     TSharpSquareL -> "#["
+    TSharp        -> "#"
 
     TAssign -> "="
     TRebind -> ":="
@@ -325,6 +337,7 @@ data Keyword =
   KWEffect
   | KWElse
   | KWEnd
+  | KWEnum
   | KWFalse
   | KWForall
   | KWFunct
@@ -351,6 +364,7 @@ instance Pretty Keyword where
     KWEffect  -> "effect"
     KWElse    -> "else"
     KWEnd     -> "end"
+    KWEnum    -> "enum"
     KWFalse   -> "false"
     KWForall  -> "forall"
     KWFunct   -> "funct"

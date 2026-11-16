@@ -11,6 +11,8 @@ module Scope (
   findBinding,
   findBindingWithRow,
   findType,
+  findEnum,
+  enumOfConstructor,
   findEff,
   findHandler,
   findEffOps,
@@ -24,6 +26,7 @@ module Scope (
   findOperations,
   operationNames,
   addType,
+  addEnum,
   addEffect,
   addHandler,
   bindingNames,
@@ -37,6 +40,7 @@ import Types (
     HandlerSig,
     Mutability(..),
     Typ(..),
+    TypeArg(..),
     TRecordProp(..),
     EffDef(..),
     Funct(..),
@@ -46,9 +50,10 @@ import Types (
     Scheme(Scheme),
     Expr(..), NativeLambdaSign (..), tfunc, _a,
     Taste,
-    pattern NLambda
+    pattern NLambda,
+    enumCases, enumCaseName
   )
-import TypedIR (Scope(..), ValueBinding(..))
+import TypedIR (Scope(..), ValueBinding(..), EnumDef(..), EnumCase(..))
 import Control.Monad (foldM, unless)
 import qualified Data.Text as T
 import qualified Builtins
@@ -65,6 +70,7 @@ enterScope scope = Scope
   Map.empty
   Map.empty
   Map.empty
+  scope.enums
   Nothing
   scope.typeSubst
   scope.typeArgSubst
@@ -114,6 +120,35 @@ findType uptop sc name =
     (s@(Just _), _, _) -> s
     (Nothing, True, Just p) -> findType True p name
     _ -> Nothing
+
+findEnum :: Bool -> Scope -> Text -> Maybe EnumDef
+findEnum uptop sc name =
+  case (Map.lookup name sc.enums, uptop, sc.parent) of
+    (s@(Just _), _, _) -> s
+    (Nothing, True, Just p) -> findEnum True p name
+    _ -> Nothing
+
+-- | The enumeration and the case a constructor name stands for.
+--
+--   A constructor is a name in the program's scope, so two enums cannot share
+--   one; the chain is searched from the innermost scope outwards, like every
+--   other name.
+enumOfConstructor :: Bool -> Scope -> Text -> Maybe (EnumDef, EnumCase)
+enumOfConstructor uptop sc name =
+  case found of
+    Just r -> Just r
+    Nothing -> case (uptop, sc.parent) of
+      (True, Just p) -> enumOfConstructor True p name
+      _ -> Nothing
+  where
+    found = case Maybe.listToMaybe
+      [ (def, c)
+      | def <- Map.elems sc.enums
+      , c <- enumCases def
+      , enumCaseName c == name
+      ] of
+      Just r -> Just r
+      Nothing -> Nothing
 
 findEff :: Bool -> Scope -> Text -> Maybe EffDef
 findEff uptop sc name =
@@ -245,6 +280,22 @@ addType name typ scope =
   else
     pure $ scope {types = Map.insert name typ scope.types}
 
+-- | Register a declared enumeration: the name denotes an opaque type (its
+--   arguments are the parameters the declaration quantifies), and the
+--   declaration itself is kept so that a @match@ can be checked for
+--   exhaustiveness.
+addEnum :: EnumDef -> Scope -> TypeCheckM Scope
+addEnum def@(EnumDef name params _) scope =
+  if hasType False scope name then
+    throwTypeCheckError $ SameScopeBindingShadowing $ "Cannot shadow a `" <> name <> "` type in the same scope!"
+  else if Map.member name scope.enums then
+    throwTypeCheckError $ SameScopeBindingShadowing $ "Cannot shadow an `" <> name <> "` enumeration in the same scope!"
+  else
+    pure $ scope {
+        types = Map.insert name (TEnum name (map TAVar params)) scope.types,
+        enums = Map.insert name def scope.enums
+      }
+
 addEffect :: EffDef -> Scope -> TypeCheckM Scope
 addEffect effDef@(EffDef name _ _) scope =
   if hasEff False scope name then
@@ -369,6 +420,16 @@ globalScope _args = do
     tryA <- freshMetaM
     tryR <- freshMetaM
 
+    -- The comparisons of any two values of one type.  `==` is structural and
+    -- decides an enum's pattern match and a `val` pattern in a `match`;
+    -- `===` is identity of the value itself, which is what a reader means by
+    -- `1 === 1` being false: the two 1s are different values, even though they
+    -- are equal.
+    eqA <- freshMetaM
+    refEqA <- freshMetaM
+    neqA <- freshMetaM
+    refNeqA <- freshMetaM
+
     let t = TVar
         -- a function whose latent row is `rw`; an empty row is a pure one
         fn = tfunc
@@ -462,9 +523,22 @@ globalScope _args = do
                     (RVar tryR))
           ]
 
-    pure (functions <> arrays <> pairs <> convs)
+        -- `==` compares two values of one type structurally, `===` compares
+        -- the values themselves; `!=` and `!==` are their negations.  They are
+        -- the only polymorphic operations on a value's content, which is why
+        -- an enum's `match` and a `val` pattern use `==` rather than a
+        -- comparison the checker synthesises.
+        comparisons =
+          [ poly "==" [eqA] [] $ fn (t eqA) (fn (t eqA) TBoolean)
+          , poly "===" [refEqA] [] $ fn (t refEqA) (fn (t refEqA) TBoolean)
+          , poly "!=" [neqA] [] $ fn (t neqA) (fn (t neqA) TBoolean)
+          , poly "!==" [refNeqA] [] $ fn (t refNeqA) (fn (t refNeqA) TBoolean)
+          ]
+
+    pure (functions <> arrays <> pairs <> convs <> comparisons)
 
   let emptyScope = Scope
+        Map.empty
         Map.empty
         Map.empty
         Map.empty

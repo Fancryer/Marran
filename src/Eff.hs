@@ -70,6 +70,7 @@ extractTypeEffects = \case
   TFunct (Funct i o r) -> extractTypeEffects i <> extractTypeEffects o <> extractEffects r
   TRecord props r ->
     Utils.uniqPreserveOrder $ concatMap (extractTypeEffects . tTyp) props <> extractEffects r
+  TEnum _ args -> Utils.uniqPreserveOrder $ concatMap (extractTypeEffects . typeArgToTyp) args
   TForall _ _ _ _ _ t -> extractTypeEffects t
   _ -> []
 

@@ -1,5 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
-
 module Benchmark
   ( runBenchmarks
   , runEdgeSweepBenchmarks
@@ -10,6 +8,7 @@ module Benchmark
   , EdgeConfig(..)
   , SnapshotGraph(..)
   , SnapshotStats(..)
+  , PreparedSnapshot(..)
   , generateGraph
   , generateEdgeGraph
   , defaultConfigs
@@ -119,13 +118,6 @@ generateTopologyGraph topology config
 
     backbone =
       [(i, i + 1) | i <- [0 .. v - 2]]
-
-    -- All possible non-backbone forward edges.
-    allCandidates =
-      [ (i, i + distance)
-      | distance <- [2 .. v - 1]
-      , i <- [0 .. v - distance - 1]
-      ]
 
     -- Rotate a list without changing its elements.
     rotate :: Int -> [a] -> [a]

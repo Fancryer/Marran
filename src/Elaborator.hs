@@ -41,7 +41,12 @@ import Data.Map (Map)
 import qualified Suggest
 
 data FlatRow = FlatRow [Types.EffCons] (Maybe Taste)
-data TypeAliasDef = TypeAliasDef [Text] Ast.Typ
+-- | What a declared type name stands for: an alias, or an enumeration.
+--
+--   Both are looked up in the same environment, because a program writes the
+--   two the same way: `Box[Int]` and `Maybe[Int]` are both a name applied to
+--   arguments, and only the declaration says which one it is.
+data TypeAliasDef = TypeAliasDef [Text] Ast.Typ | TypeEnumDef [Text]
 
 -- | The rows and effects a chunk declares.
 --
@@ -211,6 +216,11 @@ collectTypEnv = foldM go []
         when (any ((name ==) . fst) acc) $
           throwError $ ElaborationError $ "Duplicate type definition: " <> n
         pure ((name, TypeAliasDef (coerce ts) body) : acc)
+      Ast.EnumDef _ n ts _ -> do
+        let name = T.unpack n
+        when (any ((name ==) . fst) acc) $
+          throwError $ ElaborationError $ "Duplicate type definition: " <> n
+        pure ((name, TypeEnumDef (coerce ts)) : acc)
       _ -> pure acc
 
 elaborateTopLevelStat :: RowEnv -> TypEnv -> Ast.TopLevelStat -> ElabM Types.TopLevelStat
@@ -233,6 +243,18 @@ elaborateTopLevelStat' env renv tenv = \case
       <$> forM ops (\(Ast.EffectOp n' t) -> (n',) <$> elaborateFunct renv tenv env' t)
   Ast.RowDef sp n fxs ->
     Types.SRowDef sp . Types.RowDef n <$> elaborateEffRow' renv tenv env fxs
+  Ast.EnumDef sp n ts cases -> do
+    -- The parameters are rigid variables of the fields, so the declaration
+    -- records the variables themselves: a use `Maybe[Int]` substitutes the
+    -- argument for exactly that variable, and matching parameters by name
+    -- would confuse two enums that both call a parameter `T`.
+    ts' <- for (coerce ts) $ \nm -> (nm,) <$> freshBound nm
+    let env' = extendTyp ts' env
+    Types.SEnumDef sp . Types.EnumDef n (map snd ts')
+      <$> forM cases (\(Ast.EnumCase cn fields) ->
+            Types.EnumCase cn <$> forM fields
+              (\(q, fn, ft) ->
+                (elaborateMutability q, fn,) <$> elaborateType' renv tenv env' [] ft))
   Ast.FunctDef sp n ts (Ast.EffParams es rs) args fxs t b -> do
     ts' <- for (coerce ts) $ \nm -> (nm,) <$> freshBound nm
     es' <- for es $ \nm -> (nm,) <$> freshBound nm
@@ -333,6 +355,43 @@ elaborateNode renv tenv env = \case
     Types.Annot
       <$> elaborateExpr renv tenv env e
       <*> elaborateType' renv tenv env [] t
+  Ast.EMatch e cs ->
+    Types.Match
+      <$> elaborateExpr renv tenv env e
+      <*> mapM (elaborateMatchClause renv tenv env) cs
+
+elaborateMatchClause :: RowEnv -> TypEnv -> ElabEnv -> Ast.MatchClause -> ElabM Types.MatchClause
+elaborateMatchClause renv tenv env (Ast.MatchClause ps g b) =
+  Types.MatchClause
+    <$> mapM (elaboratePattern renv tenv env) ps
+    <*> mapM (elaborateExpr renv tenv env) g
+    <*> elaborateBlock renv tenv env b
+
+elaboratePattern :: RowEnv -> TypEnv -> ElabEnv -> Ast.Pattern -> ElabM Types.Pattern
+elaboratePattern renv tenv env (Ast.MkPattern sp node) =
+  Types.MkPattern sp <$> go node
+  where
+    recur = elaboratePattern renv tenv env
+
+    go = \case
+      Ast.PInt i -> pure $ Types.PInt i
+      Ast.PFloat f -> pure $ Types.PFloat f
+      Ast.PString t -> pure $ Types.PString t
+      Ast.PNil -> pure Types.PNil
+      Ast.PBoolean b -> pure $ Types.PBoolean b
+      Ast.PName n -> pure $ Types.PName n
+      Ast.PVal e path -> Types.PVal <$> elaborateExpr renv tenv env e <*> pure path
+      Ast.PArray ps t -> Types.PArray <$> mapM recur ps <*> mapM recur t
+      Ast.PTuple ps -> Types.PTuple <$> mapM recur ps
+      Ast.PCon n ps -> Types.PCon n <$> mapM recur ps
+      Ast.PAs p n -> Types.PAs <$> recur p <*> pure n
+      Ast.PCast p t -> Types.PCast <$> recur p <*> elaborateType' renv tenv env [] t
+      Ast.PWildcard -> pure Types.PWildcard
+      -- Parentheses group a pattern; the grouping has no meaning once the
+      -- tree is built, so the node is dropped rather than kept as a wrapper.
+      Ast.PParen p -> Types.patNode <$> recur p
+      Ast.PStarts l r -> Types.PStarts <$> recur l <*> recur r
+      Ast.PEnds l r -> Types.PEnds <$> recur l <*> recur r
 
 elaborateUnder :: RowEnv -> TypEnv -> ElabEnv -> Ast.Under -> ElabM Types.Expr
 elaborateUnder renv tenv env = \case
@@ -526,6 +585,13 @@ elaborateType' renv tenv env visiting = \case
                 "Type alias '%s' expects %d argument(s), but was used without any"
                 (T.unpack n)
                 (length params)
+        Just (TypeEnumDef params)
+          | null params -> pure $ Types.TEnum n []
+          | otherwise ->
+              elabError $ printf
+                "Enum '%s' expects %d type argument(s), but was used without any"
+                (T.unpack n)
+                (length params)
         Nothing -> case Suggest.typoNote (builtinTypeNames <> map (T.pack . fst) tenv) n of
           -- A name that is one typo away from a type that exists is almost
           -- certainly that type: silently inventing an opaque `TFlat` would
@@ -589,6 +655,16 @@ expandTypeAlias' renv tenv env visiting n (Ast.TypeApps ts)
   | otherwise =
     case lookup (T.unpack n) tenv of
       Nothing -> elabError $ "Unknown type alias: " <> T.unpack n
+      Just (TypeEnumDef params) ->
+        if length params /= length ts then
+          elabError $ printf
+            "Wrong number of type arguments for enum '%s': expected %d, got %d"
+            (T.unpack n)
+            (length params)
+            (length ts)
+        else
+          mapM (elaborateTypeArg tenv env) (coerce ts) >>= \args ->
+            pure $ Types.TEnum n args
       Just (TypeAliasDef params body) ->
         if length params /= length ts then
           elabError $ printf
@@ -627,6 +703,13 @@ elaborateTypeArg' tenv env visiting = \case
                 "Type alias '%s' expects %d argument(s), but was used without any"
                 (T.unpack n)
                 (length params)
+        Just (TypeEnumDef params)
+          | null params -> pure $ Types.TAEnum n []
+          | otherwise ->
+              elabError $ printf
+                "Enum '%s' expects %d type argument(s), but was used without any"
+                (T.unpack n)
+                (length params)
         Nothing -> pure $ Types.TAFlat n
   Ast.TANil -> pure Types.TANil
   Ast.TAArray t -> Types.TAArray <$> elaborateTypeArg' tenv env visiting t
@@ -652,6 +735,15 @@ expandTypeArgAlias' tenv env visiting n (Ast.TypeApps ts)
       case lookup (T.unpack n) tenv of
         Nothing ->
           elabError $ "Unknown type alias: " <> T.unpack n
+        Just (TypeEnumDef params) ->
+          if length params /= length ts then
+            elabError $ printf
+              "Wrong number of type arguments for enum '%s': expected %d, got %d"
+              (T.unpack n)
+              (length params)
+              (length ts)
+          else
+            Types.TAEnum n <$> mapM (elaborateTypeArg' tenv env visiting) (coerce ts)
         Just (TypeAliasDef params body) ->
           if length params /= length ts then
             elabError $ printf

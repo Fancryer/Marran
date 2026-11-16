@@ -1,34 +1,59 @@
-row Mutation = {Var; Cell; Read; Rebind}
-row Io = {Input; Output}
-row Main = {... Mutation; ... Io | `R}
+funct abs (x Float) : Float =
+  if x `<.` 0.0 then fneg x else if feq x 0.0 then 0.0 else x
 
-funct while
-  (pred () -> {Pred | `Row} Boolean)
-  (do () -> {Do | `Row} ())
-  : {Pred; Do | `Row} ()
-  = if pred () then while pred do else ()
+funct copysign (x Float) (y Float) : Float =
+  val xa = abs x;
+  if y `<.` 0.0 then fneg xa else xa
 
-funct guess_game () : Main () =
-  val secret = random_int 1 100;
-  var attempts = 0;
-  var guessed = false;
+funct ceil (x Float) : Int =
+  val i = to_int x;
+  if x `>.` to_float i then i `+` 1 else i
 
-  sayn 'Guess the number (1-100)';
-  while {not guessed}
-  {
-    sayn 'Enter your guess: ';
-    val guess = read_int ();
-    attempts := + 1 attempts;
-    if ieq guess secret then
-    (
-      guessed := true;
-      say 'Correct! You took '; say attempts; sayn ' attempts.'
-    )
-    else if < guess secret then
-      sayn 'Too low!'
-    else
-      sayn 'Too high!'
-  }
 
-funct main () : Main () = guess_game ()
+funct floor (x Float) : Int =
+  val i = to_int x;
+  if x `<.` to_float i then i `-` 1 else i
 
+funct round (x Float) : Int =
+  if x `>=.` 0.0 then floor $ x `+.` 0.5 else ceil $ x `-.` 0.5
+
+funct mod4 (q Float) : Int = to_int q `%` 4
+
+funct reduce_angle (x Float) : {Var; Read; Rebind; Cell} (Float, Int)@{Read} =
+  val PI : Float = 3.141592653589793238462643383279502884;
+  val HALF_PI = PI `/.` 2.0;
+  val QUARTER_PI = PI `/.` 4.0;
+  val TWO_PI = 2.0 `*.` PI;
+  /|
+  Приводит x к виду:
+      x = q * (pi/2) + r,
+  где r примерно в [-pi/4, pi/4].
+  Возвращает (r, q).
+  |\
+  //| Сначала приводим к [-pi, pi]
+  var r = x `%.` TWO_PI;
+
+  if r `>.` PI then
+    (r := r `-.` TWO_PI; ())
+  else if r `<.` fneg PI then
+    (r := r `+.` TWO_PI; ())
+  else ();
+
+  //| Теперь выбираем ближайшую четверть
+  val q = round $ r `/.` HALF_PI;
+  r := r `-.` (to_float q `*.` HALF_PI);
+
+  (r, q)
+
+funct main () : {Output} () =
+  val a = 0.0;
+  val b = fneg 0.0;
+  val c = 5.7;
+  val d = fneg 4.3;
+  
+  say 'a = '; sayn $ abs a;
+  say 'b = '; sayn $ abs b;
+  say 'c = '; sayn $ abs c;
+  say 'd = '; sayn $ abs d;
+
+  ()
