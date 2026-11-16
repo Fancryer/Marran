@@ -73,6 +73,7 @@ import Data.Map (Map)
 import Data.List (find)
 import Resume (ResumeInfo)
 import Span (Span, noSpan, mergeSpan, mergeSpans)
+import Module (Module(..))
 import Data.Set (Set)
 
 type TypeScope  = TextMap Typ
@@ -492,9 +493,7 @@ instance Pretty TopLevelStat where
     SRowDef r -> pretty r
     SEnumDef e -> pretty e
 
-type Chunk = [TopLevelStat]
-
-instance Pretty Chunk where pretty sts = T.intercalate "\n" $ map pretty sts
+type Chunk = Module TopLevelStat
 
 -- | A pattern of a @match@ clause, after checking.
 --

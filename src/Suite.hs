@@ -16,6 +16,7 @@ module Suite (
   , runProgram
   , runProgramWithInput
   , runSourceWithInput
+  , withModuleHeader
   , programPath
   ) where
 
@@ -156,13 +157,16 @@ runProgramWithInput name input =
     Nothing -> pure $ Left $ "program not found: " ++ programFileName name
     Just path -> do
       src <- T.pack <$> readFile path
-      runSourceWithInput path input src
+      runSource path input src
 
--- | 'runProgramWithInput' for source text.  The path only names the source in
---   diagnostics; this is what lets a test keep a small program next to the
---   assertion instead of in a separate file.
-runSourceWithInput :: FilePath -> String -> T.Text -> IO (Either String String)
-runSourceWithInput path input src = do
+-- | Interpret a source that is already a whole file.
+--
+--   A file read from disk must declare its module itself: the header is part
+--   of the language, and a file without one is a syntax error, not an
+--   anonymous program.  Tests build their programs differently -- see
+--   'runSourceWithInput'.
+runSource :: FilePath -> String -> T.Text -> IO (Either String String)
+runSource path input src = do
   -- The source map is what lets the renderer quote the offending lines; the
   -- name of the file in the map must match the one recorded in the spans.
   let sources = insertSource (T.pack path) src emptySourceMap
@@ -185,6 +189,44 @@ runSourceWithInput path input src = do
                     diagLabels = [primaryLabel (ieSpan err) ""]
                   })
                 (Right _, out) -> pure $ Right out
+
+-- | 'runSource' for a program written inside a test.
+--
+--   The header is added when the source has none, so a test shows only the
+--   part it is about; the preamble goes on the first line, which keeps the
+--   line numbers of the test's own body as written.
+runSourceWithInput :: FilePath -> String -> T.Text -> IO (Either String String)
+runSourceWithInput path input src = runSource path input (withModuleHeader src)
+
+-- | Put @module Main@ in front of a source that has no header.
+--
+--   A test keeps a small program next to its assertion, and repeating the
+--   header in every one of them would hide the program under boilerplate.  The
+--   header goes on the first line and the program follows on the same line, so
+--   the line numbers a test quotes for its own body do not move.
+withModuleHeader :: T.Text -> T.Text
+withModuleHeader src
+  | startsWithHeader src = src
+  | otherwise = T.concat ["module Main ", src]
+
+-- | Does the source already declare its module?  Leading blank lines and the
+--   @//|@ comments the examples start with are skipped, because the header is
+--   the first thing the grammar wants to see, not the first line.
+startsWithHeader :: T.Text -> Bool
+startsWithHeader src = "module" `T.isPrefixOf` T.stripStart (stripLeadComments src)
+
+-- | Drop the whole-line @//|@ comments at the top of a source.
+stripLeadComments :: T.Text -> T.Text
+stripLeadComments src =
+  case T.lines src of
+    [] -> src
+    ls -> T.intercalate "\n" (go ls)
+  where
+    go (l : rest)
+      | "//|" `T.isPrefixOf` T.stripStart l = go rest
+      | T.null (T.strip l) = go rest
+      | otherwise = l : rest
+    go [] = []
 
 -- | Run an action with @stdin@ reading from the given string.
 withStdin :: String -> IO a -> IO a

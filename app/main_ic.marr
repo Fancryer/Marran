@@ -1,2 +1,4 @@
+module Main
+
 funct make(. : ()) : {Cell} () -> {Read; Rebind} Int = var x = 0; { (. : `m2) : {Read; Rebind} Int = x := + x 1; x}
 funct main(. : ()) : {Output} () = imm f = make (); sayn (f ()); sayn (f ())

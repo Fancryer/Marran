@@ -55,6 +55,19 @@ not produce a wall of text. End of input is reported as such instead of as an
 empty token. `test/ParserSpec.hs` pins the header, the position and the
 carets.
 
+A file has to open with its `module` header, so a file that was written before
+the header became mandatory fails on its first token. The message names the
+fix rather than the token it tripped over:
+
+```
+error[E0013]: a file must start with a module header: `module Main` for a program, `module Name` for a module
+ --> scratch/program.marr:1:1
+  |
+1 | funct main () : {Output} () =
+  | ^
+  |
+```
+
 ## Suggestions
 
 An unknown name is often a typo, so the checker looks for a name that is close

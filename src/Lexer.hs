@@ -223,6 +223,8 @@ token = choice [
     kw "imm" KWImm,
     kw "let" KWLet,
     kw "match" KWMatch,
+    kw "module" KWModule,
+    kw "import" KWImport,
     kw "resume" KWResume,
     kw "row" KWRow,
     kw "then" KWThen,
@@ -347,6 +349,8 @@ data Keyword =
   | KWImm
   | KWLet
   | KWMatch
+  | KWModule
+  | KWImport
   | KWResume
   | KWRow
   | KWThen
@@ -374,6 +378,8 @@ instance Pretty Keyword where
     KWImm     -> "imm"
     KWLet     -> "let"
     KWMatch   -> "match"
+    KWModule  -> "module"
+    KWImport  -> "import"
     KWResume  -> "resume"
     KWRow     -> "row"
     KWThen    -> "then"

@@ -7,9 +7,11 @@
 {-# LANGUAGE ViewPatterns #-}
 
 module Ast (
-  Chunk(..),
+  Chunk,
+  module Module,
   TopLevelStat(..),
   topLevelSpan,
+  declKindOf,
   EnumCase(..),
   EffectOp(..),
   FunctArg(..),
@@ -86,10 +88,23 @@ import qualified Data.List as String
 import GHC.Generics (Generic)
 import Sexp (Sexp(..))
 import Span (Span, noSpan, mergeSpan)
+import Module (Module(..), ModuleHeader(..), ExportDecl(..), DeclKind(..), prettyDeclKind, headerExportsAll)
 
-newtype Chunk = Chunk [TopLevelStat] deriving (Eq, Show, Generic)
-instance Sexp Chunk
-instance Pretty Chunk where pretty (Chunk stats) = T.intercalate "\n" $ map pretty stats
+-- | The kind of a declaration, which is what a kind in a list is checked
+--   against.
+declKindOf :: TopLevelStat -> DeclKind
+declKindOf = \case
+  TypeDef {} -> KindType
+  EffectDef {} -> KindEffect
+  RowDef {} -> KindRow
+  EnumDef {} -> KindEnum
+  FunctDef {} -> KindFunct
+
+-- | A parsed file.  The header is not optional: a file that says nothing about
+--   itself would not say what it is, and the module's name is what a reader
+--   sees in every diagnostic that comes out of it.  A program is the same
+--   shape, with @module Main@ on top.
+type Chunk = Module TopLevelStat
 
 newtype TypeParams = TypeParams [Text] deriving (Eq, Show, Generic)
 instance Sexp TypeParams

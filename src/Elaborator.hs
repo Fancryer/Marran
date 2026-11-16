@@ -20,6 +20,7 @@ where
 
 import qualified Ast
 import qualified Types
+import Module (Module(..))
 import qualified Data.Text as T
 import Utils (uniqPreserveOrder, TextMap, Pretty(..))
 import Data.Coerce (coerce)
@@ -187,10 +188,10 @@ resolveRowTaste env n =
     Nothing -> throwError $ UnboundVarError $ "Unbound row variable: " <> n
 
 elaborate :: Ast.Chunk -> ElabM Types.Chunk
-elaborate (Ast.Chunk stats) = do
+elaborate (Module header stats) = do
   rowEnv <- collectRowEnv stats
   typEnv <- collectTypEnv stats
-  mapM (elaborateTopLevelStat rowEnv typEnv) stats
+  Module header <$> mapM (elaborateTopLevelStat rowEnv typEnv) stats
 
 collectRowEnv :: [Ast.TopLevelStat] -> ElabM RowEnv
 collectRowEnv stats = RowEnv <$> foldM addRow [] stats <*> pure effectNames

@@ -1,3 +1,5 @@
+module Main
+
 //| Котировка: imm замораживает и цену, и код, который её читает. Ожидается: 10, 30, 15, 45
 funct line (unit Int) (qty Int) : Int =
   if ieq qty 0 then 0 else + unit (line unit (- qty 1))

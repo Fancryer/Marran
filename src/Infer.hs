@@ -144,6 +144,7 @@ import Data.Text (Text)
 import Control.Lens (use)
 import ErrorContext (IrFrame (IrFrame), ErrorFrame (..))
 import Suggest (suggestionNote)
+import Module (Module(..))
 import Span (Span)
 import Data.Set (Set)
 
@@ -443,7 +444,7 @@ withDeclFrame name sp = withErrorStack (EFIr $ IrFrame name sp)
 
 -- most important
 inferChunk :: [Text] -> Types.Chunk -> TypeCheckM TypedIR.Chunk
-inferChunk args chunk = do
+inferChunk args (Module header chunk) = do
   globalScope <- Scope.globalScope args
   -- The builtins live in the outer scope, so a program declaration shadows
   -- one: `funct apply ...` in a program is the program's `apply`, and the
@@ -603,7 +604,7 @@ inferChunk args chunk = do
     Types.SEnumDef _ enumDef -> pure $ Just $ TypedIR.SEnumDef enumDef
     Types.SFunctDef _ _ -> pure Nothing
 
-  pure $ catMaybes (otherStats <> map Just typedFuns)
+  pure $ Module header $ catMaybes (otherStats <> map Just typedFuns)
 
 wrapTypedExprWithCell :: TypedExpr -> EffRow -> EffRow
 wrapTypedExprWithCell e r =

@@ -1,3 +1,5 @@
+module Main
+
 //| Секрет должен лежать в [1, 100]. Ожидается: ok (прогоните несколько раз)
 funct main () : {Output; Random} () =
   val s = random_int 1 100;

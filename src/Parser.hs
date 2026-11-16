@@ -470,7 +470,54 @@ pipesym = symbol TPipe
 commasym = symbol TComma
 
 chunk :: Parser Chunk
-chunk = Chunk <$> many topLevelStat <* eof
+chunk = do
+  -- Every file starts with its header.  A file that says nothing about itself
+  -- is a mistake rather than an anonymous program: the name is what a
+  -- diagnostic quotes, and `module Main` is what makes a file runnable.
+  --
+  -- "unexpected `funct`" would not say what is missing, and a program without
+  -- a header is the first mistake a reader makes once the header is
+  -- mandatory, so the failure says what to write instead.
+  start <- currentPos
+  keyword KWModule <|> fail missingHeader
+  n <- name
+  exports <- optional exportList
+  sp <- spanUpToHere (spanFromPositions start start)
+  stats <- many topLevelStat <* eof
+  pure $ Module (ModuleHeader n exports sp) stats
+
+-- | The message for a file that does not declare its module.
+missingHeader :: String
+missingHeader =
+  "a file must start with a module header: `module Main` for a program, "
+    <> "`module Name` for a module"
+
+-- | @[funct f type T g as h]@: the names a module publishes.
+exportList :: Parser [ExportDecl]
+exportList = brackets (some exportDecl)
+
+-- | One name of an export list, with an optional kind and an optional alias.
+--
+--   The kind is only a hint: the checker compares it with the declaration it
+--   names, so `enum E` in the list of a module that declares `type E` is an
+--   error rather than a second namespace.
+exportDecl :: Parser ExportDecl
+exportDecl = do
+  start <- currentPos
+  kind <- optional declKind
+  n <- name
+  alias <- optional (symbolAs *> name)
+  sp <- spanUpToHere (spanFromPositions start start)
+  pure $ ExportDecl sp kind n alias
+
+declKind :: Parser DeclKind
+declKind = choice [
+    KindFunct  <$ keyword KWFunct,
+    KindType   <$ keyword KWType,
+    KindEffect <$ keyword KWEffect,
+    KindRow    <$ keyword KWRow,
+    KindEnum   <$ keyword KWEnum
+  ]
 
 topLevelStat :: Parser TopLevelStat
 topLevelStat = locTop $ choice [typeDef, enumDef, effDef, rowDef, functDef]

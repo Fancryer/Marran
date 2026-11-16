@@ -1,3 +1,5 @@
+module Main
+
 //| imm берёт снимок x в момент объявления. Ожидается: 6
 funct main () : {Output; Var; Rebind; Read} () =
   var x = 5;

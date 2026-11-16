@@ -1,3 +1,5 @@
+module Main
+
 val Functions = #{
   val id      : `T -> `T = ...;
   val const   : `A -> `B -> `A = ...;

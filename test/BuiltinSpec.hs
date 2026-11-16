@@ -12,6 +12,7 @@ import Test.Hspec
 import Elaborator (ElabState (..), elaborate)
 import Infer (inferChunk)
 import Parser (chunk, parseFromTextNamed)
+import Suite (withModuleHeader)
 import qualified Scope
 import Unify (TypeCheckState (..), errorCode, evalTypeCheckM)
 import Utils (Pretty (..))
@@ -21,7 +22,7 @@ import qualified Builtins
 --   The checks that do not depend on running the program live here.
 check :: T.Text -> IO (Either T.Text ())
 check src =
-  case parseFromTextNamed "test.marr" chunk src of
+  case parseFromTextNamed "test.marr" chunk (withModuleHeader src) of
     Left e -> pure $ Left (T.pack e)
     Right parsed ->
       case evalState (runExceptT (elaborate parsed)) (ElabState 0) of

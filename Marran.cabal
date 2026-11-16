@@ -38,6 +38,7 @@ library
       IntInterpreter
       Lexer
       Lib
+      Module
       Occurs
       Parser
       Record

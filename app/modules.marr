@@ -1,3 +1,5 @@
+module Main
+
 //| DO NOT TOUCH, DEPRECATED
 //| module type DB[connection] =
 //|   query : `connection -> String -> {Read} [Row];

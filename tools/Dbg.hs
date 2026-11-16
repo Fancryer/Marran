@@ -18,6 +18,7 @@ import Control.Monad.Except (runExceptT)
 import Elaborator (elaborate, ElabState(..))
 import Parser (chunk, parseFromTextNamed)
 import Infer (inferChunk)
+import Suite (withModuleHeader)
 import Unify (evalTypeCheckM, TypeCheckState(..))
 import TypedIR (Chunk(..))
 import qualified Scope
@@ -35,7 +36,7 @@ main = do
       putStrLn "usage: dbg <file.marr>"
       exitFailure
   src <- TIO.readFile path
-  case parseFromTextNamed (takeFileName path) chunk src of
+  case parseFromTextNamed (takeFileName path) chunk (withModuleHeader src) of
     Left e -> putStrLn e
     Right parsed ->
       case evalState (runExceptT (elaborate parsed)) (ElabState 0) of

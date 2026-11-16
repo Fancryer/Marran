@@ -1,3 +1,5 @@
+module Main
+
 //| Лексическая область: f видит внешний y. Ожидается: 1
 funct main () : {Output} () =
   val y = 1;

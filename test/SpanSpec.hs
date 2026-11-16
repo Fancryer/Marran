@@ -68,7 +68,8 @@ filterM' p (x:xs) = do
 --   Type-level nodes have no spans yet, so only declarations, expressions and
 --   statements are checked; that is where diagnostics are reported from.
 unspannedNodes :: Chunk -> [Bad]
-unspannedNodes (Chunk stats) = concatMap topLevel stats
+unspannedNodes (Module header stats) =
+  spanCheck "module header" (mhSpan header) <> concatMap topLevel stats
   where
     topLevel stat =
       spanCheck ("declaration at line " <> show (spanStartLine (topLevelSpan stat))) (topLevelSpan stat)

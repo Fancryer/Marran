@@ -1,3 +1,5 @@
+module Main
+
 //| Проверка сравнений. Ожидается 5 строк: ok ok ok ok ok
 funct main () : {Output} () =
   (if < 1 2 then sayn 'ok: 1 < 2' else sayn 'BAD: 1 < 2 is false');

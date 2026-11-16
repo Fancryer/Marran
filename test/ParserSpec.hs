@@ -11,8 +11,10 @@ import Test.Hspec
 
 import qualified Ast
 import Ast (Typ (..), pattern EAnnot, pattern EApply, pattern EName)
+import Ast (Module(..), ModuleHeader(..), ExportDecl(..), DeclKind(..), headerExportsAll)
 import Lexer (Keyword (..), Token (..))
 import Parser (chunk, parseFromTextNamed, parseTokensUnposed)
+import Suite (withModuleHeader)
 import qualified Parser
 
 -- | The expression parser, for tests that care about the shape of a node
@@ -23,7 +25,13 @@ exp_ = Parser.exp
 -- | Parse a program and return the rendered error, failing the test if the
 --   program unexpectedly parses.
 parseFailure :: T.Text -> IO [T.Text]
-parseFailure src = case parseFromTextNamed "demo.marr" chunk src of
+parseFailure src = case parseFromTextNamed "demo.marr" chunk (withModuleHeader src) of
+  Left e  -> pure (T.lines (T.pack e))
+  Right _ -> expectationFailure "the program parsed, but it should not have" >> pure []
+
+-- | Like 'parseFailure', but the source is a whole file, header included.
+parseFailureRaw :: T.Text -> IO [T.Text]
+parseFailureRaw src = case parseFromTextNamed "demo.marr" chunk src of
   Left e  -> pure (T.lines (T.pack e))
   Right _ -> expectationFailure "the program parsed, but it should not have" >> pure []
 
@@ -96,7 +104,7 @@ pSpec = do
 
   describe "match and patterns" $ do
     it "parses the clauses of a match, each with its own block" $ do
-      case parseFromTextNamed "demo.marr" chunk $ T.unlines
+      case parseFromTextNamed "demo.marr" chunk . withModuleHeader $ T.unlines
         [ "funct f (n Int) : Int ="
         , "  match (n) to"
         , "    | 1 => 10"
@@ -129,6 +137,53 @@ pSpec = do
         ] of
         Left e -> expectationFailure e
         Right _ -> pure ()
+
+  describe "the module header" $ do
+    it "is the first thing a file must have" $ do
+      -- The header is where a file says what it is; without one the program
+      -- has no name to be reported under, so the failure names the fix.
+      ls <- parseFailureRaw $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn 1"
+        ]
+      take 2 ls `shouldBe`
+        [ "error[E0013]: a file must start with a module header: `module Main` for a program, `module Name` for a module"
+        , " --> demo.marr:1:1"
+        ]
+
+    it "records the name of the module" $ do
+      case parseFromTextNamed "demo.marr" chunk (T.unlines
+        [ "module Demo"
+        , ""
+        , "funct f () : Int = 1"
+        ]) of
+        Left e -> expectationFailure e
+        Right (Module header _) -> mhName header `shouldBe` "Demo"
+
+    it "has no export list when the module exports everything" $ do
+      case parseFromTextNamed "demo.marr" chunk "module Demo\nfunct f () : Int = 1" of
+        Left e -> expectationFailure e
+        Right (Module header _) -> headerExportsAll header `shouldBe` True
+
+    it "reads kinds and aliases in an export list" $ do
+      -- The kind is optional and only disambiguates; `as` renames the name for
+      -- everyone who imports the module.
+      case parseFromTextNamed "demo.marr" chunk (T.unlines
+        [ "module Demo [funct f as g enum E type T]"
+        , "funct f () : Int = 1"
+        ]) of
+        Left e -> expectationFailure e
+        Right (Module header _) ->
+          fmap (\d -> (edKind d, edName d, edAlias d)) <$> mhExports header
+            `shouldBe` Just
+              [ (Just KindFunct, "f", Just "g")
+              , (Just KindEnum, "E", Nothing)
+              , (Just KindType, "T", Nothing)
+              ]
+
+    it "does not accept a keyword as a module name" $ do
+      ls <- parseFailureRaw "module funct\n"
+      take 1 ls `shouldBe` ["error[E0013]: unexpected `funct`"]
 
   describe "syntax errors" $ do
     it "reports an unexpected token with its code and position" $ do

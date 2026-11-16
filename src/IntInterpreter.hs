@@ -29,6 +29,7 @@ import Data.Scientific (Scientific, fromFloatDigits, normalize, scientific)
 import Control.Monad.Cont (ContT(..), callCC)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Span (Span, noSpan)
+import Module (Module(..))
 import Utils (TextMap, Pretty (..))
 import Data.Foldable (find)
 import Data.List (intercalate, nub)
@@ -1397,7 +1398,7 @@ floatDiv x y = normalize (scientific n (-15))
 
 -- | Выполнение чанка (игнорируем декларации, просто идём дальше)
 evalChunk :: IR.Chunk -> Interp Value
-evalChunk chunk = do
+evalChunk mod'@(Module _ chunk) = do
   st <- get
   let env0 = st.sEnv
 
@@ -1419,7 +1420,7 @@ evalChunk chunk = do
       ctor <- makeConstructor env0 (enumCaseName c) muts
       void $ bindValAddrIn env0 (enumCaseName c) ctor
 
-  let mainDecl = findMain chunk
+  let mainDecl = findMain mod'
   case mainDecl of
     Nothing -> liftIO (putStrLn "Warning: No 'main' function found") >> pure VNil
     Just (IR.SFunctDef mainFunct) -> do
@@ -1432,9 +1433,11 @@ evalChunk chunk = do
     Just _ -> rtError "'main' is not a function definition"
 
 findMain :: IR.Chunk -> Maybe IR.TopLevelStat
-findMain = find $ \case
-  (IR.SFunctDef fd) -> fd.fName == "main"
-  _ -> False
+findMain (Module _ decls) = find isMain decls
+  where
+    isMain = \case
+      (IR.SFunctDef fd) -> fd.fName == "main"
+      _ -> False
 
 makeTopLevelClosure :: EnvId -> IR.FunctDecl -> Interp (Address -> Interp Address)
 makeTopLevelClosure env fd =

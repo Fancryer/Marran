@@ -1,1 +1,3 @@
+module Main
+
 say 'Hello from Mårran!'

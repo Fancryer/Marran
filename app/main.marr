@@ -1,3 +1,5 @@
+module Main
+
 row Mutation = {Var; Cell; Read; Rebind}
 row Io = {Input; Output}
 row Main = {... Mutation; ... Io | `R}

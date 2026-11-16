@@ -1,3 +1,5 @@
+module Main
+
 //| Функции высшего порядка и массивы из стандартной библиотеки: `id`, `const`,
 //| `flip`, `compose`, `curry`, `uncurry`; `head`, `tail`, `empty`, `alen`,
 //| `map`, `filter`, `any`, `all`, `foldl`, `foldr`, `concat`, `zip`, `at`,

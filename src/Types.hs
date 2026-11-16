@@ -111,6 +111,7 @@ import qualified Data.Map as Map
 import qualified Control.Applicative as Set
 import qualified Data.Set as Set
 import Span (Span, noSpan, mergeSpan, mergeSpans)
+import Module (Module(..))
 
 -- TODO: replace name-based reachability with binding-identity-based analysis;
 -- reduce false positives caused by shadowing.
@@ -894,9 +895,7 @@ instance Pretty HandlerClause where
 -- eff clauses
 data HandlerSig = HandlerSig EffCons [(Text, Funct)] deriving Show
 
-type Chunk = [TopLevelStat]
-
-instance Pretty Chunk where pretty = T.intercalate "\n" . map pretty
+type Chunk = Module TopLevelStat
 
 data Mutability = Val | Var | Imm deriving (Eq, Ord, Generic)
 
