@@ -924,6 +924,138 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> expectationFailure $ "a row alias over an effect must work: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe` ["3"]
 
+  describe "an application is written with a hash" $ do
+    it "applies a declared type where a bracket alone used to mean a row" $ do
+      -- A leading name in a result type is a row, so `Box[Int]` reads as the
+      -- row `Box` followed by the array `[Int]`.  The hash is what tells the
+      -- reader the bracket applies.
+      r <- runSourceWithInput "sharp_application.marr" "" $ T.unlines
+        [ "enum Maybe[a] | Some (val v : a) | None"
+        , ""
+        , "funct value (m Maybe#[Int]) : Int ="
+        , "  match (m) to"
+        , "    | #Some x => x"
+        , "    | #None => 0"
+        , ""
+        , "funct main () : {Output} () = sayn (value (Some 5))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a `#[...]` application must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["5"]
+
+    it "says how the hash is written when it is missing" $ do
+      r <- runSourceWithInput "sharp_missing.marr" "" $ T.unlines
+        [ "enum Maybe[a] | Some (val v : a) | None"
+        , ""
+        , "funct value (m Maybe[Int]) : Int = 0"
+        ]
+      case r of
+        Left err -> do
+          err `shouldSatisfy` ("written `Maybe#[...]`" `isInfixOf`)
+          err `shouldSatisfy` ("a `#` before the brackets" `isInfixOf`)
+        Right out -> expectationFailure $
+          "the bracket alone must be refused; got output: " ++ take 300 out
+
+    it "substitutes into a parameter written bare in a type alias" $ do
+      -- `type Pair[a] = (a, a)` writes its parameter the way a declaration
+      -- does; only the meta spelling was substituted before.
+      r <- runSourceWithInput "alias_bare_param.marr" "" $ T.unlines
+        [ "type Pair[a] = (a, a)"
+        , "type Boxed[a] = Maybe#[a]"
+        , ""
+        , "enum Maybe[a] | Some (val v : a) | None"
+        , ""
+        , "funct mk (n Int) : Pair#[Int] = (n, n)"
+        , ""
+        , "funct main () : {Output} () = sayn (mk 2)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a bare parameter must substitute: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["(2, 2)"]
+
+  describe "rows and effects with parameters" $ do
+    it "expands a parameterised row with the arguments of its use" $ do
+      r <- runSourceWithInput "row_param.marr" "" $ T.unlines
+        [ "effect Ask[T]"
+        , "  ask : () -> `T"
+        , "end"
+        , ""
+        , "row Asking[T] = {Ask#[T]}"
+        , ""
+        , "funct f () : Asking#[Int] Int = ask ()"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (under Ask#[Int] to f ()"
+        , "  handle"
+        , "  | ask u => resume 7)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a parameterised row must expand: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["7"]
+
+    it "charges a parameterised effect with the arguments of the use" $ do
+      -- A use of `ask` performs `Ask[`m]`, not a bare `Ask`: the row the
+      -- caller declares is `Ask[Int]`, and the variable the operation
+      -- produces is the one that row binds.
+      r <- runSourceWithInput "effect_param_charge.marr" "" $ T.unlines
+        [ "effect Ask[T]"
+        , "  ask : () -> `T"
+        , "end"
+        , ""
+        , "funct f () : {Ask#[Int]} Int = ask ()"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (under Ask#[Int] to f ()"
+        , "  handle"
+        , "  | ask u => resume 5)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "an applied effect must charge: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["5"]
+
+    it "reports a missing argument in the row that writes the effect" $ do
+      r <- runSourceWithInput "effect_arity.marr" "" $ T.unlines
+        [ "effect Ask[T]"
+        , "  ask : () -> `T"
+        , "end"
+        , ""
+        , "funct f () : {Ask} Int = ask ()"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("declares 1 type argument" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a bare effect name must be refused; got output: " ++ take 300 out
+
+  describe "what a handler cannot intercept" $ do
+    it "refuses to handle a marker effect" $ do
+      -- `Var` is a label on a mutable binding, not a declaration with
+      -- operations, so there is nothing to intercept.
+      r <- runSourceWithInput "under_marker.marr" "" $ T.unlines
+        [ "funct main () : {Output; Var; Rebind} () ="
+        , "  under Var to (var x = 1; sayn x) handle | then a => a"
+        ]
+      case r of
+        Left err -> do
+          err `shouldSatisfy` ("E0016" `isInfixOf`)
+          err `shouldSatisfy` ("no operations to intercept" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a marker effect is not handleable; got output: " ++ take 300 out
+
+    it "refuses to handle an effect with no operations" $ do
+      r <- runSourceWithInput "under_empty.marr" "" $ T.unlines
+        [ "effect Empty"
+        , "end"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (under Empty to 1 handle | then x => x)"
+        ]
+      case r of
+        Left err -> do
+          err `shouldSatisfy` ("E0016" `isInfixOf`)
+          err `shouldSatisfy` ("declares no operations" `isInfixOf`)
+        Right out -> expectationFailure $
+          "an empty effect is not handleable; got output: " ++ take 300 out
+
   describe "Nothing is the bottom type" $ do
     it "types `[[1], []]` and `[[], [1]]` the same way" $ do
       -- The empty array is `[Nothing]`, and `Nothing <: T`; an ordinary
