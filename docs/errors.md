@@ -68,6 +68,59 @@ error[E0013]: a file must start with a module header: `module Main` for a progra
   |
 ```
 
+## Modules and imports
+
+Imports are resolved before the type checker runs, so a mistake about a file is
+reported by the loader: there is no code, and the position is the `import` line
+(or the export name) that is wrong. The renderer quotes the file the import is
+in, and the notes say what to do next.
+
+```
+error: cannot find the module `numbers`
+ --> scratch/main.marr:3:1
+  |
+3 | import numbers
+  | ^^^^^^^^^^^^^^
+  |
+  = looked for: scratch/numbers.marr, ./numbers.marr, app/marr/numbers.marr, app/numbers.marr
+```
+
+The cases the loader reports:
+
+| Situation | Message |
+|-----------|---------|
+| a module is not on disk | ``cannot find the module `a` ``, with the list of paths tried |
+| a name the export list names is unknown | ``` `f` is not declared or imported here, so it cannot be exported ```, with the names the module does have |
+| two imports bring one name | ``two imports bring `f`: a.marr (a function) and b.marr (a function)``, with the advice to rename one |
+| the entry file is not `module Main` | ``` `Lib` is a library, not a program: a file that is run must say `module Main` ``` |
+
+Two imports of *different* namespaces do not clash: a function and a type may
+share a name, exactly as two declarations of one file may. Only two values, or
+two types, of one name are an error, and `as` is the way out.
+
+An enumeration carries its constructors. Naming `enum Colour` in an export or
+import list names `Red` and `Green` too, because a type whose values cannot be
+written is not much of an export; repeating a constructor in the list is the
+same declaration twice, not a clash. `as` renames the type only — `enum Colour
+as Shade` makes `Shade` the spelling in signatures while `Red` keeps its declared
+name — and two enums that both have a `Red` clash unless one of them spells the
+constructor out and renames it: `[enum Shade funct Red as Crimson]`.
+
+A rename reaches the body of the declaration, not only its table entry: the
+types a declaration mentions are written in the vocabulary of the module that
+declares it, so an importer that writes `Shade` must not receive a constructor
+or an operation that still says `Colour`. Function and constructor schemes,
+enum fields, the signatures and rows of an effect's operations, and a type or
+row alias' body all take the local spelling.
+
+A private name is not a special case: a module's table holds only what it
+exports, so an unexported name is not "hidden" from the importer, it was never
+imported. Reaching for it gives the ordinary ``E0007`` about a name in scope,
+and no note suggests the private spelling.
+
+The entry point is the only `main` that runs. A library may declare one; the
+interpreter calls the `main` of the module named on the command line.
+
 ## Suggestions
 
 An unknown name is often a typo, so the checker looks for a name that is close

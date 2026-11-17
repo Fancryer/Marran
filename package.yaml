@@ -85,6 +85,7 @@ tests:
       ParserSpec
       SuggestSpec
       BuiltinSpec
+      ImportSpec
       BenchmarkSpec
     ghc-options:
     - -threaded

@@ -8,7 +8,7 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
 
-module IntInterpreter (interpret, prepareSnapshotBenchmark, InterpError(..), errorCodeOf, heapError) where
+module IntInterpreter (interpret, interpretProgram, prepareSnapshotBenchmark, InterpError(..), errorCodeOf, heapError) where
 
 import qualified TypedIR as IR
 import Types (
@@ -29,7 +29,7 @@ import Data.Scientific (Scientific, fromFloatDigits, normalize, scientific)
 import Control.Monad.Cont (ContT(..), callCC)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Span (Span, noSpan)
-import Module (Module(..))
+import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), Unit(..), Program(..), moduleAt)
 import Utils (TextMap, Pretty (..))
 import Data.Foldable (find)
 import Data.List (intercalate, nub)
@@ -57,7 +57,7 @@ import System.CPUTime (getCPUTime)
 import Control.Concurrent (threadDelay)
 import Resume (ResumeInfo(..))
 import Text.Printf (printf)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, listToMaybe)
 import System.Environment (lookupEnv)
 import Control.Exception (AsyncException (..), IOException, evaluate, fromException, throwIO, try)
 import System.IO.Error (isEOFError)
@@ -484,6 +484,127 @@ interpret chunk cmdArgs = do
         pure (Left (heapError (mainSpan chunk) async))
       _ -> throwIO e
 
+-- | Run a whole program.
+--
+--   Every module gets an environment of its own, whose parent is the root (the
+--   native values).  A module's own declarations are bound there first, so a
+--   recursive function closes over an environment that will hold its own name;
+--   then the names the module imported are copied in under the spelling this
+--   file writes.  Copying the address rather than the value keeps one instance
+--   of each function per program, and two private @helper@s of two modules are
+--   simply two addresses in two environments.
+--
+--   Only the entry module's @main@ is called: a library is a program too, and
+--   running it would mean running the first module of the import graph, which
+--   is not what a reader asked for.
+interpretProgram :: Program IR.TopLevelStat -> [String] -> IO (Either InterpError Value)
+interpretProgram prog cmdArgs = do
+  rootRef <- newIORef (Env Map.empty Nothing)
+  let root = EnvId {envId = 0, envCell = rootRef}
+      state = (initialInterpState root) {sCmdArgs = cmdArgs}
+  result <- try $ fst <$> runInterp (do
+    modify $ \st -> st {sEnv = root}
+    _ <- buildInitialEnv cmdArgs
+    envs <- evalProgram prog root
+    case Map.lookup (progEntry prog) envs of
+      Nothing -> rtError $ T.concat [
+          "internal error: the entry module `", T.pack (progEntry prog),
+          "` is not part of the program"
+        ]
+      Just eid -> do
+        modify $ \st -> st {sEnv = eid}
+        runEntry (findMainOf prog) eid
+    ) state
+
+  case result of
+    Right ok -> pure ok
+    Left e -> case fromException e of
+      Just async | async == HeapOverflow || async == StackOverflow ->
+        pure (Left (heapError (programMainSpan prog) async))
+      _ -> throwIO e
+
+-- | The body of @main@ in the entry module, as the position of a failure that
+--   is not tied to a particular node.
+programMainSpan :: Program IR.TopLevelStat -> Span
+programMainSpan prog = case findMainOf prog of
+  Just fd -> IR.blockSpan (IR.fBlock fd)
+  Nothing -> noSpan
+
+findMainOf :: Program IR.TopLevelStat -> Maybe IR.FunctDecl
+findMainOf prog = listToMaybe
+  [ fd
+  | u <- progUnits prog
+  , (p, Module _ decls) <- unitModules u
+  , p == progEntry prog
+  , IR.SFunctDef fd <- decls
+  , IR.fName fd == "main"
+  ]
+
+-- | Give every module of the program an environment, in dependency order.
+evalProgram :: Program IR.TopLevelStat -> EnvId -> Interp (Map FilePath EnvId)
+evalProgram prog root = do
+  envs <- foldM unitStep Map.empty (progUnits prog)
+  pure envs
+  where
+    unitStep envs (Unit _ mods) = do
+      -- Every member of a unit gets its environment before any of them is
+      -- filled: a cycle has no first module, and a closure only needs the
+      -- environment to exist.
+      fresh <- forM mods $ \(p, m) -> do
+        eid <- newEnv Env {bindings = Map.empty, parent = Just root}
+        pure (p, eid, m)
+      -- Own declarations first: a function's body may call any function of its
+      -- own module, including itself.
+      forM_ fresh $ \(_, eid, m) -> evalModule eid (modDecls m)
+      -- Then the imported names, copied from the module that declares them.
+      -- The members of this unit are already in the map: a cycle imports from
+      -- itself just like any other module, and the other member's environment
+      -- exists by now even though the unit as a whole is not finished.
+      let here = Map.fromList [ (p, eid) | (p, eid, _) <- fresh ]
+          known = Map.union here envs
+      forM_ fresh $ \(_, eid, m) -> linkImports known eid m
+      pure $ Map.union here envs
+
+    linkImports envs eid m =
+      forM_ (Map.toList (mhResolved (modHeader m))) $ \(local, imp) -> case imOrigin imp of
+        -- A native name is already bound in the root environment, which is
+        -- this module's parent; only a renamed one needs a local binding.
+        FromNative _
+          | local == imName imp -> pure ()
+          | otherwise -> copyFrom eid root local (imName imp)
+        FromModule path -> case Map.lookup path envs of
+          Nothing -> pure ()
+          Just src -> copyFrom eid src local (imName imp)
+
+    copyFrom eid src local declared =
+      findBindingEnvMaybe src declared >>= \case
+        Just (_, mut, addr) -> do
+          _ <- modifyEnv eid $ \env ->
+            env {bindings = Map.insert local (mut, addr) env.bindings}
+          pure ()
+        Nothing -> pure ()
+
+-- | Bind one module's own declarations into an environment.
+evalModule :: EnvId -> [IR.TopLevelStat] -> Interp ()
+evalModule env0 chunk = do
+  let functDefs = [fd | IR.SFunctDef fd <- chunk, IR.fName fd /= "main"]
+  forM_ functDefs $ \fd -> do
+    let cache = case fst (IR.fRet fd) of
+          Just fxs -> if isPureClosure fxs then Just IM.empty else Nothing
+          _ -> Just IM.empty
+    fn <- makeTopLevelClosure env0 fd
+    void $ bindValIn env0 (IR.fName fd) $ VClosure env0 cache
+          (Just (CodeFun Whole (IR.fName fd) (map fst $ IR.fArgs fd) (IR.fBlock fd))) fn
+
+  -- The constructors of a declared enumeration are ordinary functions of the
+  -- module's scope, so a value is built by applying one: `Some 5`.
+  let enumDefs = [ed | IR.SEnumDef ed <- chunk]
+  forM_ enumDefs $ \def ->
+    forM_ (enumCases def) $ \c -> do
+      let muts = [m | (m, _, _) <- enumCaseFields c]
+      ctor <- makeConstructor env0 (enumCaseName c) muts
+      void $ bindValAddrIn env0 (enumCaseName c) ctor
+
 -- | An out-of-memory condition as a diagnostic.  Kept separate from 'interpret'
 --   so that the mapping can be tested without actually exhausting memory.
 heapError :: Span -> AsyncException -> InterpError
@@ -505,8 +626,18 @@ outOfMemory resource = T.concat [
 outOfMemoryNoRts :: Text
 outOfMemoryNoRts = "the program ran out of memory"
 
--- | The block of @main@, used as the position of a failure that is not tied to
---   a particular node, such as exhaustion of memory.
+-- | Call the entry module's @main@.
+runEntry :: Maybe IR.FunctDecl -> EnvId -> Interp Value
+runEntry mainDecl eid = case mainDecl of
+  Nothing -> liftIO (putStrLn "Warning: No 'main' function found") >> pure VNil
+  Just fd -> do
+    -- `main` is `() -> ...`: the entry point is called with the unit value.
+    unit <- alloc VNil
+    fn <- makeTopLevelClosure eid fd
+    resultAddr <- fn unit
+    result <- whnfAddr resultAddr
+    reportEvents (fst $ IR.fRet fd)
+    readCell result
 mainSpan :: IR.Chunk -> Span
 mainSpan chunk = case findMain chunk of
   Just (IR.SFunctDef fd) -> IR.blockSpan fd.fBlock
@@ -534,7 +665,7 @@ globalOps = [
         args -> \_ -> arityError "sayn" 1 args),
       ("trace", Op 2 $ \case
         [labelArg, valArg] -> \_ -> do
-          -- `trace` is `app/std.marr`'s `String -> `A -> {Output} `A`: the label
+          -- `trace` reads `String -> `A -> {Output} `A`: the label
           -- says where the value came from, and the value is shown, not its
           -- thunk.  The cell is forced in place and the argument address is
           -- returned, so the result is the value the label described.
@@ -623,7 +754,7 @@ globalOps = [
             _ -> rtError "`sleep` needs an Int as its duration in microseconds"
         args -> \_ -> arityError "sleep" 1 args)
     ]),
-    -- `Env` of `app/std.marr`: the process environment.
+    -- `Env`: the process environment.
     (Eff.elabel "Env", [
       ("get_env", Op 1 $ \case
         [addr] -> \_ -> do
@@ -648,7 +779,7 @@ globalOps = [
             _ -> rtError "`set_env` needs a String as both the name and the value"
         args -> \_ -> arityError "set_env" 2 args)
     ]),
-    -- `File` of `app/std.marr`.  Every operation that can fail reports the
+    -- `File`.  Every operation that can fail reports the
     -- failure through `Error`, the same way `/` reports a zero divisor, so a
     -- program can catch it with `try` or `under Error`.
     (Eff.elabel "File", [
@@ -707,7 +838,7 @@ globalOps = [
             other -> rtError $ "`list_directory` expected a String, but got " <> describe other
         args -> \_ -> arityError "list_directory" 1 args)
     ]),
-    -- `System` of `app/std.marr`.
+    -- `System`.
     (Eff.elabel "System", [
       -- The command line is read when the program asks for it: an `args ()`
       -- in a library is not a reason to give every program a `System` row.
@@ -809,7 +940,7 @@ globalHandlers = [
 -- | The initial environment: the operations of the built-in effects and the
 --   native values, exactly the names 'Builtins.builtins' lists.
 --
---   The arithmetic and the strings of @app/std.marr@ live here as native
+--   The arithmetic and the strings of the native modules live here as native
 --   closures.  Each one forces exactly the arguments whose values it needs:
 --   a language whose arguments are delayed must not force a `spin` that its
 --   result never mentions, so `||` and `&&` stop at the first deciding
@@ -1316,21 +1447,9 @@ buildInitialEnv _cmdArgs = do
           ("try", tryAddr)
         ]
 
-  -- The library records are views of the very values above, so
-  -- `Numbers@+` and `+` are one function and cannot drift apart.
-  recordBindings <- forM (Builtins.builtins >>= asRecord) $ \(name, fields) -> do
-    propAddrs <- forM fields $ \field ->
-      case lookup field natives of
-        Just addr -> pure (field, addr)
-        Nothing -> rtError $ "internal error: the library record `" <> name
-          <> "` names `" <> field <> "`, which is not a native value"
-    eid <- newEnv Env {bindings = Map.fromList [(n, (Val, a)) | (n, a) <- propAddrs], parent = Nothing}
-    addr <- alloc (VRecord eid)
-    pure (name, (Val, addr))
-
   let justNatives = Map.fromList $ map (\(n, a) -> (n, (Val, a))) natives
 
-      allBindings = operations <> justNatives <> Map.fromList recordBindings
+      allBindings = operations <> justNatives
 
       -- The checker and the interpreter must offer the same names: a name the
       -- program can call but the interpreter cannot run would crash, and a
@@ -1346,10 +1465,6 @@ buildInitialEnv _cmdArgs = do
       ]
 
   modifyCurrentEnv $ \e -> e {bindings = allBindings <> e.bindings}
-
-  where
-    asRecord (Builtins.Builtin name (Builtins.Record fields)) = [(name, fields)]
-    asRecord _ = []
 
 -- | Raise an error through the effect @Error@, so that a handler installed by
 --   the program sees it and the bottom handler turns it into a diagnostic when

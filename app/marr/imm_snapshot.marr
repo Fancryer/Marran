@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| imm берёт снимок x в момент объявления. Ожидается: 6
 funct main () : {Output; Var; Rebind; Read} () =

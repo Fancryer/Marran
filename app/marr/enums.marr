@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| Энумы и `match`: конструктор — обычная функция (`Some 5`), а образец
 //| пишет `#`.  Ожидается 6 строк: Some 5 / None / 5 / none / cdef / two

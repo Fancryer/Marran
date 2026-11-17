@@ -9,9 +9,9 @@ import Data.List (sort)
 import qualified Data.Text as T
 import Test.Hspec
 
-import Elaborator (ElabState (..), elaborate)
-import Infer (inferChunk)
-import Parser (chunk, parseFromTextNamed)
+import Elaborator (ElabState (..), elaborateProgram)
+import Infer (inferProgram)
+import Loader (LoadError (..), loadText)
 import Suite (withModuleHeader)
 import qualified Scope
 import Unify (TypeCheckState (..), errorCode, evalTypeCheckM)
@@ -21,14 +21,15 @@ import qualified Builtins
 -- | Type-check a chunk and return the error code of the first failure, if any.
 --   The checks that do not depend on running the program live here.
 check :: T.Text -> IO (Either T.Text ())
-check src =
-  case parseFromTextNamed "test.marr" chunk (withModuleHeader src) of
-    Left e -> pure $ Left (T.pack e)
+check src = do
+  loaded <- loadText "test.marr" (withModuleHeader src)
+  pure $ case loaded of
+    Left e -> Left (leMessage e)
     Right parsed ->
-      case evalState (runExceptT (elaborate parsed)) (ElabState 0) of
-        Left e -> pure $ Left (pretty e)
+      case evalState (runExceptT (elaborateProgram parsed)) (ElabState 0) of
+        Left e -> Left (pretty e)
         Right elaborated ->
-          pure $ case evalTypeCheckM (inferChunk [] elaborated) (TypeCheckState (0, 0, 0) 0 []) of
+          case evalTypeCheckM (inferProgram [] elaborated) (TypeCheckState (0, 0, 0) 0 []) of
             Left (_, err) -> Left (maybe "no code" id (errorCode err))
             Right _ -> Right ()
 

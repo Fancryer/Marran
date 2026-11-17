@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| Рекурсивная функция внутри снимка (цикл в таблице копий). Ожидается: 15
 funct sum (n Int) : Int =

@@ -15,16 +15,14 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Control.Monad.State.Lazy (evalState)
 import Control.Monad.Except (runExceptT)
-import Elaborator (elaborate, ElabState(..))
-import Parser (chunk, parseFromTextNamed)
-import Infer (inferChunk)
+import Elaborator (elaborateProgram, ElabState(..))
+import Loader (LoadError(..), loadText)
+import Infer (inferProgram)
 import Suite (withModuleHeader)
 import Unify (evalTypeCheckM, TypeCheckState(..))
-import TypedIR (Chunk(..))
-import qualified Scope
+import Module (Program(..))
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
-import System.FilePath (takeFileName)
 import Utils (Pretty(..))
 
 main :: IO ()
@@ -36,12 +34,13 @@ main = do
       putStrLn "usage: dbg <file.marr>"
       exitFailure
   src <- TIO.readFile path
-  case parseFromTextNamed (takeFileName path) chunk (withModuleHeader src) of
-    Left e -> putStrLn e
+  loaded <- loadText path (withModuleHeader src)
+  case loaded of
+    Left e -> putStrLn (T.unpack (leMessage e))
     Right parsed ->
-      case evalState (runExceptT (elaborate parsed)) (ElabState 0) of
+      case evalState (runExceptT (elaborateProgram parsed)) (ElabState 0) of
         Left e -> putStrLn (T.unpack (pretty e))
         Right elab ->
-          case evalTypeCheckM (inferChunk [] elab) (TypeCheckState (0,0,0) 0 []) of
+          case evalTypeCheckM (inferProgram [] elab) (TypeCheckState (0,0,0) 0 []) of
             Left e -> print e
             Right ir -> putStrLn (T.unpack (pretty ir))

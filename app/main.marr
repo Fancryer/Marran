@@ -1,4 +1,5 @@
 module Main
+import @native
 
 row Mutation = {Var; Cell; Read; Rebind}
 row Io = {Input; Output}

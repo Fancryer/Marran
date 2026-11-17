@@ -7,6 +7,7 @@
 
 module Elaborator (
   elaborate,
+  elaborateProgram,
   elaborateTopLevelStat,
   elaborateEffRow,
   elaborateExpr,
@@ -20,7 +21,8 @@ where
 
 import qualified Ast
 import qualified Types
-import Module (Module(..))
+import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..),
+               Unit(..), Program(..), DeclKind(..))
 import qualified Data.Text as T
 import Utils (uniqPreserveOrder, TextMap, Pretty(..))
 import Data.Coerce (coerce)
@@ -37,7 +39,7 @@ import Control.Lens.Setter ((+=))
 import Control.Monad.Error.Class (throwError)
 import Types (Mutability, Taste, EffRow(RClosed))
 import Data.Traversable (for)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Map (Map)
 import qualified Suggest
 
@@ -192,6 +194,169 @@ elaborate (Module header stats) = do
   rowEnv <- collectRowEnv stats
   typEnv <- collectTypEnv stats
   Module header <$> mapM (elaborateTopLevelStat rowEnv typEnv) stats
+
+-- | Elaborate a whole program.
+--
+--   Every module is elaborated on its own, against a type and row environment
+--   built from what it declares and what it imports.  Where the declarations
+--   come from is the loader's answer: a resolved name points at the module that
+--   declares it, so an unexported alias of one module is simply absent from
+--   another's environment, and a private alias cannot be reached even by
+--   guessing its name.
+elaborateProgram :: Ast.Program Ast.TopLevelStat -> ElabM (Program Types.TopLevelStat)
+elaborateProgram (Program units sources entry) = do
+  let chunks = Map.fromList [ (p, m) | u <- units, (p, m) <- unitModules u ]
+  units' <- forM units $ \(Unit paths mods) ->
+    Unit paths <$> forM mods (\(p, m) -> (p,) <$> elaborateModule chunks p m)
+  pure $ Program units' sources entry
+
+-- | One module of a program, elaborated with the declarations it can see.
+elaborateModule :: Map FilePath Ast.Chunk -> FilePath -> Ast.Chunk -> ElabM Types.Chunk
+elaborateModule chunks _ (Module header stats) = do
+  ownRows <- collectRowEnv stats
+  ownTyps <- collectTypEnv stats
+  let imported = importedDecls chunks header
+      -- The module's own declarations come first: an alias of the same name
+      -- wins over an imported one, exactly as a value declaration does.
+      rowEnv = ownRows {
+          rowAliases = rowAliases ownRows <> importedRows imported
+        , declaredEffects = declaredEffects ownRows <> importedEffects imported
+        }
+      typEnv = ownTyps <> importedTyps imported
+  Module header <$> mapM (elaborateTopLevelStat rowEnv typEnv) stats
+
+-- | A declaration of another module, as the tables of a module name it.
+data ImportedDecl =
+    ImportedType (Text, TypeAliasDef)
+  | ImportedRow (Text, Ast.EffRow)
+  | ImportedEffect Text
+
+-- | The declarations a module's imports give it.
+--
+--   A name is looked up in the chunk of the module that declares it, which is
+--   what 'mhResolved' records; a re-export therefore travels to the declaring
+--   module and not to the middle one, so a name a middle module did not export
+--   stays invisible.
+--
+--   The declaration keeps its body but takes the local name, because an import
+--   may rename it: `import a [type Pair as Couple]` must make `Couple` elaborate
+--   to the same alias `Pair` names in `a`, and the type environment is keyed by
+--   the spelling this file writes.
+importedDecls :: Map FilePath Ast.Chunk -> ModuleHeader -> [ImportedDecl]
+importedDecls chunks header =
+  [ rename renames local decl
+  | (local, imp) <- Map.toList (mhResolved header)
+  , Just path <- [case imOrigin imp of
+        FromModule p -> Just p
+        FromNative _ -> Nothing]
+  , Just chunk <- [Map.lookup path chunks]
+  , Just decl <- [lookupDecl chunk (imName imp) (imKind imp)]
+  ]
+  where
+    -- A declaration's body is written in the vocabulary of the module that
+    -- declares it.  A file that renames `Colour` to `Shade` also renames the
+    -- `Colour` inside `type Colours = [Colour]`, or the alias would expand to
+    -- a name this file does not have.
+    renames =
+      [ (imName imp, local)
+      | (local, imp) <- Map.toList (mhResolved header)
+      , imKind imp /= KindFunct
+      , local /= imName imp
+      ]
+
+    rename renames local = \case
+      ImportedType (_, d) -> ImportedType (local, renameAlias renames d)
+      ImportedRow (_, r) -> ImportedRow (local, renameRow renames r)
+      ImportedEffect _ -> ImportedEffect local
+
+-- | Rewrite the names a file renames inside an alias' body.
+renameAlias :: [(Text, Text)] -> TypeAliasDef -> TypeAliasDef
+renameAlias renames = \case
+  TypeAliasDef params body -> TypeAliasDef params (renameAstTyp renames body)
+  TypeEnumDef params -> TypeEnumDef params
+
+-- | Rewrite the names a file renames inside a row alias.
+renameRow :: [(Text, Text)] -> Ast.EffRow -> Ast.EffRow
+renameRow = renameAstRow
+
+-- | A type with the renamed type and enum names substituted.
+--
+--   Type *variables* are not names of declarations and are left alone; only a
+--   plain name or an applied generic alias is a reference to something the
+--   other file declared.
+renameAstTyp :: [(Text, Text)] -> Ast.Typ -> Ast.Typ
+renameAstTyp renames = go
+  where
+    rename n = fromMaybe n (lookup n renames)
+
+    go = \case
+      Ast.TFlat n -> Ast.TFlat (rename n)
+      Ast.TArray t -> Ast.TArray (go t)
+      Ast.TParen t -> Ast.TParen (go t)
+      Ast.TPair l r -> Ast.TPair (go l) (go r)
+      Ast.TFunct (Ast.Funct i o r) -> Ast.TFunct (Ast.Funct (go i) (go o) (renameAstRow renames r))
+      Ast.TRecord (Ast.RecordTyp props) ->
+        Ast.TRecord $ Ast.RecordTyp
+          [ Ast.RecordTypProp c n (go t) | Ast.RecordTypProp c n t <- props ]
+      Ast.TPending t r -> Ast.TPending (go t) (renameAstRow renames r)
+      Ast.TForall ts es t -> Ast.TForall ts es (go t)
+      Ast.TVar n -> Ast.TVar n
+      Ast.TGenericAlias n apps -> Ast.TGenericAlias (rename n) (renameAstApps renames apps)
+
+renameAstApps :: [(Text, Text)] -> Ast.TypeApps -> Ast.TypeApps
+renameAstApps renames (Ast.TypeApps args) = Ast.TypeApps (map goArg args)
+  where
+    goArg = \case
+      Ast.TAFlat n -> Ast.TAFlat (fromMaybe n (lookup n renames))
+      Ast.TAArray t -> Ast.TAArray (goArg t)
+      Ast.TAParen t -> Ast.TAParen (goArg t)
+      Ast.TAPair l r -> Ast.TAPair (goArg l) (goArg r)
+      Ast.TAFunct i o -> Ast.TAFunct (goArg i) (goArg o)
+      Ast.TARecord (Ast.RecordTypeArg props) ->
+        Ast.TARecord $ Ast.RecordTypeArg
+          [ Ast.RecordTypeArgProp c n (goArg t) | Ast.RecordTypeArgProp c n t <- props ]
+      Ast.TAMeta n -> Ast.TAMeta n
+      Ast.TAGenericAlias n apps ->
+        Ast.TAGenericAlias (fromMaybe n (lookup n renames)) (renameAstApps renames apps)
+
+-- | A row with the renamed effect and row names substituted.
+renameAstRow :: [(Text, Text)] -> Ast.EffRow -> Ast.EffRow
+renameAstRow renames = \case
+  Ast.ERVar n -> Ast.ERVar n
+  Ast.ERAlias n -> Ast.ERAlias (fromMaybe n (lookup n renames))
+  Ast.ERSugar entries tailVar ->
+    Ast.ERSugar (map entry entries) tailVar
+  where
+    entry = \case
+      Ast.EREEffCons (Ast.EffCons ec) -> Ast.EREEffCons (Ast.EffCons (cons ec))
+      Ast.EREEffCons (Ast.EVar n) -> Ast.EREEffCons (Ast.EVar n)
+      Ast.EREEffRow r -> Ast.EREEffRow (renameAstRow renames r)
+
+    cons (Ast.ECons n apps) =
+      Ast.ECons (fromMaybe n (lookup n renames)) (renameAstApps renames <$> apps)
+
+
+lookupDecl :: Ast.Chunk -> Text -> DeclKind -> Maybe ImportedDecl
+lookupDecl chunk name kind = listToMaybe $ mapMaybe one (Ast.modDecls chunk)
+  where
+    one stat
+      | Ast.topLevelName stat /= name = Nothing
+      | Ast.declKindOf stat /= kind = Nothing
+      | otherwise = case stat of
+          Ast.TypeDef _ _ ts body -> Just $ ImportedType (name, TypeAliasDef (coerce ts) body)
+          Ast.EnumDef _ _ ts _ -> Just $ ImportedType (name, TypeEnumDef (coerce ts))
+          Ast.RowDef _ _ row -> Just $ ImportedRow (name, row)
+          Ast.EffectDef {} -> Just $ ImportedEffect name
+          Ast.FunctDef {} -> Nothing
+
+importedTyps :: [ImportedDecl] -> TypEnv
+importedTyps ds = [ (T.unpack n, d) | ImportedType (n, d) <- ds ]
+
+importedRows :: [ImportedDecl] -> [(String, Ast.EffRow)]
+importedRows ds = [ (T.unpack n, r) | ImportedRow (n, r) <- ds ]
+
+importedEffects :: [ImportedDecl] -> [String]
+importedEffects ds = [ T.unpack n | ImportedEffect n <- ds ]
 
 collectRowEnv :: [Ast.TopLevelStat] -> ElabM RowEnv
 collectRowEnv stats = RowEnv <$> foldM addRow [] stats <*> pure effectNames

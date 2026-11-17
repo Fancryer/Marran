@@ -482,9 +482,16 @@ chunk = do
   keyword KWModule <|> fail missingHeader
   n <- name
   exports <- optional exportList
+  -- The imports belong to the header: they come before the first declaration,
+  -- so a reader sees the file's whole interface before its contents, and the
+  -- loader never has to look for an import between two functions.
+  --
+  -- `many` stops at the first token that is not `import`, which includes the
+  -- end of the file: a file may import nothing.
+  imports <- many importDecl
   sp <- spanUpToHere (spanFromPositions start start)
   stats <- many topLevelStat <* eof
-  pure $ Module (ModuleHeader n exports sp) stats
+  pure $ Module (parsedHeader n imports exports sp) stats
 
 -- | The message for a file that does not declare its module.
 missingHeader :: String
@@ -509,6 +516,57 @@ exportDecl = do
   alias <- optional (symbolAs *> name)
   sp <- spanUpToHere (spanFromPositions start start)
   pure $ ExportDecl sp kind n alias
+
+-- | @import a@, @import a#f@, @import a [f g as h]@, @import 'dir/' [a b]@,
+--   @import @native Numbers@.
+--
+--   The module part follows the export list's grammar, because both list names
+--   of the same five kinds and both allow @as@.  The `#` form is the one-name
+--   spelling of the list form: it reads like a selector, which is what a reader
+--   looking for a single function wants to write.
+--
+--   A native import is marked with `@` before the module, so `@native` is read
+--   as a marker and a name rather than as a keyword: the grammar has no word
+--   for the native scope, and a program that declares a module called `native`
+--   would otherwise be ambiguous.
+importDecl :: Parser ImportDecl
+importDecl = do
+  start <- currentPos
+  keyword KWImport
+  native <- optional nativeMarker
+  unit <- case native of
+    -- `import @native` alone is the whole native scope.  The next token is
+    -- either the end of the imports or a declaration; `optional` is enough to
+    -- tell them apart, because neither starts with a name of an import unit.
+    Just _ -> optional importUnit
+    Nothing -> Just <$> importUnit
+  sp <- spanUpToHere (spanFromPositions start start)
+  pure $ ImportDecl sp (isJust native) unit
+
+-- | The `@native` of an import: `@` and the word after it.
+nativeMarker :: Parser ()
+nativeMarker = do
+  symbol TAt
+  n <- name
+  if n == "native" then pure () else fail nativeMarkerMessage
+
+nativeMarkerMessage :: String
+nativeMarkerMessage = "an import starts with a module name, or with `@native` for the native modules"
+
+importUnit :: Parser ImportUnit
+importUnit = choice [
+    ImportDir <$> stringLiteral <*> brackets (some importUnit),
+    try importModuleNames,
+    ImportModule <$> name <*> pure Nothing
+  ]
+
+-- | @a#f@ and @a [f g as h]@.
+importModuleNames :: Parser ImportUnit
+importModuleNames = do
+  n <- name
+  names <- (pure <$> (symbol TSharp *> exportDecl)) <|> brackets (some exportDecl)
+  pure $ ImportModule n (Just names)
+
 
 declKind :: Parser DeclKind
 declKind = choice [

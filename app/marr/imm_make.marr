@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| imm замораживает и код функции make: счётчик становится константой. Ожидается: 0, затем 0
 funct make () : {Cell} () -> {Read; Rebind} Int =

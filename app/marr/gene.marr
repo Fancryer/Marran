@@ -1,4 +1,5 @@
 module Main
+import @native
 
 funct main () : {Read; Var} Int =
   var x = 10;

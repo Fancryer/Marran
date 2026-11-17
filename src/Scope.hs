@@ -32,7 +32,8 @@ module Scope (
   bindingNames,
   typeNames,
   effectNames,
-  globalScope
+  globalScope,
+  nativeScope
 )
 where
 
@@ -317,8 +318,22 @@ addHandler sig scope =
 --   two sides are checked against, so a name that is added on one side only is
 --   reported while the scope is built rather than when a program first calls
 --   it.
+--
+--   A program sees only the names of the native modules it imported, so this
+--   is the whole native scope and 'nativeScope' is the filtered one.
 globalScope :: [Text] -> TypeCheckM Scope
-globalScope _args = do
+globalScope = buildNativeScope (const True)
+
+-- | The native names a module may use, given the modules it imported.
+--
+--   The filter is over names rather than modules so that a caller does not have
+--   to know which module a name belongs to; 'Builtins.moduleOf' answers that
+--   for a diagnostic.
+nativeScope :: (Text -> Bool) -> [Text] -> TypeCheckM Scope
+nativeScope = buildNativeScope
+
+buildNativeScope :: (Text -> Bool) -> [Text] -> TypeCheckM Scope
+buildNativeScope visible _args = do
   boundSay <- freshBoundM
   boundSayn <- freshBoundM
   boundTrace <- freshBoundM
@@ -329,14 +344,15 @@ globalScope _args = do
   -- `exit` never returns, so its result is the bottom of every type.
   boundExit <- freshBoundM
 
-  -- The polymorphic groups of `app/std.marr`, unpacked into the native scope.
+  -- The polymorphic names of the native modules.
   --
   -- A record's fields are inferred at a single type ('Infer.inferRecord'), so
-  -- a field cannot be quantified; these names are therefore plain functions.
-  -- Every variable below is a meta that the scheme quantifies, so each use
-  -- gets fresh ones.  A row variable is a meta for the same reason, and also
-  -- because 'Unify.applyEffRowSubst' resolves rows through 'rowSubst' only for
-  -- metas: a rigid row variable in a scheme would never be freshened.
+  -- a record could not hold a polymorphic field; these names are therefore
+  -- plain functions of a module.  Every variable below is a meta that the
+  -- scheme quantifies, so each use gets fresh ones.  A row variable is a meta
+  -- for the same reason, and also because 'Unify.applyEffRowSubst' resolves
+  -- rows through 'rowSubst' only for metas: a rigid row variable in a scheme
+  -- would never be freshened.
   polyEntries <- do
     -- `Functions`
     idT <- freshMetaM
@@ -573,12 +589,12 @@ globalScope _args = do
 
       strings = TArray TString (RClosed [])
 
-      -- The arithmetic, the strings and the booleans: monomorphic, so a field
-      -- of a record is exactly the type of the flat name.
+      -- The arithmetic, the strings and the booleans: monomorphic, so each
+      -- entry is one declared type and needs no quantification.
       fieldTypes =
         [ ("pred", i1i)
         -- `/` reports a zero divisor through `Error`, so its latent row names
-        -- the effect: a caller pays for it, exactly as `app/std.marr` says.
+        -- the effect and a caller pays for it.
         , ("+", i2i), ("-", i2i), ("*", i2i), ("%", i2i)
         , ("/", TFunct $ Funct TInt (tfunc TInt TInt) Eff.fxError)
         , ("neg", i1i), ("abs", i1i), ("max", i2i), ("min", i2i)
@@ -626,7 +642,7 @@ globalScope _args = do
         , quantified "say" [boundSay] $ TFunct $ Funct tSay TNil Eff.fxOutput
         , quantified "sayn" [boundSayn] $ TFunct $ Funct tSayn TNil Eff.fxOutput
         -- `trace 'label' v`: the label is ordinary text, the value comes back
-        -- unchanged, so `app/std.marr` declares it `String -> `A -> {Output} `A`.
+        -- unchanged, so it reads `String -> `A -> {Output} `A`.
         , quantified "trace" [boundTrace] $
             TFunct $ Funct TString (TFunct $ Funct tTrace tTrace Eff.fxOutput) Eff.empty
         , operation "read_int" TNil TInt ["Input"]
@@ -643,7 +659,7 @@ globalScope _args = do
         , operation "random_string" TInt TString ["Random"]
         , operation "time_ms" TNil TInt ["Time"]
         , operation "sleep" TInt TNil ["Time"]
-        -- `Env`, `File` and `System` of `app/std.marr`.  A file operation that
+        -- `Env`, `File` and `System`.  A file operation that
         -- can fail names `Error` in its row as well, so a handler for it is
         -- optional but a `try` or `under Error` can catch the failure.
         , operation "get_env" TString TString ["Env"]
@@ -676,20 +692,14 @@ globalScope _args = do
         ]
 
       flatNames = map (\(n, _, _, _) -> n) (entries <> polyEntries)
-      recordNames = Builtins.namesOfKind isRecord
-      declared = flatNames <> recordNames
-      undocumented = filter (`notElem` declared) Builtins.names
-      unimplemented = filter (`notElem` Builtins.names) declared
+      undocumented = [ n | n <- flatNames, n `notElem` Builtins.names ]
 
-  unless (null undocumented && null unimplemented) $
+  unless (null undocumented) $
     throwTypeCheckError $ InferenceError $ T.concat [
-        "internal error: the builtin table and the type checker disagree",
-        report "the table lists but the checker lacks" undocumented,
-        report "the checker binds but the table lacks" unimplemented
+        "internal error: the type checker binds names the builtin table lacks",
+        report "the checker binds" undocumented
       ]
 
-  -- The flat names first: a record is built out of their types, so
-  -- `Numbers@+` and `+` are the same scheme, not two that happen to agree.
   -- `Error` is the one effect a program may name without declaring it: the
   -- interpreter keeps a bottom handler for it that turns an unhandled `error`
   -- into a diagnostic, and `/` reports a zero divisor through it.  A program
@@ -697,57 +707,32 @@ globalScope _args = do
   -- instead of letting it reach the bottom.
   --
   -- It lives in its own outer scope, so a program is still free to declare
-  -- `effect Error` itself (`app/std.marr` does): a declaration shadows a
-  -- built-in, and `addEffect` only looks at the scope it adds to.
+  -- `effect Error` itself: a declaration shadows a built-in, and `addEffect`
+  -- only looks at the scope it adds to.
+  --
+  -- A name is only bound here if the file imported the native module that
+  -- declares it: the interpreter still has every native value below the
+  -- program's environment, but the checker refuses a name it did not import,
+  -- which is what makes `import @native Numbers` mean anything.
   let errorScope = emptyScope {effects = Map.singleton "Error" errorEff}
       builtinScope = emptyScope {parent = Just errorScope}
 
       errorEff = EffDef "Error" [] [
-          -- The result is the bottom type: `error` never returns, so its use
-          -- reads as whatever the surrounding expression needs.  The latent
-          -- row is empty like every declared operation's: an effect is charged
-          -- at the use site ('Scope.findOperations'), not by the operation's
-          -- own type.
           ("error", Funct TString TNothing Eff.empty)
         ]
 
-  -- The flat names first: a record is built out of their types, so
-  -- `Numbers@+` and `+` are the same scheme, not two that happen to agree.
-  withFlat <- foldM
+  foldM
     (\sc (name, tvs, rvs, typ) -> do
         (openedTyp, rowVars) <- openArrows typ
         let scheme = Scheme tvs [] (rvs <> rowVars) Map.empty Map.empty openedTyp
         addBinding name scheme (valueOf name scheme) Val sc)
     builtinScope
-    (entries <> polyEntries)
-
-  foldM addRecord withFlat (Builtins.builtins >>= asRecord)
+    [ (n, tvs, rvs, typ)
+    | (n, tvs, rvs, typ) <- entries <> polyEntries
+    , visible n
+    ]
 
   where
-    isRecord (Builtins.Record _) = True
-    isRecord _ = False
-
-    asRecord (Builtins.Builtin name (Builtins.Record fields)) = [(name, fields)]
-    asRecord _ = []
-
-    -- A library record.  Its fields keep the open rows of the flat names: the
-    -- record is a view of the library, not a second copy of it, and a field
-    -- read through the record must be as permissive as the name itself.
-    addRecord sc (name, fields) = do
-      let fieldOf n =
-            case Scope.findBinding True sc n of
-              Just (scheme, _, _) -> scheme._a
-              Nothing -> TInt -- unreachable: the flat pass bound every field
-      (props, rowVars) <- foldM
-        (\(acc, rs) n -> do
-            (t, rs') <- openArrows (fieldOf n)
-            pure (acc <> [TRecordProp Val n t], rs <> rs'))
-        ([], [])
-        fields
-      let typ = TRecord props (RClosed [])
-          scheme = Scheme [] [] rowVars Map.empty Map.empty typ
-      addBinding name scheme (valueOf name scheme) Val sc
-
     report what ns =
       if null ns then "" else "; " <> what <> ": " <> T.intercalate ", " ns
 

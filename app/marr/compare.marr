@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| Проверка сравнений. Ожидается 5 строк: ok ok ok ok ok
 funct main () : {Output} () =

@@ -12,7 +12,7 @@ import Test.Hspec
 import IntInterpreter (InterpError (..), errorCodeOf, heapError)
 import Span (isNoSpan, spanAt)
 import Utils (Pretty (..))
-import Suite (cases, rejectedProgram, programPath, runProgram, runProgramWithInput, runSourceWithInput)
+import Suite (cases, rejectedProgram, programPath, runProgram, runProgramWithInput, runSource, runSourceWithInput)
 
 -- | The example programs of the paper, as tests.  The event check of the
 --   interpreter is enabled, so a mutation event that the declared row does not
@@ -775,14 +775,14 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         , "  sayn add1;"
         , "  sayn twice;"
         , "  sayn +;"
-        , "  sayn (Numbers@+);"
+        , "  sayn pred;"
         , "  sayn [add1, twice];"
         , "  sayn (add1, twice)"
         ]
       case r of
         Left err -> expectationFailure $ "printing a function must work: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe`
-          ["add1", "twice", "+", "+", "[add1, twice]", "(add1, twice)"]
+          ["add1", "twice", "+", "pred", "[add1, twice]", "(add1, twice)"]
 
     it "says that a partial application is not the whole function" $ do
       -- `add 1` is a function, but it is not `add`: printing the bare name would
@@ -1386,20 +1386,37 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
           "a cyclic thunk must be a diagnostic, got output: " ++ take 300 out
 
   describe "the standard library" $ do
-    it "binds a field of a record to the same function as the flat name" $ do
-      -- `Numbers@+` is not a second `+`: the record is a view of the values the
-      -- initial environment already holds, so a call through it and a call to
-      -- the name give the same result and cost the same row.
-      r <- runSourceWithInput "records_of_the_library.marr" "" $ T.unlines
-        [ "funct main () : {Output} () ="
-        , "  sayn (Numbers@+ 1 2);"
+    it "gives a native name to a module that imported it, and hides it otherwise" $ do
+      -- A native name is not a global: a module sees the names of the native
+      -- modules it imported.  Importing `Numbers` brings `+` and `pred`, and
+      -- nothing else; importing nothing leaves even `+` unbound.
+      r <- runSource "native_imports.marr" "" $ T.unlines
+        [ "module Main [funct main]"
+        , "import @native Numbers"
+        , "import @native Output"
+        , ""
+        , "funct main () : {Output} () ="
         , "  sayn (+ 1 2);"
-        , "  sayn (Strings@slen 'abc');"
-        , "  sayn (Booleans@not true)"
+        , "  sayn (pred 5)"
         ]
       case r of
-        Left err -> expectationFailure $ "the records must be callable: " ++ err
-        Right out -> filter (not . isReport) (lines out) `shouldBe` ["3", "3", "3", "false"]
+        Left err -> expectationFailure $ "the imported names must be visible: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["3", "4"]
+
+    it "refuses a native name of a module that was not imported" $ do
+      -- `slen` belongs to `Strings`, which this module did not import, so the
+      -- checker reports it although the interpreter has the value below.
+      r <- runSource "native_hidden.marr" "" $ T.unlines
+        [ "module Main"
+        , "import @native Numbers"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (slen 'abc')"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` isInfixOf "E0007"
+        Right out -> expectationFailure $
+          "a native name that was not imported must be rejected, got: " ++ take 300 out
 
     it "reports a zero divisor through `Error`, so a handler can catch it" $ do
       r <- runSourceWithInput "division_by_zero.marr" "" $ T.unlines

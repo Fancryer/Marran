@@ -15,6 +15,7 @@ module Suite (
   , runSuite
   , runProgram
   , runProgramWithInput
+  , runSource
   , runSourceWithInput
   , withModuleHeader
   , programPath
@@ -32,15 +33,17 @@ import System.Environment (setEnv)
 import System.IO
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 
-import Elaborator (elaborate, ElabState(..))
+import Elaborator (elaborateProgram, ElabState(..))
 import ErrorContext (
-    ErrorFrame(..), renderError, insertSource, emptySourceMap,
+    insertSource, emptySourceMap,
     renderDiagnostic, diagnostic, Severity(SevError), renderErrorWith, primaryLabel,
     Diagnostic(..), innermost
   )
-import Infer (inferChunk)
-import IntInterpreter (interpret, InterpError(..), errorCodeOf)
-import Parser (parseFromTextNamed, chunk)
+import Infer (inferProgram)
+import IntInterpreter (interpretProgram, InterpError(..), errorCodeOf)
+import Loader (LoadError(..), loadText)
+import Span (isNoSpan)
+import Module (Program(..))
 import Unify (TypeCheckState(..), evalTypeCheckM, errorCode)
 import Utils (Pretty(..))
 
@@ -168,21 +171,31 @@ runProgramWithInput name input =
 runSource :: FilePath -> String -> T.Text -> IO (Either String String)
 runSource path input src = do
   -- The source map is what lets the renderer quote the offending lines; the
-  -- name of the file in the map must match the one recorded in the spans.
-  let sources = insertSource (T.pack path) src emptySourceMap
-  case elaborate <$> parseFromTextNamed path chunk src of
-    Left e -> pure $ Left e
-    Right elabAction ->
-      case evalState (runExceptT elabAction) (ElabState 0) of
+  -- name of the file in the map must match the one recorded in the spans.  The
+  -- imports add the files they were read from, so a diagnostic about an
+  -- imported module can quote it too.
+  loaded <- loadText path src
+  case loaded of
+    Left e -> pure . Left . T.unpack $
+      renderDiagnostic (insertSource (T.pack path) src emptySourceMap)
+        ((diagnostic SevError Nothing (leMessage e)) {
+            diagNotes = leNotes e
+          , diagLabels = [primaryLabel (leSpan e) "" | not (isNoSpan (leSpan e))]
+        })
+    Right prog -> do
+      let sources = foldl' (\sm (p, t) -> insertSource (T.pack p) t sm)
+                      (insertSource (T.pack path) src emptySourceMap)
+                      (progSources prog)
+      case evalState (runExceptT (elaborateProgram prog)) (ElabState 0) of
         Left e -> pure . Left . T.unpack $
           renderDiagnostic sources (diagnostic SevError Nothing (pretty e))
         Right c' ->
-          case evalTypeCheckM (inferChunk [] c') (TypeCheckState (0, 0, 0) 0 []) of
+          case evalTypeCheckM (inferProgram [] c') (TypeCheckState (0, 0, 0) 0 []) of
             Left (stack, err) ->
               pure . Left . T.unpack $
                 renderErrorWith sources (innermost stack) (errorCode err) (pretty err) stack
             Right ic -> do
-              r <- captureStdoutWith (withStdin input (interpret ic []))
+              r <- captureStdoutWith (withStdin input (interpretProgram ic []))
               case r of
                 (Left err, _) -> pure . Left . T.unpack $
                   renderDiagnostic sources ((diagnostic SevError (errorCodeOf err) (pretty err)) {
@@ -198,16 +211,22 @@ runSource path input src = do
 runSourceWithInput :: FilePath -> String -> T.Text -> IO (Either String String)
 runSourceWithInput path input src = runSource path input (withModuleHeader src)
 
--- | Put @module Main@ in front of a source that has no header.
+-- | Put @module Main@ and a native import in front of a source that has no
+--   header.
 --
 --   A test keeps a small program next to its assertion, and repeating the
 --   header in every one of them would hide the program under boilerplate.  The
 --   header goes on the first line and the program follows on the same line, so
 --   the line numbers a test quotes for its own body do not move.
+--
+--   The native import is part of the preamble because a module sees only the
+--   native modules it imported: a test that says @say@ wants the names of
+--   @Output@, and spelling the whole native scope is what @import @native@ is
+--   for.  A test about imports writes its own header instead.
 withModuleHeader :: T.Text -> T.Text
 withModuleHeader src
   | startsWithHeader src = src
-  | otherwise = T.concat ["module Main ", src]
+  | otherwise = T.concat ["module Main import @native ", src]
 
 -- | Does the source already declare its module?  Leading blank lines and the
 --   @//|@ comments the examples start with are skipped, because the header is
@@ -249,11 +268,7 @@ withStdin input action
       pure result
 
 -- | Run an action with @stdout@ redirected to a temporary file and return what
---   was written to it.
-captureStdout :: IO a -> IO String
-captureStdout action = snd <$> captureStdoutWith action
-
--- | 'captureStdout' that also keeps the action's result.
+--   was written to it, together with the action's result.
 captureStdoutWith :: IO a -> IO (a, String)
 captureStdoutWith action = do
   tmp <- getTemporaryDirectory

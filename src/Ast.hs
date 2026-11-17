@@ -11,6 +11,7 @@ module Ast (
   module Module,
   TopLevelStat(..),
   topLevelSpan,
+  topLevelName,
   declKindOf,
   EnumCase(..),
   EffectOp(..),
@@ -88,7 +89,7 @@ import qualified Data.List as String
 import GHC.Generics (Generic)
 import Sexp (Sexp(..))
 import Span (Span, noSpan, mergeSpan)
-import Module (Module(..), ModuleHeader(..), ExportDecl(..), DeclKind(..), prettyDeclKind, headerExportsAll)
+import Module
 
 -- | The kind of a declaration, which is what a kind in a list is checked
 --   against.
@@ -99,6 +100,15 @@ declKindOf = \case
   RowDef {} -> KindRow
   EnumDef {} -> KindEnum
   FunctDef {} -> KindFunct
+
+-- | The name a declaration publishes.
+topLevelName :: TopLevelStat -> Text
+topLevelName = \case
+  TypeDef _ n _ _ -> n
+  EffectDef _ n _ _ -> n
+  RowDef _ n _ -> n
+  EnumDef _ n _ _ -> n
+  FunctDef _ n _ _ _ _ _ _ -> n
 
 -- | A parsed file.  The header is not optional: a file that says nothing about
 --   itself would not say what it is, and the module's name is what a reader

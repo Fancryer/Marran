@@ -1,4 +1,5 @@
 module Main
+import @native
 
 funct abs (x Float) : Float =
   if x `<.` 0.0 then fneg x else if feq x 0.0 then 0.0 else x

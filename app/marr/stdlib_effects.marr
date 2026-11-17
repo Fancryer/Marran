@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| Эффекты стандартной библиотеки, кроме `Output`/`Input`: `Env` (`get_env`,
 //| `set_env`), `File` (`write_file`, `append_file`, `read_file`, `file_exists`,

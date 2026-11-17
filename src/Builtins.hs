@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The names every program starts with.
+-- | The names the native modules offer, and which module offers each.
 --
 --   A builtin is visible to two independent components: the type checker
 --   ('Scope.globalScope' gives it a scheme) and the interpreter
@@ -12,222 +12,205 @@
 --   sides are checked against, so a name added in one place and forgotten in
 --   the other is reported instead of discovered by a user.
 --
---   The list grew into the standard library of line 0.2: the arithmetic, the
---   strings and the booleans of @app/std.marr@ live here.  A record of the
---   library (@Numbers@, @Strings@, @Booleans@) is not a second definition of
---   its fields; it names them, and both sides build the record out of the very
---   values they bind globally.  That is what makes @Numbers@+@ and @+@ the same
---   function rather than two that must be kept in step.
+--   The list is the standard library of line 0.2, cut into the native modules
+--   @import @native@ names.  A group of names used to be a record in a source
+--   file; a record could not hold a polymorphic field, so half of the library
+--   was flat names and half was fields, and a reader had to know which was
+--   which.  A module has no such limit: every name of @Arrays@ is polymorphic
+--   and none of it needs a field.  The interface is documented in
+--   @docs/stdlib.md@.
 --
---   Not every group of @app/std.marr@ can be a record yet.  A record's fields
---   are inferred at one type ('Infer.inferRecord'), so a field cannot be
---   quantified: @Arrays@ would have to hold @map@ at a single element type.
---   The fields of @Functions@, @Arrays@, @Pairs@, @Conv@, @Output@ and
---   @Input@ are therefore unpacked into the native scope as plain functions,
---   and only the monomorphic groups are records.  When a record field may be
---   polymorphic these names will move into their records as well, and the flat
---   names will be built from the records, exactly as @+@ and @Numbers@+@
---   already are.
+--   Nothing here is visible without an import.  The interpreter still binds
+--   every native name in its own environment below a program's, but the
+--   checker only adds the names of the modules a file imported, so an
+--   unimported @map@ is reported as an unknown name.
 module Builtins (
   Builtin(..),
   BuiltinKind(..),
   builtins,
   names,
-  namesOfKind
+  namesOfKind,
+  modules,
+  moduleNames,
+  namesOfModule,
+  effectsOfModule,
+  moduleOf
 ) where
 
 import Data.Text (Text)
+import qualified Data.List as List
 
 -- | How a builtin reaches the program.
 data BuiltinKind =
-    -- | A value the interpreter builds directly (a closure over native code,
-    --   or a constant such as @args@).
+    -- | A value the interpreter builds directly (a closure over native code).
     Native
-    -- | A record whose fields are the named builtins.  The fields are listed
-    --   globally as well, so @Booleans@@not@ and @not@ are the same value; the
-    --   order here is the order @app/std.marr@ declares them in, which is the
-    --   order a record prints its fields in only if the names happen to sort
-    --   that way, and that is fine.
-  | Record [Text]
-    -- | An operation of a built-in effect.
+    -- | An operation of a built-in effect.  The name of the effect is also the
+    --   name of the module the operation comes from.
   | Op Text
   deriving (Eq, Ord, Show)
 
 data Builtin = Builtin {
-  bName :: Text,
-  bKind :: BuiltinKind
+    bModule :: Text
+  , bName   :: Text
+  , bKind   :: BuiltinKind
 } deriving (Eq, Ord, Show)
 
--- | Every name visible in the initial scope.  Keep this list and the two
+-- | Every name a native module offers.  Keep this list and the two
 --   implementations in step; 'Marran.Test.BuiltinSpec' fails when they are not.
 builtins :: [Builtin]
 builtins = [
-    -- integers
-    Builtin "pred" Native,
-    Builtin "+" Native,
-    Builtin "-" Native,
-    Builtin "*" Native,
-    Builtin "/" Native,
-    Builtin "%" Native,
-    Builtin "neg" Native,
-    Builtin "abs" Native,
-    Builtin "max" Native,
-    Builtin "min" Native,
-    Builtin "ieq" Native,
-    Builtin "ineq" Native,
-    Builtin ">" Native,
-    Builtin "<" Native,
-    Builtin "<=" Native,
-    Builtin ">=" Native,
+    -- Numbers: the arithmetic of `Int` and `Float`, and the conversions
+    -- between them.
+    Builtin "Numbers" "pred" Native,
+    Builtin "Numbers" "+" Native,
+    Builtin "Numbers" "-" Native,
+    Builtin "Numbers" "*" Native,
+    Builtin "Numbers" "/" Native,
+    Builtin "Numbers" "%" Native,
+    Builtin "Numbers" "neg" Native,
+    Builtin "Numbers" "abs" Native,
+    Builtin "Numbers" "max" Native,
+    Builtin "Numbers" "min" Native,
+    Builtin "Numbers" "ieq" Native,
+    Builtin "Numbers" "ineq" Native,
+    Builtin "Numbers" ">" Native,
+    Builtin "Numbers" "<" Native,
+    Builtin "Numbers" "<=" Native,
+    Builtin "Numbers" ">=" Native,
 
-    -- floats
-    Builtin "+." Native,
-    Builtin "-." Native,
-    Builtin "*." Native,
-    Builtin "/." Native,
-    Builtin "%." Native,
-    Builtin "fneg" Native,
-    Builtin "fabs" Native,
-    Builtin "fmax" Native,
-    Builtin "fmin" Native,
-    Builtin "feq" Native,
-    Builtin "fneq" Native,
-    Builtin "<." Native,
-    Builtin ">." Native,
-    Builtin "<=." Native,
-    Builtin ">=." Native,
+    Builtin "Numbers" "+." Native,
+    Builtin "Numbers" "-." Native,
+    Builtin "Numbers" "*." Native,
+    Builtin "Numbers" "/." Native,
+    Builtin "Numbers" "%." Native,
+    Builtin "Numbers" "fneg" Native,
+    Builtin "Numbers" "fabs" Native,
+    Builtin "Numbers" "fmax" Native,
+    Builtin "Numbers" "fmin" Native,
+    Builtin "Numbers" "feq" Native,
+    Builtin "Numbers" "fneq" Native,
+    Builtin "Numbers" "<." Native,
+    Builtin "Numbers" ">." Native,
+    Builtin "Numbers" "<=." Native,
+    Builtin "Numbers" ">=." Native,
 
-    -- conversions
-    Builtin "to_int" Native,
-    Builtin "to_float" Native,
+    Builtin "Numbers" "to_int" Native,
+    Builtin "Numbers" "to_float" Native,
 
-    -- strings
-    Builtin "++" Native,
-    Builtin "slen" Native,
-    Builtin "sub" Native,
-    Builtin "split" Native,
-    Builtin "join" Native,
-    Builtin "trim" Native,
-    Builtin "upper" Native,
-    Builtin "lower" Native,
-    Builtin "contains" Native,
-    Builtin "replace" Native,
-    Builtin "seq" Native,
-    Builtin "sneq" Native,
+    -- Strings
+    Builtin "Strings" "++" Native,
+    Builtin "Strings" "slen" Native,
+    Builtin "Strings" "sub" Native,
+    Builtin "Strings" "split" Native,
+    Builtin "Strings" "join" Native,
+    Builtin "Strings" "trim" Native,
+    Builtin "Strings" "upper" Native,
+    Builtin "Strings" "lower" Native,
+    Builtin "Strings" "contains" Native,
+    Builtin "Strings" "replace" Native,
+    Builtin "Strings" "seq" Native,
+    Builtin "Strings" "sneq" Native,
 
-    -- booleans
-    Builtin "not" Native,
-    Builtin "||" Native,
-    Builtin "&&" Native,
-    Builtin "^" Native,
-    Builtin "nor" Native,
-    Builtin "nand" Native,
-    -- the conjunction the paper's examples are written with; `&&` is the name
-    -- `app/std.marr` gives it
-    Builtin "and" Native,
+    -- Booleans.  `and` is the conjunction the paper's examples are written
+    -- with; `&&` is the C spelling of the same operation, and both stay.
+    Builtin "Booleans" "not" Native,
+    Builtin "Booleans" "||" Native,
+    Builtin "Booleans" "&&" Native,
+    Builtin "Booleans" "^" Native,
+    Builtin "Booleans" "nor" Native,
+    Builtin "Booleans" "nand" Native,
+    Builtin "Booleans" "and" Native,
 
-    -- introspection and memory
-    Builtin "force" Native,
-    Builtin "whnf" Native,
+    -- Functions
+    Builtin "Functions" "id" Native,
+    Builtin "Functions" "const" Native,
+    Builtin "Functions" "flip" Native,
+    Builtin "Functions" "compose" Native,
+    Builtin "Functions" "apply" Native,
+    Builtin "Functions" "curry" Native,
+    Builtin "Functions" "uncurry" Native,
 
-    -- comparing two values of one type: `==` and `!=` compare content,
-    -- `===` and `!==` compare the values themselves.  They are polymorphic,
-    -- which is why they are not fields of a record yet (see the note above).
-    Builtin "==" Native,
-    Builtin "===" Native,
-    Builtin "!=" Native,
-    Builtin "!==" Native,
+    -- Arrays
+    Builtin "Arrays" "head" Native,
+    Builtin "Arrays" "tail" Native,
+    Builtin "Arrays" "empty" Native,
+    Builtin "Arrays" "alen" Native,
+    Builtin "Arrays" "map" Native,
+    Builtin "Arrays" "filter" Native,
+    Builtin "Arrays" "any" Native,
+    Builtin "Arrays" "all" Native,
+    Builtin "Arrays" "foldl" Native,
+    Builtin "Arrays" "foldr" Native,
+    Builtin "Arrays" "concat" Native,
+    Builtin "Arrays" "zip" Native,
+    Builtin "Arrays" "at" Native,
+    Builtin "Arrays" "take" Native,
+    Builtin "Arrays" "drop" Native,
 
-    -- the polymorphic groups of `app/std.marr`, unpacked (see the note above):
-    -- `Functions`
-    Builtin "id" Native,
-    Builtin "const" Native,
-    Builtin "flip" Native,
-    Builtin "compose" Native,
-    Builtin "apply" Native,
-    Builtin "curry" Native,
-    Builtin "uncurry" Native,
+    -- Pairs
+    Builtin "Pairs" "fst" Native,
+    Builtin "Pairs" "snd" Native,
 
-    -- `Arrays`
-    Builtin "head" Native,
-    Builtin "tail" Native,
-    Builtin "empty" Native,
-    Builtin "alen" Native,
-    Builtin "map" Native,
-    Builtin "filter" Native,
-    Builtin "any" Native,
-    Builtin "all" Native,
-    Builtin "foldl" Native,
-    Builtin "foldr" Native,
-    Builtin "concat" Native,
-    Builtin "zip" Native,
-    Builtin "at" Native,
-    Builtin "take" Native,
-    Builtin "drop" Native,
+    -- Conv: the comparisons and the conversion to text.  `==` compares content
+    -- and `===` compares the values themselves, which is why a reader sees
+    -- `1 === 1` as false: the two 1s are different values, even though they
+    -- are equal.
+    Builtin "Conv" "show" Native,
+    Builtin "Conv" "==" Native,
+    Builtin "Conv" "===" Native,
+    Builtin "Conv" "!=" Native,
+    Builtin "Conv" "!==" Native,
 
-    -- `Pairs`
-    Builtin "fst" Native,
-    Builtin "snd" Native,
+    -- Memory: the two ways to force a delayed computation.
+    Builtin "Memory" "force" Native,
+    Builtin "Memory" "whnf" Native,
 
-    -- `Conv` (`parse` is still missing: see TODO)
-    Builtin "show" Native,
+    -- Output.  `trace` shows its value; it is a function, not an operation,
+    -- because it takes two arguments and returns the second.
+    Builtin "Output" "say" (Op "Output"),
+    Builtin "Output" "sayn" (Op "Output"),
+    Builtin "Output" "trace" (Op "Output"),
 
-    -- `try` handles `Error` inside the language: it installs a handler for the
-    -- body, so it is a function, not an operation whose clause a handler needs.
-    Builtin "try" Native,
+    -- Input
+    Builtin "Input" "read_string" (Op "Input"),
+    Builtin "Input" "read_int" (Op "Input"),
+    Builtin "Input" "read_float" (Op "Input"),
+    Builtin "Input" "read_boolean" (Op "Input"),
 
-    Builtin "say" (Op "Output"),
-    Builtin "sayn" (Op "Output"),
-    Builtin "trace" (Op "Output"),
+    -- Random
+    Builtin "Random" "random_int" (Op "Random"),
+    Builtin "Random" "random_float" (Op "Random"),
+    Builtin "Random" "random_boolean" (Op "Random"),
+    Builtin "Random" "random_string" (Op "Random"),
 
-    Builtin "read_string" (Op "Input"),
-    Builtin "read_int" (Op "Input"),
-    Builtin "read_float" (Op "Input"),
-    Builtin "read_boolean" (Op "Input"),
+    -- Time
+    Builtin "Time" "time_ms" (Op "Time"),
+    Builtin "Time" "sleep" (Op "Time"),
 
-    Builtin "random_int" (Op "Random"),
-    Builtin "random_float" (Op "Random"),
-    Builtin "random_boolean" (Op "Random"),
-    Builtin "random_string" (Op "Random"),
+    -- Env
+    Builtin "Env" "get_env" (Op "Env"),
+    Builtin "Env" "set_env" (Op "Env"),
 
-    Builtin "time_ms" (Op "Time"),
-    Builtin "sleep" (Op "Time"),
+    -- File
+    Builtin "File" "read_file" (Op "File"),
+    Builtin "File" "write_file" (Op "File"),
+    Builtin "File" "append_file" (Op "File"),
+    Builtin "File" "file_exists" (Op "File"),
+    Builtin "File" "delete_file" (Op "File"),
+    Builtin "File" "list_directory" (Op "File"),
 
-    -- `Env`, `File` and `System` are declared by `app/std.marr` and implemented
-    -- here; none of them needs a record, because their operations are ordinary
-    -- effect operations.
-    Builtin "get_env" (Op "Env"),
-    Builtin "set_env" (Op "Env"),
+    -- System
+    Builtin "System" "args" (Op "System"),
+    Builtin "System" "hostname" (Op "System"),
+    Builtin "System" "system" (Op "System"),
+    Builtin "System" "exit" (Op "System"),
 
-    Builtin "read_file" (Op "File"),
-    Builtin "write_file" (Op "File"),
-    Builtin "append_file" (Op "File"),
-    Builtin "file_exists" (Op "File"),
-    Builtin "delete_file" (Op "File"),
-    Builtin "list_directory" (Op "File"),
-
-    Builtin "args" (Op "System"),
-    Builtin "hostname" (Op "System"),
-    Builtin "system" (Op "System"),
-    Builtin "exit" (Op "System"),
-
-    -- `error` is the operation of `Error` a handler catches; `assert` is a
-    -- plain function that performs it, so a handler needs one clause, not two.
-    Builtin "error" (Op "Error"),
-    Builtin "assert" Native,
-
-    -- the records of the library, field by field as `app/std.marr` lists them
-    Builtin "Numbers" (Record [
-        "+", "-", "*", "/", "%", "neg", "abs", "max", "min",
-        "ieq", "ineq", "<", ">", "<=", ">=",
-        "+.", "-.", "*.", "/.", "%.", "fneg", "fabs", "fmax", "fmin",
-        "feq", "fneq", "<.", ">.", "<=.", ">=.",
-        "to_int", "to_float"]),
-    Builtin "Strings" (Record [
-        "++", "slen", "sub", "split", "join", "trim", "upper", "lower",
-        "contains", "replace", "seq", "sneq"]),
-    Builtin "Booleans" (Record [
-        "not", "||", "&&", "^", "nor", "nand"])
+    -- Error: `error` is the operation a handler catches; `try` handles the
+    -- effect inside the language and `assert` reports a failed condition
+    -- through it, so neither needs a clause in a handler the program writes.
+    Builtin "Error" "error" (Op "Error"),
+    Builtin "Error" "assert" Native,
+    Builtin "Error" "try" Native
   ]
 
 names :: [Text]
@@ -235,3 +218,32 @@ names = map bName builtins
 
 namesOfKind :: (BuiltinKind -> Bool) -> [Text]
 namesOfKind p = [bName b | b <- builtins, p (bKind b)]
+
+-- | The modules in the order they are documented, each with its names.
+modules :: [(Text, [Text])]
+modules = [(m, [n | (m', n) <- pairs, m' == m]) | m <- order]
+  where
+    pairs = List.sortOn fst [(bModule b, bName b) | b <- builtins]
+    order = List.nub (map fst pairs)
+
+moduleNames :: [Text]
+moduleNames = map fst modules
+
+namesOfModule :: Text -> [Text]
+namesOfModule m = concatMap snd (filter ((m ==) . fst) modules)
+
+-- | The effects a module declares operations of.  A module of operations is
+--   named after its effect, so this is the module's own name for every module
+--   that is one; `Functions` and `Conv`, which are values, have none.
+effectsOfModule :: Text -> [Text]
+effectsOfModule m = List.nub
+  [ eff
+  | Builtin m' _ (Op eff) <- builtins
+  , m' == m
+  ]
+
+-- | The module a name comes from, if any.
+moduleOf :: Text -> Maybe Text
+moduleOf n = case [m | Builtin m n' _ <- builtins, n' == n] of
+  (m:_) -> Just m
+  [] -> Nothing

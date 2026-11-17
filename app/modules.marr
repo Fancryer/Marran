@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| DO NOT TOUCH, DEPRECATED
 //| module type DB[connection] =

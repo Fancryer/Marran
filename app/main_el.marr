@@ -1,4 +1,5 @@
 module Main
+import @native
 
 funct apply[]{}(f : `A -> { | `R} `B) (x : `A) : { | `R} `B = f x
 funct hello[]{}(u : ()) : {Output} () = sayn 'hello'

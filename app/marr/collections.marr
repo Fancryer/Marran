@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| Функции высшего порядка и массивы из стандартной библиотеки: `id`, `const`,
 //| `flip`, `compose`, `curry`, `uncurry`; `head`, `tail`, `empty`, `alen`,

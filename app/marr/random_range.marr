@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| Секрет должен лежать в [1, 100]. Ожидается: ok (прогоните несколько раз)
 funct main () : {Output; Random} () =

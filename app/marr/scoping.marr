@@ -1,4 +1,5 @@
 module Main
+import @native
 
 //| Лексическая область: f видит внешний y. Ожидается: 1
 funct main () : {Output} () =

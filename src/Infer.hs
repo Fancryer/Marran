@@ -15,6 +15,7 @@ module Infer (
   inferStat,
   inferBlock,
   inferChunk,
+  inferProgram,
   freezeMutability,
   touches,
   freeze,
@@ -144,7 +145,7 @@ import Data.Text (Text)
 import Control.Lens (use)
 import ErrorContext (IrFrame (IrFrame), ErrorFrame (..))
 import Suggest (suggestionNote)
-import Module (Module(..))
+import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), DeclKind(..), Unit(..), Program(..))
 import Span (Span)
 import Data.Set (Set)
 
@@ -443,9 +444,220 @@ withDeclFrame :: Text -> Span -> TypeCheckM a -> TypeCheckM a
 withDeclFrame name sp = withErrorStack (EFIr $ IrFrame name sp)
 
 -- most important
+--
+-- | Check one file against the whole native scope.
+--
+--   This is what a test harness or a tool wants when it hands the checker a
+--   chunk and no program around it: every native name is in scope, as it was
+--   before native modules became importable.  'inferProgram' is the form a
+--   program takes, where a module sees only what it imported.
 inferChunk :: [Text] -> Types.Chunk -> TypeCheckM TypedIR.Chunk
-inferChunk args (Module header chunk) = do
-  globalScope <- Scope.globalScope args
+inferChunk args chunk = do
+  base <- Scope.globalScope args
+  fst <$> inferModule base chunk
+
+-- | Check a whole program, one module at a time.
+--
+--   The units arrive in dependency order, so every interface a module imports
+--   is already known.  Within a unit the interfaces are taken from the
+--   declarations themselves rather than from the checked modules: a cycle has
+--   no first module, and a declared signature is all an importer needs to see.
+--
+--   Each module is checked against a scope of its own -- the native names of
+--   the modules it imported, then the modules it imported, then its own
+--   declarations -- so an unexported name of another file is not merely absent
+--   from its table, it was never put in scope.
+inferProgram :: [Text] -> Program Types.TopLevelStat -> TypeCheckM (Program TypedIR.TopLevelStat)
+inferProgram args (Program units sources entry) = do
+  (_, units') <- foldM step (Map.empty, []) units
+  pure $ Program units' sources entry
+  where
+    step (known, acc) (Unit paths mods) = do
+      -- A cycle is checked as one step, so its members see each other's
+      -- declared interfaces; a settled module keeps the interface of its own
+      -- declarations, which is the same thing an importer would have computed.
+      let declared = Map.fromList [ (p, declaredInterface m) | (p, m) <- mods ]
+          tables = Map.union declared known
+      checked <- forM mods $ \(p, m) -> do
+        base <- moduleScope args tables (modHeader m)
+        (chunk', face) <- inferModule base m
+        pure ((p, chunk'), (p, face))
+      pure (Map.union (Map.fromList (map snd checked)) known
+           , acc <> [Unit paths (map fst checked)])
+
+-- | What one module offers to the modules that import it.
+data Interface = Interface {
+    inValues  :: Map.Map Text TypeScheme
+  , inEnums   :: Map.Map Text EnumDef
+  , inEffects :: Map.Map Text EffDef
+  }
+
+-- | The interface a module's declarations describe, without checking them.
+--
+--   A function's signature is mandatory, so the scheme an importer uses is the
+--   one written in the file.  The first pass of 'inferModule' builds exactly
+--   this scheme, and 'inferModule' reports it back, so the two cannot drift
+--   apart.
+declaredInterface :: Types.Chunk -> Interface
+declaredInterface (Module _ stats) =
+  Interface
+    { inValues = Map.fromList $
+        [ (d.fName, functScheme d) | Types.SFunctDef _ d <- stats ]
+        <> concatMap constructors [ d | Types.SEnumDef _ d <- stats ]
+    , inEnums = Map.fromList
+        [ (enumName d, d) | Types.SEnumDef _ d <- stats ]
+    , inEffects = Map.fromList
+        [ (effName d, d) | Types.SEffDef _ d <- stats ]
+    }
+
+-- | The constructors of an enumeration, as the schemes of ordinary functions.
+--
+--   A constructor is a value of the module's scope, so an importer gets it the
+--   same way it gets a function: by name, with the declaration's parameters
+--   quantified.  The declaration's own table lists the constructors as
+--   'KindFunct', which is what makes this lookup possible.
+constructors :: EnumDef -> [(Text, TypeScheme)]
+constructors def =
+  [ (enumCaseName c, Scheme (enumParams def) [] [] Map.empty Map.empty (constructorTyp def c))
+  | c <- enumCases def
+  ]
+
+-- | The scheme a function declaration states.
+functScheme :: Types.FunctDecl -> TypeScheme
+functScheme functDecl =
+  let (retFxs, retTyp) = functDecl.fRet
+      fullTyp = buildCurried (map snd functDecl.fArgs) retFxs retTyp
+      tvars = uniqPreserveOrder $
+        map (`Bound` 0) functDecl.fTvars <> collectTvarsFromType [] fullTyp
+      evars = uniqPreserveOrder $
+        map (`Bound` 0) functDecl.fEvars <> collectEvarsFromType [] fullTyp
+      rvars = uniqPreserveOrder $
+        map (`Bound` 0) functDecl.fRvars <> collectRvarsFromType [] fullTyp
+  in Scheme tvars evars rvars Map.empty Map.empty fullTyp
+
+-- | The scope a module starts from: the native names it imported, and the
+--   names its imports bring under the local spelling this file writes.
+moduleScope ::
+     [Text]
+  -> Map.Map FilePath Interface
+  -> ModuleHeader
+  -> TypeCheckM Scope
+moduleScope args tables header = do
+  let resolved = Map.toList (mhResolved header)
+      natives = [ imName imp | (_, imp) <- resolved, FromNative _ <- [imOrigin imp] ]
+      -- An import may rename a type-level declaration: the enumeration of
+      -- `enum Colour as Shade`, or the effect of `effect Write as Save`.  Every
+      -- declaration named beside it mentions those names -- a constructor says
+      -- `Colour`, an operation says `{Write}` -- so the rename has to reach
+      -- inside the schemes, or an importer would receive a name in a spelling
+      -- this file does not have.
+      renames =
+        [ (imName imp, local)
+        | (local, imp) <- resolved
+        , imKind imp /= KindFunct
+        , local /= imName imp
+        ]
+  base <- Scope.nativeScope (`elem` natives) args
+  foldM (addImport renames base) base resolved
+  where
+    addImport renames base sc (local, imp) = case imOrigin imp of
+      FromNative _
+        -- A native name renamed by `as`: the scheme is the declared one, the
+        -- spelling in this file is the alias.
+        | local /= imName imp ->
+            case Scope.findBinding False base (imName imp) of
+              Just (scheme, _, _) -> Scope.addBinding local (renameScheme renames scheme) (XVar local) Val sc
+              Nothing -> pure sc
+        | otherwise -> pure sc
+      FromModule path -> case Map.lookup path tables of
+        Nothing -> pure sc
+        Just face -> addFrom face sc
+      where
+        addFrom face s = case imKind imp of
+          KindFunct -> case Map.lookup (imName imp) (inValues face) of
+            Just scheme -> Scope.addBinding local (renameScheme renames scheme) (XVar local) Val s
+            Nothing -> pure s
+          KindEnum -> case Map.lookup (imName imp) (inEnums face) of
+            Just def -> Scope.addEnum (renameEnum renames local def) s
+            Nothing -> pure s
+          KindEffect -> case Map.lookup (imName imp) (inEffects face) of
+            Just def -> Scope.addEffect (renameEffect renames local def) s
+            Nothing -> pure s
+          -- A type or row alias lives in the elaborator, not in the checker.
+          _ -> pure s
+
+    -- An import may rename a declaration.  The declaration's own parameters and
+    -- operations are unchanged; only the name a use writes is the local one,
+    -- and the enumerations its types mention take their local spelling too.
+    renameEnum renames local (EnumDef _ params cases) =
+      EnumDef local params
+        [ EnumCase (enumCaseName c)
+            [ (m, n, renameTypeName renames t) | (m, n, t) <- enumCaseFields c ]
+        | c <- cases
+        ]
+    renameEffect renames local (EffDef _ params ops) =
+      EffDef local params
+        [ (n, Funct (renameTypeName renames i) (renameTypeName renames o)
+                    (renameEffRow renames fxs))
+        | (n, Funct i o fxs) <- ops
+        ]
+
+    renameScheme renames (Scheme ts es rs els rls t) =
+      Scheme ts es rs els rls (renameTypeName renames t)
+
+-- | Rewrite the enumerated types a set of aliases renames.
+--
+--   A rename applies in one file only, and it is a name substitution: the
+--   declaration's cases, fields and parameters keep their shapes.
+renameTypeName :: [(Text, Text)] -> Typ -> Typ
+renameTypeName renames = go
+  where
+    rename n = fromMaybe n (lookup n renames)
+
+    go = \case
+      TArray t r -> TArray (go t) (renameEffRow renames r)
+      TPair l r fx -> TPair (go l) (go r) (renameEffRow renames fx)
+      TFunct (Funct i o fxs) -> TFunct (Funct (go i) (go o) (renameEffRow renames fxs))
+      TRecord props r -> TRecord [p {tTyp = go (tTyp p)} | p <- props] (renameEffRow renames r)
+      TEnum n args -> TEnum (rename n) (map goArg args)
+      TForall ts es rs els rls t -> TForall ts es rs els rls (go t)
+      t -> t
+
+    goArg = \case
+      TAArray t -> TAArray (goArg t)
+      TAPair l r -> TAPair (goArg l) (goArg r)
+      TAFunct i o -> TAFunct (goArg i) (goArg o)
+      TARecord props -> TARecord [TARecordProp m n (goArg t) | TARecordProp m n t <- props]
+      TAEnum n args -> TAEnum (rename n) (map goArg args)
+      t -> t
+
+-- | Rewrite the effect names a set of aliases renames, in a row and in the
+--   types its parameters carry.
+renameEffRow :: [(Text, Text)] -> EffRow -> EffRow
+renameEffRow renames = go
+  where
+    renameEff = \case
+      EffCons (ECons n args) -> EffCons (ECons (rename n) (map goArg args))
+      v -> v
+    rename n = fromMaybe n (lookup n renames)
+
+    go = \case
+      RClosed cons -> RClosed (map renameEff cons)
+      ROpen cons tailVar -> ROpen (map renameEff cons) tailVar
+      r -> r
+
+    goArg = \case
+      TAArray t -> TAArray (goArg t)
+      TAPair l r -> TAPair (goArg l) (goArg r)
+      TAFunct i o -> TAFunct (goArg i) (goArg o)
+      TARecord props -> TARecord [TARecordProp m n (goArg t) | TARecordProp m n t <- props]
+      TAEnum n args -> TAEnum (rename n) (map goArg args)
+      t -> t
+
+-- | Check one module against the scope it starts from, and report what it
+--   offers.
+inferModule :: Scope -> Types.Chunk -> TypeCheckM (TypedIR.Chunk, Interface)
+inferModule globalScope (Module header chunk) = do
   -- The builtins live in the outer scope, so a program declaration shadows
   -- one: `funct apply ...` in a program is the program's `apply`, and the
   -- library's is still reachable from a scope that does not rebind it.  It is
@@ -514,7 +726,7 @@ inferChunk args (Module header chunk) = do
     ) (programScope, []) chunk
 
   -- Второй проход: типизируем тела функций и обновляем схемы
-  (_scope2, typedFuns) <- foldM (\(sc, acc) (functDecl, retFxs, retTyp) -> do
+  (finalScope, typedFuns) <- foldM (\(sc, acc) (functDecl, retFxs, retTyp) -> do
       let funScope = enterScope sc
       scopeWithArgs <- foldM (\sc' (argName, argTyp) ->
           Scope.addBinding argName (monoScheme argTyp) (XVar argName) Val sc'
@@ -604,7 +816,25 @@ inferChunk args (Module header chunk) = do
     Types.SEnumDef _ enumDef -> pure $ Just $ TypedIR.SEnumDef enumDef
     Types.SFunctDef _ _ -> pure Nothing
 
-  pure $ Module header $ catMaybes (otherStats <> map Just typedFuns)
+  -- What the module offers: the schemes the bodies were given, the enums and
+  -- the effects.  A signature is mandatory, so this is the same interface
+  -- 'declaredInterface' reads off the declarations, now with the rows the
+  -- checker solved.
+  let funNames = [ n | TypedIR.SFunctDef (TypedIR.FunctDecl n _ _ _ _ _) <- typedFuns ]
+      enumDefs = [ d | Types.SEnumDef _ d <- chunk ]
+      face = Interface
+        { inValues = Map.fromList $
+            [ (name, scheme)
+            | name <- funNames
+            , Just (ValueBinding scheme _ _ _) <- [Map.lookup name (values finalScope)]
+            ]
+            <> concatMap constructors enumDefs
+        , inEnums = Map.fromList [ (enumName d, d) | d <- enumDefs ]
+        , inEffects = Map.fromList
+            [ (effName d, d) | Types.SEffDef _ d <- chunk ]
+        }
+
+  pure (Module header $ catMaybes (otherStats <> map Just typedFuns), face)
 
 wrapTypedExprWithCell :: TypedExpr -> EffRow -> EffRow
 wrapTypedExprWithCell e r =
