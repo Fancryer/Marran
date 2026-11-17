@@ -124,9 +124,24 @@ iSpec = describe "imports" $ do
       ]
     printed r `shouldBe` Right ["101"]
 
+  it "reports a native module that does not exist" $ do
+    r <- runFiles [] $ T.unlines
+      [ "module Main"
+      , "import @native Nosuch"
+      , ""
+      , "funct main () : () = ()"
+      ]
+    case r of
+      Left err -> do
+        err `shouldSatisfy` ("there is no native module `Nosuch`" `isInfixOf`)
+        err `shouldSatisfy` ("native modules:" `isInfixOf`)
+      Right _ -> expectationFailure "an unknown native module must be a diagnostic"
+
   it "hides a name the module did not export" $ do
-    -- The loader's table for `numbers` holds `one` and nothing else, so
-    -- `hidden` is not absent from a list of candidates: it was never imported.
+    -- `numbers` exports `one` and keeps `hidden`, so the name is not in its
+    -- table.  The import is where the mistake is, so the loader reports it
+    -- there and says the name exists but is private: waiting for an `E0007`
+    -- at a use three functions later would hide the cause.
     r <- runFiles [ ("numbers.marr", numbers) ] $ T.unlines
       [ "module Main"
       , "import @native"
@@ -136,9 +151,25 @@ iSpec = describe "imports" $ do
       , "  sayn (hidden 1)"
       ]
     case r of
-      Left err -> err `shouldSatisfy` ("E0007" `isInfixOf`)
+      Left err -> do
+        err `shouldSatisfy` ("`hidden` is not offered by the module `numbers.marr`" `isInfixOf`)
+        err `shouldSatisfy` ("declared in numbers.marr but not exported" `isInfixOf`)
       Right out -> expectationFailure $
         "an unexported name must not be importable, got: " ++ take 300 out
+
+  it "reports a name the source never had, listing the ones it has" $ do
+    r <- runFiles [ ("numbers.marr", numbers) ] $ T.unlines
+      [ "module Main"
+      , "import @native"
+      , "import numbers #nosuch"
+      , ""
+      , "funct main () : () = ()"
+      ]
+    case r of
+      Left err -> do
+        err `shouldSatisfy` ("`nosuch` is not offered by the module `numbers.marr`" `isInfixOf`)
+        err `shouldSatisfy` ("it offers: one" `isInfixOf`)
+      Right _ -> expectationFailure "a name the source lacks must be a diagnostic"
 
   it "imports a single name with `#`" $ do
     r <- runFiles [ ("numbers.marr", numbers) ] $ T.unlines
@@ -218,7 +249,9 @@ iSpec = describe "imports" $ do
       , "  sayn (hidden 1)"
       ]
     case r of
-      Left err -> err `shouldSatisfy` ("E0007" `isInfixOf`)
+      Left err -> do
+        err `shouldSatisfy` ("`hidden` is not offered by the module `middle.marr`" `isInfixOf`)
+        err `shouldSatisfy` ("it offers: one" `isInfixOf`)
       Right out -> expectationFailure $
         "a re-export must not carry a name the middle module did not have, got: " ++ take 300 out
 

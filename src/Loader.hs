@@ -489,8 +489,63 @@ strictVisible nodes tables p = do
     n = nodes Map.! p
     own = declaredTable nodes p
 
-    add acc i = foldlM (insertImport (iSpan i)) acc
-                      (resolveImport (enumsOf nodes) tables i)
+    add acc i = do
+      names <- strictImport nodes tables i
+      foldlM (insertImport (iSpan i)) acc [ (n, Just imp) | (n, imp) <- names ]
+
+-- | The strict form of 'resolveImport': every name an import names must be one
+--   the source offers.
+--
+--   During the growth of a cycle a name may legitimately be missing, so
+--   'resolveImport' drops it and the rounds continue.  Once the rounds are
+--   over, a name that never appeared is a mistake in the import, and reporting
+--   it at the import line is worth more than an `E0007` at a use three
+--   functions later: the reader is told what the source does offer, and, when
+--   the name exists but is private, that too.
+strictImport :: Map FilePath Node -> Map FilePath Table -> Import -> Either LoadError [(Text, Imported)]
+strictImport nodes tables i = case iSource i of
+  SrcNative m
+    | T.null m -> Right $ [ (n, imp) | (n, imp) <- Map.toList wholeNative ]
+    | otherwise -> case nativeTable m of
+        Left e -> Left e {leSpan = iSpan i}
+        Right t -> keep t Nothing
+  SrcModule p -> keep (Map.findWithDefault Map.empty p tables) (Just p)
+  where
+    wholeNative = either (const Map.empty) id (nativeTable "")
+
+    keep t src = case iNames i of
+      Nothing -> Right [ (n, imp) | (n, imp) <- Map.toList t ]
+      Just decls -> concat <$> traverse (one t src (map edName decls)) decls
+
+    one t src spelled ed = case Map.lookup (edName ed) t of
+      Just imp -> Right (entriesOf (enumsOf nodes) spelled (localOf ed, imp))
+      Nothing -> Left $ missing t src ed
+
+    missing t src ed = LoadError (edSpan ed) (T.concat [
+        "`", edName ed, "` is not offered by ", where_
+      ]) (notes t src)
+      where
+        where_ = case src of
+          Just p -> "the module `" <> T.pack (baseName p) <> "`"
+          Nothing -> "`@native " <> nativeName <> "`"
+        nativeName = case iSource i of
+          SrcNative m -> m
+          SrcModule _ -> ""
+
+        -- A name the module declares but does not export is a different
+        -- mistake from a name it never had: the first asks for the export
+        -- list to change, the second for the spelling.
+        notes t src = case src of
+          Just p | Map.member (edName ed) (declaredTable nodes p) ->
+            [ T.concat [
+                "`", edName ed, "` is declared in ", T.pack (baseName p),
+                " but not exported: a module offers the names its export list names"
+              ] ]
+          _ -> [ offered t ]
+
+        offered t = case Map.keys t of
+          [] -> "the source offers nothing"
+          names -> "it offers: " <> T.intercalate ", " names
 
 insertImport :: Span -> Table -> (Text, Maybe Imported) -> Either LoadError Table
 insertImport _ acc (_, Nothing) = Right acc
