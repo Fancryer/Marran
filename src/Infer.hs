@@ -872,9 +872,18 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
         [] -> throwTypeCheckErrorWithNotes (UndefinedVariable v)
           (maybe [] pure (suggestionNote (Scope.bindingNames scope <> Scope.operationNames scope) v))
         [(eff, params, opTyp)] -> do
-          let scheme = Scheme params [] [] Map.empty Map.empty (TFunct opTyp)
-          (t, sc) <- instantiateTypeScheme scope scheme
-          pure (t, Eff.closedOfFlat eff, sc, Val)
+          -- A use of an operation performs its effect, and a parameterised
+          -- effect is performed with arguments: `ask` of `effect Ask[T]`
+          -- performs `Ask[`m]`, and the row its caller declares (`Ask[Int]`)
+          -- binds that variable.  The arguments are the same fresh variables
+          -- the operation's own type mentions, so the value the operation
+          -- produces and the occurrence it charges stay in step.
+          args <- mapM (const freshMetaTypeArgM) params
+          let opTyp' = case instantiateOps params [(v, opTyp)] args of
+                ((_, t') : _) -> t'
+                [] -> opTyp
+          (t, sc) <- instantiateTypeScheme scope $ monoScheme (TFunct opTyp')
+          pure (t, Eff.closedOfFlatWith eff args, sc, Val)
         candidates -> throwTypeCheckError $ InferenceError $ T.concat [
             "the operation `", v, "` is declared by more than one effect ("
           , T.intercalate ", " [ "`" <> n <> "`" | (n, _, _) <- candidates ]
@@ -1655,9 +1664,38 @@ inferHandler scope handler = withNewLevel $
         HandlerError $
           T.concat ["`", tasteName v, "` is an effect variable, not an effect, so it cannot be handled"]
     eff@(EffCons eff'@(ECons n effArgs)) -> do
+      -- `Var`, `Read`, `Rebind` and `Cell` are not declarations: the checker
+      -- adds them when a mutable binding is created, read or rebound, and no
+      -- operation performs them.  A handler works by intercepting a performed
+      -- operation, so there is nothing for it to intercept here, and saying so
+      -- is better than "there is no effect named `Var`".
+      when (n `Set.member` Eff.markerEffects) $
+        throwTypeCheckError $ HandlerError $ T.concat [
+            "`", n, "` is not an effect a handler can handle"
+          , ": it marks a mutable binding, it has no operations to intercept"
+          ]
       decl@(EffDef _ params declaredOps) <- case effectDeclaration scope n of
         Nothing -> throwTypeCheckError $ HandlerError $ "there is no effect named `" <> n <> "` in scope"
         Just d -> pure d
+      -- A parameterised effect is applied to as many arguments as it declares.
+      -- `instantiateOps` would otherwise leave the parameters rigid, and the
+      -- first operation call would report a unification failure against a
+      -- variable the reader never wrote.
+      when (length params /= length effArgs) $
+        throwTypeCheckError $ HandlerError $ T.concat [
+            "the effect `", n, "` declares ", T.pack (show (length params))
+          , " type argument(s), but this handler supplies "
+          , T.pack (show (length effArgs))
+          ]
+      -- A handler runs the clause of an operation it intercepts, and a
+      -- declaration with no operations gives it no clause to run.  An `effect
+      -- Empty end` written to mark a computation is therefore not handleable
+      -- either, and the declaration is the place to say why.
+      when (null declaredOps) $
+        throwTypeCheckError $ HandlerError $ T.concat [
+            "the effect `", n, "` declares no operations, so a handler has nothing to handle"
+          , ": an operation is what a handler intercepts"
+          ]
       let ops = instantiateOps params declaredOps effArgs
       let opNames = map fst ops
       -- 2. Создаём подскоуп с операциями
@@ -2815,7 +2853,7 @@ addRowLacksToRowExcept excluded scope row forbidden =
           | otherwise -> addEffLacks sc variable forbidden
 
 mutationEffects :: Set Text
-mutationEffects = Set.fromList ["Read", "Var", "Rebind", "Cell"]
+mutationEffects = Eff.markerEffects
 
 freezeMutability :: Mutability -> Mutability
 freezeMutability = \case Var -> Val; m -> m

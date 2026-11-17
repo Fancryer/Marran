@@ -51,15 +51,26 @@ data FlatRow = FlatRow [Types.EffCons] (Maybe Taste)
 --   arguments, and only the declaration says which one it is.
 data TypeAliasDef = TypeAliasDef [Text] Ast.Typ | TypeEnumDef [Text]
 
+-- | The parameters a name declares, if it is a type at all.
+typParams :: TypEnv -> String -> Maybe [Text]
+typParams tenv name = case lookup name tenv of
+  Just (TypeAliasDef params _) -> Just params
+  Just (TypeEnumDef params) -> Just params
+  Nothing -> Nothing
+
 -- | The rows and effects a chunk declares.
 --
 --   The effect names are kept next to the row aliases so that a name used in
 --   row position can be told apart from a misspelled alias: `{Doubt}` names a
 --   row that contains the effect @Doubt@, while a bare @Doubt@ is not a row at
---   all, because an effect is not a row.
+--   all, because an effect is not a row.  Each effect carries the number of
+--   type parameters it declares, so an application with the wrong number of
+--   arguments is reported in the row rather than at the first operation call.
 data RowEnv = RowEnv {
-  rowAliases :: [(String, Ast.EffRow)],
-  declaredEffects :: [String]
+  -- | A row alias with its parameters and its body: @row Pair[T] = {...}@.
+  --   A name is looked up by its first component, which is what a use writes.
+  rowAliases :: [(String, [Text], Ast.EffRow)],
+  declaredEffects :: [(String, Int)]
 }
 
 type TypEnv = [(String, TypeAliasDef)]
@@ -228,8 +239,8 @@ elaborateModule chunks _ (Module header stats) = do
 -- | A declaration of another module, as the tables of a module name it.
 data ImportedDecl =
     ImportedType (Text, TypeAliasDef)
-  | ImportedRow (Text, Ast.EffRow)
-  | ImportedEffect Text
+  | ImportedRow (Text, [Text], Ast.EffRow)
+  | ImportedEffect Text Int
 
 -- | The declarations a module's imports give it.
 --
@@ -266,8 +277,8 @@ importedDecls chunks header =
 
     rename renames local = \case
       ImportedType (_, d) -> ImportedType (local, renameAlias renames d)
-      ImportedRow (_, r) -> ImportedRow (local, renameRow renames r)
-      ImportedEffect _ -> ImportedEffect local
+      ImportedRow (_, ps, r) -> ImportedRow (local, ps, renameRow renames r)
+      ImportedEffect _ k -> ImportedEffect local k
 
 -- | Rewrite the names a file renames inside an alias' body.
 renameAlias :: [(Text, Text)] -> TypeAliasDef -> TypeAliasDef
@@ -323,7 +334,8 @@ renameAstApps renames (Ast.TypeApps args) = Ast.TypeApps (map goArg args)
 renameAstRow :: [(Text, Text)] -> Ast.EffRow -> Ast.EffRow
 renameAstRow renames = \case
   Ast.ERVar n -> Ast.ERVar n
-  Ast.ERAlias n -> Ast.ERAlias (fromMaybe n (lookup n renames))
+  Ast.ERAlias n apps ->
+    Ast.ERAlias (fromMaybe n (lookup n renames)) (renameAstApps renames <$> apps)
   Ast.ERSugar entries tailVar ->
     Ast.ERSugar (map entry entries) tailVar
   where
@@ -345,32 +357,34 @@ lookupDecl chunk name kind = listToMaybe $ mapMaybe one (Ast.modDecls chunk)
       | otherwise = case stat of
           Ast.TypeDef _ _ ts body -> Just $ ImportedType (name, TypeAliasDef (coerce ts) body)
           Ast.EnumDef _ _ ts _ -> Just $ ImportedType (name, TypeEnumDef (coerce ts))
-          Ast.RowDef _ _ row -> Just $ ImportedRow (name, row)
-          Ast.EffectDef {} -> Just $ ImportedEffect name
+          Ast.RowDef _ _ ts row -> Just $ ImportedRow (name, coerce ts, row)
+          Ast.EffectDef _ _ ts _ -> Just $ ImportedEffect name (length (coerce ts :: [Text]))
           Ast.FunctDef {} -> Nothing
 
 importedTyps :: [ImportedDecl] -> TypEnv
 importedTyps ds = [ (T.unpack n, d) | ImportedType (n, d) <- ds ]
 
-importedRows :: [ImportedDecl] -> [(String, Ast.EffRow)]
-importedRows ds = [ (T.unpack n, r) | ImportedRow (n, r) <- ds ]
+importedRows :: [ImportedDecl] -> [(String, [Text], Ast.EffRow)]
+importedRows ds = [ (T.unpack n, ps, r) | ImportedRow (n, ps, r) <- ds ]
 
-importedEffects :: [ImportedDecl] -> [String]
-importedEffects ds = [ T.unpack n | ImportedEffect n <- ds ]
+importedEffects :: [ImportedDecl] -> [(String, Int)]
+importedEffects ds = [ (T.unpack n, k) | ImportedEffect n k <- ds ]
 
 collectRowEnv :: [Ast.TopLevelStat] -> ElabM RowEnv
 collectRowEnv stats = RowEnv <$> foldM addRow [] stats <*> pure effectNames
   where
-    effectNames = [ T.unpack n | Ast.EffectDef _ n _ _ <- stats ]
+    effectNames = [ (T.unpack n, length (coerce ts :: [Text])) | Ast.EffectDef _ n ts _ <- stats ]
 
-    addRow :: [(String, Ast.EffRow)] -> Ast.TopLevelStat -> ElabM [(String, Ast.EffRow)]
+    addRow :: [(String, [Text], Ast.EffRow)] -> Ast.TopLevelStat -> ElabM [(String, [Text], Ast.EffRow)]
     addRow acc stat = case stat of
-      Ast.RowDef _ n row -> do
+      Ast.RowDef _ n ts row -> do
         let name = T.unpack n
-        when (any ((name ==) . fst) acc) $
+        when (any ((name ==) . fst3) acc) $
           throwError $ ElaborationError $ "Duplicate row definition: " <> n
-        pure ((name, row) : acc)
+        pure ((name, coerce ts, row) : acc)
       _ -> pure acc
+
+    fst3 (x, _, _) = x
 
 collectTypEnv :: [Ast.TopLevelStat] -> ElabM TypEnv
 collectTypEnv = foldM go []
@@ -407,8 +421,15 @@ elaborateTopLevelStat' env renv tenv = \case
     let env' = extendTyp ts' env
     Types.SEffDef sp . Types.EffDef n (map snd ts')
       <$> forM ops (\(Ast.EffectOp n' t) -> (n',) <$> elaborateFunct renv tenv env' t)
-  Ast.RowDef sp n fxs ->
-    Types.SRowDef sp . Types.RowDef n <$> elaborateEffRow' renv tenv env fxs
+  Ast.RowDef sp n ts fxs -> do
+    -- The parameters are rigid variables of the body, so a use `Pair#[Int]`
+    -- substitutes into the body the elaborator recorded, exactly as a type
+    -- alias does.  The declaration keeps the names, because the substitution
+    -- happens on the surface syntax of the row before it is elaborated.
+    ts' <- for (coerce ts) $ \nm -> (nm,) <$> freshBound nm
+    let env' = extendTyp ts' env
+    Types.SRowDef sp . Types.RowDef n (coerce ts)
+      <$> elaborateEffRow' renv tenv env' fxs
   Ast.EnumDef sp n ts cases -> do
     -- The parameters are rigid variables of the fields, so the declaration
     -- records the variables themselves: a use `Maybe[Int]` substitutes the
@@ -564,7 +585,7 @@ elaborateUnder renv tenv env = \case
   Ast.Under eff blk clauses thenN thenB ->
     Types.Handle
       <$> (Types.Handler
-            <$> elaborateEffCons tenv env (Ast.EffCons eff)
+            <$> elaborateEffCons renv tenv env (Ast.EffCons eff)
             <*> elaborateBlock renv tenv env blk
             <*> mapM (elaborateHandlerClause renv tenv env) clauses
             <*> elaborateThenClause renv tenv env thenN thenB)
@@ -594,7 +615,7 @@ elaborateHandlerClause renv tenv env (Ast.HandlerClause op ns b) =
 elaborateEffArg :: RowEnv -> TypEnv -> ElabEnv -> Ast.EffArg -> ElabM [Types.EffCons]
 elaborateEffArg renv tenv env = \case
   Ast.EACons c -> do
-    c' <- elaborateEffCons tenv env c
+    c' <- elaborateEffCons renv tenv env c
     pure [c']
   Ast.EARow row -> do
     row' <- elaborateEffRow' renv tenv env row
@@ -930,7 +951,14 @@ expandTypeArgAlias' tenv env visiting n (Ast.TypeApps ts)
 
 substTypeInTyp :: [(Text, Ast.TypeArg)] -> Ast.Typ -> Ast.Typ
 substTypeInTyp subst = \case
-  Ast.TFlat n -> Ast.TFlat n
+  -- A parameter may be written bare as well as in meta position: `type Pair[a]
+  -- = (a, a)` and `type Pair[`a] = (`a, `a)` mean the same thing.  Missing
+  -- the bare form left `a` opaque, and `Pair#[Int]` then failed to unify
+  -- `Int` with `a`.
+  Ast.TFlat n ->
+    case lookup n subst of
+      Just arg -> typeArgToTyp arg
+      Nothing -> Ast.TFlat n
   Ast.TNil -> Ast.TNil
   Ast.TArray t -> Ast.TArray $ substTypeInTyp subst t
   Ast.TParen t -> Ast.TParen $ substTypeInTyp subst t
@@ -958,6 +986,7 @@ substTypeInTyp subst = \case
 substTypeInEffRow :: [(Text, Ast.TypeArg)] -> Ast.EffRow -> Ast.EffRow
 substTypeInEffRow subst = \case
   Ast.ERSugar entries t -> Ast.ERSugar (substTypeInEffRowEntry subst <$> entries) t
+  Ast.ERAlias n apps -> Ast.ERAlias n (substTypeApps subst <$> apps)
   r -> r
 
 substTypeInEffRowEntry :: [(Text, Ast.TypeArg)] -> Ast.EffRowEntry -> Ast.EffRowEntry
@@ -975,7 +1004,12 @@ substTypeApps subst (Ast.TypeApps ts) = Ast.TypeApps $ substTypeInTypeArg subst 
 
 substTypeInTypeArg :: [(Text, Ast.TypeArg)] -> Ast.TypeArg -> Ast.TypeArg
 substTypeInTypeArg subst = \case
-  Ast.TAFlat n -> Ast.TAFlat n
+  -- The bare spelling of a parameter, in type-argument position too:
+  -- `type Boxed[a] = Maybe#[a]`.
+  Ast.TAFlat n ->
+    case lookup n subst of
+      Just arg -> arg
+      Nothing -> Ast.TAFlat n
   Ast.TANil -> Ast.TANil
   Ast.TAArray t -> Ast.TAArray $ substTypeInTypeArg subst t
   Ast.TAParen t -> Ast.TAParen $ substTypeInTypeArg subst t
@@ -1045,25 +1079,49 @@ elaborateEffRow' renv tenv env row = do
 
 flattenEffRow :: RowEnv -> TypEnv -> ElabEnv -> [String] -> Ast.EffRow -> ElabM FlatRow
 flattenEffRow renv tenv env visiting = \case
-  Ast.ERAlias n ->
+  Ast.ERAlias n apps ->
     let name = T.unpack n
         aliases = rowAliases renv
+        aliasNames = [ aliasName | (aliasName, _, _) <- aliases ]
+        findAlias nm = listToMaybe [ (ps, body) | (n', ps, body) <- aliases, n' == nm ]
     in if name `elem` visiting then
       elabError $ "Cyclic row alias: " <> name
     else
-      case lookup name aliases of
+      case findAlias name of
         -- An effect is not a row: `{Doubt}` names a row containing the effect,
         -- but a bare `Doubt` in row position would mean "the row of Doubt",
         -- which does not exist.  The name is declared, so the mistake is not a
         -- typo and must not be reported as an unknown alias.
-        Nothing | name `elem` declaredEffects renv ->
+        Nothing | Just _ <- lookup name (declaredEffects renv) ->
           elabError $ printf
             "`%s` is an effect, not a row: write `{%s}` to put it in a row"
             name name
-        Nothing -> case Suggest.suggestionNote (map (T.pack . fst) aliases) (T.pack name) of
+        -- `Box[Int]` in a result type reads as the row `Box` followed by the
+        -- array `[Int]`, because a leading row is a bare name.  When `Box` is
+        -- a type, the reader meant an application, which is written with a
+        -- hash: the bracket alone cannot say it.
+        Nothing | Just params <- typParams tenv name ->
+          elabError $ if null params
+            then printf "`%s` is a type, not a row: a row goes in braces" name
+            else printf
+              "`%s` is a type, not a row: a type application is written `%s#[...]`"
+              name name
+        Nothing -> case Suggest.suggestionNote (map T.pack aliasNames) (T.pack name) of
           Just hint -> elabError $ "Unknown row alias: " <> name <> "; " <> T.unpack hint
           Nothing -> elabError $ "Unknown row alias: " <> name
-        Just row -> flattenEffRow renv tenv env (name : visiting) row
+        -- A row alias with parameters is expanded with this use's arguments
+        -- substituted into its body, exactly as a type alias is: `Pair#[Int]`
+        -- is `Pair` with its `T` replaced by `Int`.  An alias that takes no
+        -- parameters is expanded as it stands.
+        Just (params, row) -> do
+          let Ast.TypeApps args = fromMaybe (Ast.TypeApps []) apps
+          if length params /= length args then
+            elabError $ printf
+              "Wrong number of arguments for row alias '%s': expected %d, got %d"
+              name (length params) (length args)
+          else
+            flattenEffRow renv tenv env (name : visiting) $
+              substTypeInEffRow (zip params args) row
   Ast.ERSugar entries Nothing -> do
     foldM (\acc entry ->
         mergeFlatRows acc =<< flattenEffRowEntry renv tenv env visiting entry
@@ -1094,7 +1152,7 @@ flattenEffRow renv tenv env visiting = \case
 flattenEffRowEntry :: RowEnv -> TypEnv -> ElabEnv -> [String] -> Ast.EffRowEntry -> ElabM FlatRow
 flattenEffRowEntry renv tenv env visiting = \case
   Ast.EREEffCons c -> do
-    c' <- elaborateEffCons tenv env c
+    c' <- elaborateEffCons renv tenv env c
     pure $ FlatRow [c'] Nothing
   Ast.EREEffRow r -> flattenEffRow renv tenv env visiting r
 
@@ -1109,9 +1167,21 @@ mergeFlatRows (FlatRow cons1 t1) (FlatRow cons2 t2) =
     (Nothing, Just t) -> pure $ FlatRow (cons1 <> cons2) (Just t)
     (Just _, Just _) -> elabError "Multiple effect row tails in one row"
 
-elaborateEffCons :: TypEnv -> ElabEnv -> Ast.EffCons -> ElabM Types.EffCons
-elaborateEffCons tenv env = \case
-  Ast.EffCons (Ast.ECons n apps) ->
+elaborateEffCons :: RowEnv -> TypEnv -> ElabEnv -> Ast.EffCons -> ElabM Types.EffCons
+elaborateEffCons renv tenv env = \case
+  Ast.EffCons (Ast.ECons n apps) -> do
+    -- An effect that is declared with parameters is applied to exactly that
+    -- many arguments.  A missing or extra one used to surface as
+    -- "Effect parameter lists length mismatch" at the first operation call,
+    -- which says nothing about the row the reader wrote.
+    case [ k | (n', k) <- declaredEffects renv, n' == T.unpack n ] of
+      (k : _) ->
+        let supplied = maybe 0 (length . (\(Ast.TypeApps a) -> a)) apps
+        in when (supplied /= k) $
+             elabError $ printf
+               "the effect `%s` declares %d type argument(s), but this use supplies %d"
+               (T.unpack n) k supplied
+      [] -> pure ()
     Types.EffCons . Types.ECons n <$> maybe (pure []) (mapM (elaborateTypeArg tenv env) . coerce) apps
   Ast.EVar n -> Types.EVar <$> getBoundOrMakeMeta rowBounds iRowVars env n
     -- case lookupEff env n of

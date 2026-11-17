@@ -187,7 +187,7 @@ instance Pretty Typ where
     TRecord props r ->
       "#{" <> T.intercalate "; " (map pretty props) <>  "}" <> prettyPending r
     TEnum n args ->
-      n <> if null args then "" else T.concat ["[", T.intercalate "; " (map pretty args), "]"]
+      n <> if null args then "" else T.concat ["#[", T.intercalate "; " (map pretty args), "]"]
     TForall ts es rs els rls t -> T.concat [
         "forall ",
         "[", T.unwords $ map tasteName ts, "]",
@@ -311,10 +311,14 @@ instance Pretty EffDef where
       " end"
     ]
 
-data RowDef = RowDef Text EffRow deriving (Show, Generic)
+data RowDef = RowDef Text [Text] EffRow deriving (Show, Generic)
 
 instance Pretty RowDef where
-  pretty (RowDef n row) = "row " <> n <> " = " <> pretty row
+  pretty (RowDef n ts row) = T.concat [
+      "row ", n,
+      if null ts then "" else T.concat ["[", T.intercalate "; " ts, "]"],
+      " = ", pretty row
+    ]
 
 -- | An expression together with the region of source it came from.  The
 --   elaborator copies the position of the AST node it came from; nodes that
@@ -546,7 +550,7 @@ instance Pretty TypeArg where
         "}"
       ]
     TAEnum n args ->
-      n <> if null args then "" else T.concat ["[", T.intercalate "; " (map pretty args), "]"]
+      n <> if null args then "" else T.concat ["#[", T.intercalate "; " (map pretty args), "]"]
     TAVar v -> tasteName v
 
 data TARecordProp = TARecordProp Mutability Text TypeArg deriving (Eq, Ord, Show, Generic)

@@ -7,6 +7,7 @@ module Eff (
   elabel,
   labels,
   closedOfFlat,
+  closedOfFlatWith,
   isEmpty,
   extractEffects,
   extractTypeEffects,
@@ -27,10 +28,12 @@ module Eff (
   fxVar,
   fxRead,
   fxRebind,
-  fxCell
+  fxCell,
+  markerEffects
 ) where
 import Types
 import Data.List (nub, sort)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Utils
 
@@ -48,6 +51,11 @@ labels = map label
 
 closedOfFlat :: Text -> EffRow
 closedOfFlat l = RClosed [label l]
+
+-- | The row of one effect, performed with the arguments of this use:
+--   @Ask@ with @[`m]@ is @{Ask[`m]}@.
+closedOfFlatWith :: Text -> [TypeArg] -> EffRow
+closedOfFlatWith l args = RClosed [EffCons (ECons l args)]
 
 isEmpty :: EffRow -> Bool
 isEmpty = \case RClosed [] -> True; _ -> False
@@ -106,6 +114,15 @@ unionEffRowsList = foldl unionEffRows $ RClosed []
 
 pureEffDeclWithOps :: Text -> [(Text, Funct)] -> EffDef
 pureEffDeclWithOps name = EffDef name []
+
+-- | The effects the checker produces by itself.
+--
+--   They have no operations, because nothing can perform them: `var`, `rebind`
+--   and a read of a mutable binding add the label to the row, and the checker
+--   checks that row at the point of use.  A handler needs an operation to
+--   handle, so `under Var` has nothing to do and is refused.
+markerEffects :: Set.Set Text
+markerEffects = Set.fromList ["Read", "Var", "Rebind", "Cell"]
 
 fxInput, fxOutput, fxEnv, fxFile, fxRandom, fxTime, fxSystem, fxError, fxVar, fxRead, fxRebind, fxCell :: EffRow
 fxInput = closedOfFlat "Input"

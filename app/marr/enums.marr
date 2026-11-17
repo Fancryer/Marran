@@ -5,12 +5,12 @@ import @native
 //| пишет `#`.  Ожидается 6 строк: Some 5 / None / 5 / none / cdef / two
 enum Maybe[a] | Some (val v : a) | None
 
-funct value (m Maybe[Int]) : Int =
+funct value (m Maybe#[Int]) : Int =
   match (m) to
     | #Some x => x
     | #None => 0
 
-funct label (m Maybe[Int]) : String =
+funct label (m Maybe#[Int]) : String =
   match (m) to
     | #Some x as whole => if ieq x 0 then 'zero' else 'some'
     | #None => 'none'

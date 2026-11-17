@@ -106,7 +106,7 @@ topLevelName :: TopLevelStat -> Text
 topLevelName = \case
   TypeDef _ n _ _ -> n
   EffectDef _ n _ _ -> n
-  RowDef _ n _ -> n
+  RowDef _ n _ _ -> n
   EnumDef _ n _ _ -> n
   FunctDef _ n _ _ _ _ _ _ -> n
 
@@ -144,7 +144,7 @@ instance Pretty EffParams where
 data TopLevelStat =
   TypeDef Span Text TypeParams {-EffParams-} Typ
   | EffectDef Span Text TypeParams [EffectOp]
-  | RowDef Span Text EffRow
+  | RowDef Span Text TypeParams EffRow
   | EnumDef Span Text TypeParams [EnumCase]
   | FunctDef Span Text TypeParams EffParams [FunctArg] (Maybe EffRow) Typ Block
   deriving (Eq, Show, Generic)
@@ -155,7 +155,7 @@ topLevelSpan :: TopLevelStat -> Span
 topLevelSpan = \case
   TypeDef s _ _ _ -> s
   EffectDef s _ _ _ -> s
-  RowDef s _ _ -> s
+  RowDef s _ _ _ -> s
   EnumDef s _ _ _ -> s
   FunctDef s _ _ _ _ _ _ _ -> s
 
@@ -267,8 +267,8 @@ instance Pretty TopLevelStat where
       T.concat ["type ", n, prettyTs ts, {-, prettyEs es-} " = ", pretty t]
     EffectDef _ n ts ops ->
       T.concat ["effect ", n, prettyTs ts, " ", T.unwords $ map pretty ops, " end"]
-    RowDef _ n row ->
-      T.concat ["row ", n, " = ", pretty row]
+    RowDef _ n ts row ->
+      T.concat ["row ", n, prettyTs ts, " = ", pretty row]
     EnumDef _ n ts cs ->
       T.concat ["enum ", n, prettyTs ts, T.concat (map ((" " <>) . pretty) cs)]
     FunctDef _ n ts es args fxs t b ->
@@ -355,7 +355,9 @@ instance Pretty RecordTypProp where
 
 data EffRow =
   ERVar Text
-  | ERAlias Text
+  -- | A row alias, with the arguments of an application when it has any:
+  --   @Pair@ and @Pair#[Int]@ are the same constructor, one applied and one not.
+  | ERAlias Text (Maybe TypeApps)
   | ERSugar [EffRowEntry] (Maybe Text)
   deriving (Eq, Show, Generic)
 instance Sexp EffRow
@@ -363,7 +365,7 @@ instance Sexp EffRow
 instance Pretty EffRow where
   pretty = \case
     ERVar r -> "`" <> r
-    ERAlias a -> a
+    ERAlias a apps -> a <> maybe "" pretty apps
     ERSugar res t -> T.concat [T.intercalate "; " $ map pretty res, maybe T.empty (T.append " | ") t]
 
 data EffRowEntry = EREEffCons EffCons | EREEffRow EffRow deriving (Eq, Show, Generic)
@@ -519,8 +521,17 @@ instance Pretty AtomLetPatternRecordProp where
 newtype TypeApps = TypeApps [TypeArg] deriving (Eq, Show, Generic)
 instance Sexp TypeApps
 
+-- | A type application is written with a hash before the brackets:
+--   @Maybe#[Int]@.
+--
+--   The hash is not decoration.  `@` and `[` used to be one spelling, and a
+--   leading row of a result type is written as a bare name (`: Main ()`), so
+--   `Box[Int]` read two ways: an application of `Box`, and the row `Box`
+--   followed by the array `[Int]`.  The grammar chose the second, and a
+--   parameterised enum in a signature failed as "Unknown row alias: Box".
+--   `#[` is one token, so the two readings cannot collide.
 instance Pretty TypeApps where
-  pretty (TypeApps tas) = T.concat ["[", T.intercalate "; " $ map pretty tas, "]"]
+  pretty (TypeApps tas) = T.concat ["#[", T.intercalate "; " $ map pretty tas, "]"]
 
 data EffApps = EffApps [EffArg] [EffRow] deriving (Eq, Show, Generic)
 instance Sexp EffApps

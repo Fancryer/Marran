@@ -1184,7 +1184,7 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
       r <- runSourceWithInput "enum_match.marr" "" $ T.unlines
         [ "enum Maybe[a] | Some (val v : a) | None"
         , ""
-        , "funct value (m Maybe[Int]) : Int ="
+        , "funct value (m Maybe#[Int]) : Int ="
         , "  match (m) to"
         , "    | #Some x => x"
         , "    | #None => 0"
@@ -1302,7 +1302,7 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
       r <- runSourceWithInput "match_gap.marr" "" $ T.unlines
         [ "enum Maybe[a] | Some (val v : a) | None"
         , ""
-        , "funct value (m Maybe[Int]) : Int ="
+        , "funct value (m Maybe#[Int]) : Int ="
         , "  match (m) to"
         , "    | #Some x => x"
         , ""

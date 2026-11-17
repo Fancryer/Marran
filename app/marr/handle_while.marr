@@ -17,11 +17,11 @@ end
 
 funct loop[T]
   (pred () -> Main Boolean)
-  (do () -> {Loop[`T]; ... Main} `T)
+  (do () -> {Loop#[`T]; ... Main} `T)
   (or_else `T)
   : Main `T
   =
-    under Loop[`T] to
+    under Loop#[`T] to
       if pred () then (do (); loop pred do or_else) else or_else
     handle
     | break x => x

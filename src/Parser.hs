@@ -457,10 +457,11 @@ bool = tok test
 betweenSymbols :: Token -> Token -> Parser a -> Parser a
 betweenSymbols l = between (symbol l) . symbol
 
-brackets, braces, sharpBraces, parens :: Parser a -> Parser a
+brackets, braces, sharpBraces, sharpBrackets, parens :: Parser a -> Parser a
 brackets = betweenSymbols TSquareL TSquareR
 braces = betweenSymbols TBraceL TBraceR
 sharpBraces = betweenSymbols TSharpBraceL TBraceR
+sharpBrackets = betweenSymbols TSharpSquareL TSquareR
 parens = betweenSymbols TParenL TParenR
 
 semisym, colonsym, pipesym, commasym :: Parser ()
@@ -839,8 +840,17 @@ arrowEffRow =
   try (braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> meta))
   <|> try (do
     n <- name
-    _ <- lookAhead typeAtomStart
-    pure $ ERAlias n)
+    -- `T#[...]` applies a row alias.  The bracket itself says so, which is the
+    -- one case where a name followed by something is unambiguously a row: a
+    -- row followed by a type would be a row alias and a type, which only the
+    -- braced form writes.
+    m <- optional typeApps
+    case m of
+      Just apps -> pure $ ERAlias n (Just apps)
+      Nothing -> do
+        noBareApplication n
+        _ <- lookAhead typeAtomStart
+        pure $ ERAlias n Nothing)
   <|> try (do
     n <- meta
     _ <- lookAhead typeAtomStart
@@ -871,7 +881,7 @@ typAtomBase :: Parser Typ
 typAtomBase =
   choice [
     try $ TGenericAlias <$> name <*> typeApps,
-    TFlat <$> name,
+    TFlat <$> flatName,
     -- `nil` consumes `(` before it discovers that the parentheses are not
     -- empty, and without `try` the choice would not reach the parenthesised
     -- type below.  The effect was that every `(T1, T2)` annotation failed
@@ -883,6 +893,35 @@ typAtomBase =
     TRecord <$> recordType,
     forallType
   ]
+
+-- | A name that is not applied, or a complaint that the application lost its
+--   hash.
+--
+--   A type application is written `Maybe#[Int]`, and `#[` is one token, so a
+--   plain `[` after a name can only be a leftover: an array is written `[T]`
+--   with nothing in front of it.  Saying so here is the difference between
+--   "unexpected `[`" -- which points at a bracket and says nothing -- and the
+--   spelling the reader needs.
+flatName :: Parser Text
+flatName = do
+  n <- name
+  noBareApplication n
+  pure n
+
+-- | Complain if a name is followed by a bare `[`.
+--
+--   An array type is `[T]` with nothing in front of it, and an application is
+--   `T#[...]`, so a name glued to a bracket has no reading left.  Without this
+--   the name is taken, the bracket is left over, and the failure is reported at
+--   a token that has nothing to do with the mistake.
+noBareApplication :: Text -> Parser ()
+noBareApplication n = do
+  bracket <- optional $ lookAhead (symbol TSquareL)
+  case bracket of
+    Nothing -> pure ()
+    Just _ -> fail $ T.unpack $ T.concat [
+        "a type application is written `", n, "#[...]`, with a `#` before the brackets"
+      ]
 
 recordType :: Parser RecordTyp
 recordType = sharpBraces $
@@ -945,9 +984,10 @@ rowDef :: Parser (Span -> TopLevelStat)
 rowDef = do
   keyword KWRow
   n <- name
+  ts <- fromMaybe mempty <$> optional typeParams
   symbol TAssign
   row <- effRow
-  pure $ \sp -> RowDef sp n row
+  pure $ \sp -> RowDef sp n ts row
 
 functDef :: Parser (Span -> TopLevelStat)
 functDef = do
@@ -960,7 +1000,12 @@ functDef = do
   try $ do
     fx <- optional effRow
     case fx of
-      Just (ERAlias a) -> do
+      -- A leading name is a row only when a result type follows it: `: Main
+      -- ()` is the row `Main` and the type `()`, while `: Int = 1` is the type
+      -- `Int` and no row at all.  The definition only knows which one it read
+      -- after it looks for the type, so it decides here and drops the row when
+      -- there is none.
+      Just (ERAlias a apps) -> do
         out <- optional typ
         symbol TAssign
         case out of
@@ -969,7 +1014,8 @@ functDef = do
             pure $ \sp -> FunctDef sp n ts es args fx t b
           Nothing -> do
             b <- block
-            pure $ \sp -> FunctDef sp n ts es args Nothing (TFlat a) b
+            let outTyp = maybe (TFlat a) (TGenericAlias a) apps
+            pure $ \sp -> FunctDef sp n ts es args Nothing outTyp b
       _ -> do
         out <- typ
         symbol TAssign
@@ -983,7 +1029,16 @@ effRow :: Parser EffRow
 effRow =
   choice [
     ERVar <$> meta,
-    ERAlias <$> name,
+    -- A name in row position is a row alias, with or without an application:
+    -- `Main` and `Chatty#[Int]` both name a row.  A bare `[` after the name is
+    -- only a leftover of a type application, so it is reported rather than
+    -- left for the bracket to fail at.
+    try $ do
+      n <- name
+      apps <- optional typeApps
+      case apps of
+        Just ts -> pure $ ERAlias n (Just ts)
+        Nothing -> noBareApplication n >> pure (ERAlias n Nothing),
     braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> meta)
   ]
 
@@ -998,7 +1053,12 @@ effCons :: Parser EffCons
 effCons = (EVar <$> meta) <|> (EffCons <$> eCons)
 
 eCons :: Parser ECons
-eCons = ECons <$> name <*> optional typeApps
+eCons = do
+  n <- name
+  -- An effect is applied with a hash too: `Loop#[Int]`.  Saying so beats
+  -- letting the name through and failing at the bracket.
+  noBareApplication n
+  ECons n <$> optional typeApps
 
 block :: Parser Block
 block = do
@@ -1072,7 +1132,7 @@ functArg = parens $ do
   pure $ fromMaybe NilArg arg
 
 typeApps :: Parser TypeApps
-typeApps = TypeApps <$> brackets (sepBy typeArg semisym <* optional semisym)
+typeApps = TypeApps <$> sharpBrackets (sepBy typeArg semisym <* optional semisym)
 
 typeArg :: Parser TypeArg
 typeArg = makeExprParser typeArgAtom table
