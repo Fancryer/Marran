@@ -23,6 +23,9 @@ module Module (
   , Imported(..)
   , ImportOrigin(..)
   , Table
+  , tableFromList
+  , tableEntries
+  , mergeTables
   , Unit(..)
   , Program(..)
   , DeclKind(..)
@@ -103,10 +106,39 @@ instance Pretty Imported where
 
 -- | A table of names, keyed by the name a use writes.
 --
+--   A name is a list because one name may be declared twice: `funct f` and
+--   `type f` are two declarations of one spelling, told apart by the position a
+--   use puts them in -- exactly as two declarations of one file are.  Two
+--   entries of one namespace under one name are a clash, and no table ever holds
+--   them: 'mergeTables' keeps both namespaces, and the loader reports the clash.
+--
 --   Both directions are one of these: what a file sees of the outside
 --   ('mhResolved', which the loader keeps apart from the file's own
 --   declarations) and what it offers an importer ('mhPublished').
-type Table = Map Text Imported
+type Table = Map Text [Imported]
+
+-- | Every entry of a table, with the name a use writes.
+--
+--   This is the flattened view: one pair per declaration, so a name that stands
+--   for a function and a type appears twice, and a caller that walks a resolved
+--   table sees both.
+tableEntries :: Table -> [(Text, Imported)]
+tableEntries t = [ (n, imp) | (n, imps) <- Map.toList t, imp <- imps ]
+
+-- | A table from single entries.  Two declarations of one name, in two
+--   namespaces, both stay; the same declaration twice stays once.
+tableFromList :: [(Text, Imported)] -> Table
+tableFromList = Map.fromListWith joinEntries . map (\(n, i) -> (n, [i]))
+
+-- | Two tables as one.  The entries of a name that both have are joined, so a
+--   name declared as a function on one side and a type on the other is one name
+--   with both declarations.
+mergeTables :: Table -> Table -> Table
+mergeTables = Map.unionWith joinEntries
+
+-- | Add the entries of the second list to the first without repeating any.
+joinEntries :: [Imported] -> [Imported] -> [Imported]
+joinEntries new old = old <> [ i | i <- new, i `notElem` old ]
 
 -- | The namespace a kind belongs to.
 --

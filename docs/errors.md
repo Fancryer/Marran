@@ -91,12 +91,50 @@ The cases the loader reports:
 |-----------|---------|
 | a module is not on disk | ``cannot find the module `a` ``, with the list of paths tried |
 | a name the export list names is unknown | ``` `f` is not declared or imported here, so it cannot be exported ```, with the names the module does have |
+| a name the import list names is unknown | `` `f` is not offered by the module `a.marr` ``, with the names the source does offer |
+| an import or export list names the wrong kind | ``` `f` is a function in a.marr, not a type ```, with the advice to write the kind it is |
+| an import names a native module that is not there | ``there is no native module `Nosuch` ``, with the list of native modules |
 | two imports bring one name | ``two imports bring `f`: a.marr (a function) and b.marr (a function)``, with the advice to rename one |
 | the entry file is not `module Main` | ``` `Lib` is a library, not a program: a file that is run must say `module Main` ``` |
 
+A name an import list writes is a claim about another file, so the loader checks
+it at the line that makes it. Waiting for the checker to say the name is not in
+scope would report the symptom three functions later; the loader knows which
+file the list is about, and it reports the mistake where a reader can fix it:
+
+```
+error: `nosuch` is not offered by the module `numbers.marr`
+ --> main.marr:3:13
+  |
+3 | import numbers [funct nosuch]
+  |             ^^^^^^^^^^^^
+  |
+  = it offers: one
+```
+
 Two imports of *different* namespaces do not clash: a function and a type may
 share a name, exactly as two declarations of one file may. Only two values, or
-two types, of one name are an error, and `as` is the way out.
+two types, of one name are an error, and `as` is the way out. A table entry is
+therefore a list: one spelling, one declaration per namespace.
+
+The kind a list writes chooses the namespace. A bare name brings every
+declaration of that spelling, and `[type f]` or `[funct f]` asks for one of
+them. A kind that the source does not have there is a mistake about the kind,
+not about the spelling, and the note says which one the source has:
+
+```
+error: `cell` is not offered by the module `func.marr`
+ --> main.marr:3:11
+  |
+3 | import func [type cell]
+  |           ^^^^^^^^^
+  |
+  = `cell` is a function in func.marr, not a type
+```
+
+Shadowing follows the same rule: a file's own `funct f` wins over an imported
+`funct f`, but an imported `type f` still arrives, because a use tells the two
+apart by position.
 
 An enumeration carries its constructors. Naming `enum Colour` in an export or
 import list names `Red` and `Green` too, because a type whose values cannot be
@@ -115,8 +153,11 @@ row alias' body all take the local spelling.
 
 A private name is not a special case: a module's table holds only what it
 exports, so an unexported name is not "hidden" from the importer, it was never
-imported. Reaching for it gives the ordinary ``E0007`` about a name in scope,
-and no note suggests the private spelling.
+imported. An import that names it is told so at the import line — `` `f` is not
+offered by the module `a.marr` ``, with the note that `f` is declared there but
+not exported — because the export list is what has to change. A use of a name
+that never came through any import is the ordinary ``E0007`` about a name in
+scope, and no note suggests the private spelling.
 
 The entry point is the only `main` that runs. A library may declare one; the
 interpreter calls the `main` of the module named on the command line.

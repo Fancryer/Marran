@@ -22,7 +22,7 @@ where
 import qualified Ast
 import qualified Types
 import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..),
-               Unit(..), Program(..), DeclKind(..))
+               Unit(..), Program(..), DeclKind(..), tableEntries)
 import qualified Data.Text as T
 import Utils (uniqPreserveOrder, TextMap, Pretty(..))
 import Data.Coerce (coerce)
@@ -245,7 +245,7 @@ data ImportedDecl =
 importedDecls :: Map FilePath Ast.Chunk -> ModuleHeader -> [ImportedDecl]
 importedDecls chunks header =
   [ rename renames local decl
-  | (local, imp) <- Map.toList (mhResolved header)
+  | (local, imp) <- tableEntries (mhResolved header)
   , Just path <- [case imOrigin imp of
         FromModule p -> Just p
         FromNative _ -> Nothing]
@@ -259,7 +259,7 @@ importedDecls chunks header =
     -- a name this file does not have.
     renames =
       [ (imName imp, local)
-      | (local, imp) <- Map.toList (mhResolved header)
+      | (local, imp) <- tableEntries (mhResolved header)
       , imKind imp /= KindFunct
       , local /= imName imp
       ]

@@ -649,3 +649,120 @@ iSpec = describe "imports" $ do
       ]
     printed r `shouldBe` Right ["Red"]
 
+  it "brings both namespaces when a name is a function and a type" $ do
+    -- A module may declare `funct cell` and `type cell`; the two are one
+    -- spelling in two namespaces, and a bare import of the module brings both,
+    -- just as a bare import of a file brings everything it declares.
+    r <- runFiles [ ("cell.marr", cellModule) ] $ T.unlines
+      [ "module Main"
+      , "import @native"
+      , "import cell"
+      , ""
+      , "funct pick (x cell) : Int = x"
+      , ""
+      , "funct main () : {Output} () = sayn (pick (cell ()))"
+      ]
+    printed r `shouldBe` Right ["5"]
+
+  it "keeps the namespace a name list writes" $ do
+    let prog = T.unlines
+          [ "module Main"
+          , "import @native"
+          , "import cell [type cell]"
+          , ""
+          , "funct pick (x cell) : Int = x"
+          , ""
+          , "funct main () : {Output} () = sayn (pick 3)"
+          ]
+    out <- runFiles [ ("cell.marr", cellModule) ] prog
+    printed out `shouldBe` Right ["3"]
+
+  it "reports the kind an import asked for against the kind the source has" $ do
+    -- `[type cell]` in a module whose `cell` is a function is a wrong kind,
+    -- not a typo: the note says which kind it is.
+    let source = T.unlines
+          [ "module Func [funct cell]"
+          , "import @native"
+          , ""
+          , "funct cell () : Int = 5"
+          ]
+    r <- runFiles [ ("func.marr", source) ] $ T.unlines
+      [ "module Main"
+      , "import @native"
+      , "import func [type cell]"
+      , ""
+      , "funct main () : () = ()"
+      ]
+    case r of
+      Left err -> do
+        err `shouldSatisfy` ("`cell` is not offered by the module `func.marr`" `isInfixOf`)
+        err `shouldSatisfy` ("is a function in func.marr, not a type" `isInfixOf`)
+      Right _ -> expectationFailure "a wrong kind in an import must be a diagnostic"
+
+  it "reports the kind an export list asked for against the kind the file has" $ do
+    r <- runFiles [] $ T.unlines
+      [ "module Main [type run]"
+      , "import @native"
+      , ""
+      , "funct run () : () = ()"
+      ]
+    case r of
+      Left err -> do
+        err `shouldSatisfy` ("`run` is a function here, not a type" `isInfixOf`)
+        err `shouldSatisfy` ("drop the kind" `isInfixOf`)
+      Right _ -> expectationFailure "a wrong kind in an export list must be a diagnostic"
+
+  it "keeps a local value beside an imported type of the same name" $ do
+    -- Shadowing is per namespace: the file's own `funct cell` wins over the
+    -- imported function, but the imported `type cell` is still the type, and
+    -- the run must call the local function.
+    r <- runFiles [ ("cell.marr", cellModule) ] $ T.unlines
+      [ "module Main"
+      , "import @native"
+      , "import cell [type cell]"
+      , ""
+      , "funct cell () : Int = 9"
+      , ""
+      , "funct pick (x cell) : Int = x"
+      , ""
+      , "funct main () : {Output} () = sayn (cell ())"
+      ]
+    printed r `shouldBe` Right ["9"]
+
+  it "brings a function from one module and a type from another under one name" $ do
+    let fun = T.unlines
+          [ "module Fun [funct cell]"
+          , "import @native"
+          , ""
+          , "funct cell () : Int = 4"
+          ]
+        typ = T.unlines
+          [ "module Typ [type cell]"
+          , "import @native"
+          , ""
+          , "type cell = Int"
+          ]
+    r <- runFiles [ ("fun.marr", fun), ("typ.marr", typ) ] $ T.unlines
+      [ "module Main"
+      , "import @native"
+      , "import fun"
+      , "import typ"
+      , ""
+      , "funct pick (x cell) : cell = x"
+      , ""
+      , "funct main () : {Output} () = sayn (pick (cell ()))"
+      ]
+    printed r `shouldBe` Right ["4"]
+
+-- | A module that declares one spelling twice: a function and a type under
+--   `cell`, which is legal because a use tells the two apart by position.
+cellModule :: T.Text
+cellModule = T.unlines
+  [ "module Cell [type cell funct cell]"
+  , "import @native"
+  , ""
+  , "type cell = Int"
+  , ""
+  , "funct cell () : Int = 5"
+  ]
+

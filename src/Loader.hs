@@ -304,8 +304,12 @@ settleComponent nodes comp = do
 -- | The names a module declares: every top-level name and its kind.  The
 --   constructors of an enum are values of the module's scope, so they travel
 --   with it.
+--
+--   A file may declare two things under one name -- `funct f` and `type f` are
+--   told apart by the position a use puts them in -- so the table keeps both
+--   rather than the last one read.
 declaredTable :: Map FilePath Node -> FilePath -> Table
-declaredTable nodes p = Map.fromList
+declaredTable nodes p = tableFromList
   [ (name, Imported (FromModule p) name k)
   | (name, k) <- declared (nChunk (nodes Map.! p)) ]
 
@@ -352,12 +356,12 @@ constructorsOf enums origin name = case origin of
 --   library without naming every module import.
 nativeTable :: Text -> Either LoadError Table
 nativeTable m
-  | T.null m = Right $ Map.fromList
+  | T.null m = Right $ tableFromList
       [ (bName b, Imported (FromNative "") (bName b) (nativeKind b)) | b <- builtins ]
   | null names =
       Left $ LoadError noSpan (T.concat ["there is no native module `", m, "`"])
         [ "native modules: " <> T.intercalate ", " moduleNames ]
-  | otherwise = Right $ Map.fromList
+  | otherwise = Right $ tableFromList
       [ (n, Imported (FromNative m) n k) | (n, k) <- names ]
   where
     names = [ (bName b, nativeKind b) | b <- builtins, bModule b == m ]
@@ -366,6 +370,20 @@ nativeKind :: Builtin -> DeclKind
 nativeKind b = case bKind b of
   Op _ -> KindEffect
   Native -> KindFunct
+
+-- | The entries one name of a list asks for.
+--
+--   A name alone is every declaration of that spelling, because a module may
+--   declare a function and a type under one name and exporting the name exports
+--   the name.  A kind narrows it to one namespace: `[type cell]` asks for the
+--   type, `[funct cell]` for the function, and a module that has only the other
+--   one is told so rather than silently given nothing.
+namedEntries :: Table -> ExportDecl -> [Imported]
+namedEntries t ed =
+  [ imp
+  | imp <- Map.findWithDefault [] (edName ed) t
+  , maybe True (\k -> namespaceOf (imKind imp) == namespaceOf k) (edKind ed)
+  ]
 
 -- | An import with its names looked up in the table of its source.  A name the
 --   source does not offer is 'Nothing': during the growth of a cycle the source
@@ -384,9 +402,10 @@ resolveImport enums tables i = case iSource i of
     -- constructors of its enumerations; there is nothing to expand.  A list of
     -- names is where an enumeration turns into its values.
     keep t = case iNames i of
-      Nothing -> [ (n, Just imp) | (n, imp) <- Map.toList t ]
+      Nothing -> [ (n, Just imp) | (n, imp) <- tableEntries t ]
       Just decls -> withConstructors enums (map edName decls)
-        [ (localOf ed, Map.lookup (edName ed) t) | ed <- decls ]
+        [ (localOf ed, Just imp)
+        | ed <- decls, imp <- namedEntries t ed ]
 
 -- | A name list with the constructors of every enumeration in it.
 --
@@ -419,9 +438,15 @@ entriesOf enums spelled (local, imp) =
 --   A constructor is a value of the enumeration's module: its declared name is
 --   the constructor's, and its kind is 'KindFunct', so an importer adds it as a
 --   function and two constructors of one name still clash as two values.
+--
+--   Only an enumeration brings values.  A name may be a function and an
+--   enumeration at once, and the function does not own the enumeration's
+--   constructors.
 enumValues :: Enums -> Text -> Imported -> [(Text, Imported)]
 enumValues enums local imp =
-  (local, imp) : [ (c, ctor c) | c <- constructorsOf enums (imOrigin imp) (imName imp) ]
+  (local, imp) : case imKind imp of
+    KindEnum -> [ (c, ctor c) | c <- constructorsOf enums (imOrigin imp) (imName imp) ]
+    _ -> []
   where
     ctor c = imp {imName = c, imKind = KindFunct}
 
@@ -433,44 +458,81 @@ localOf ed = fromMaybe (edName ed) (edAlias ed)
 --   strict pass does the reporting once the whole component has settled.
 publishOf :: Map FilePath Node -> Map FilePath Table -> FilePath -> Table
 publishOf nodes tables p = case mhExports (Ast.modHeader (nChunk n)) of
-    Nothing -> Map.union imported own
-    Just decls -> Map.fromList
+    Nothing -> mergeTables own imported
+    Just decls -> tableFromList
       [ entry
       | ed <- decls
-      , Just imp <- [Map.lookup (edName ed) (Map.union own imported)]
-      , entry <- entriesOf (enumsOf nodes) (map edName decls) (localOf ed, imp)
+      , imp <- namedEntries visible ed
+      , entry <- entriesOf (enumsOf nodes) spelled (localOf ed, imp)
       ]
   where
     n = nodes Map.! p
     own = declaredTable nodes p
-    imported = foldl' add Map.empty (nImports n)
-    add acc i = foldl' (\t (local, imp) -> maybe t (\i' -> Map.insert local i' t) imp)
-                  acc (resolveImport (enumsOf nodes) tables i)
+    spelled = map edName (fromMaybe [] (mhExports (Ast.modHeader (nChunk n))))
+    visible = mergeTables own imported
+    imported = importedOf (enumsOf nodes) tables (nImports n)
 
 -- | The table a module offers, once its component has settled: an export list
 --   that names nothing the module has is an error here.
 strictPublish :: Map FilePath Node -> Map FilePath Table -> FilePath -> Either LoadError Table
 strictPublish nodes tables p = case mhExports (Ast.modHeader (nChunk n)) of
-    Nothing -> pure $ Map.union own imported
-    Just decls -> Map.fromList . concat <$> traverse select decls
+    Nothing -> pure $ mergeTables own imported
+    Just decls -> tableFromList . concat <$> traverse select decls
   where
     n = nodes Map.! p
     own = declaredTable nodes p
     spelled = map edName (fromMaybe [] (mhExports (Ast.modHeader (nChunk n))))
-    imported = foldl' add Map.empty (nImports n)
+    visible = mergeTables own imported
+    imported = importedOf (enumsOf nodes) tables (nImports n)
 
-    add acc i = foldl' (\t (local, imp) -> maybe t (\i' -> Map.insert local i' t) imp)
-                  acc (resolveImport (enumsOf nodes) tables i)
-
-    select ed = case Map.lookup (edName ed) (Map.union own imported) of
-      Nothing -> Left $ LoadError (edSpan ed) (T.concat [
+    select ed = case namedEntries visible ed of
+      -- A name that is here, but in another namespace, is a different mistake
+      -- from a name that is not here at all: `[type cell]` in a module whose
+      -- `cell` is a function is a wrong kind, not a typo.
+      [] | others@(_ : _) <- Map.findWithDefault [] (edName ed) visible ->
+        Left $ LoadError (edSpan ed) (T.concat [
+            "`", edName ed, "` is ", kinds others, " here, not ", asked
+          ]) [ "write the kind it is, or drop the kind and rename it with `as`" ]
+      [] -> Left $ LoadError (edSpan ed) (T.concat [
           "`", edName ed, "` is not declared or imported here, so it cannot be exported"
         ]) [ available ]
-      Just imp -> Right (entriesOf (enumsOf nodes) spelled (localOf ed, imp))
+      imps -> Right
+        [ entry
+        | imp <- imps
+        , entry <- entriesOf (enumsOf nodes) spelled (localOf ed, imp)
+        ]
       where
-        available = case Map.keys (Map.union own imported) of
+        asked = case edKind ed of
+          Nothing -> "a name this module has"
+          Just k -> kindName k
+        available = case Map.keys visible of
           [] -> "this module declares and imports nothing"
           names -> "the module declares or imports: " <> T.intercalate ", " names
+        kinds = T.intercalate " and " . map kindName . mapKindNub . map imKind
+
+-- | One kind per namespace, so a name declared as a function and a type says
+--   both.
+mapKindNub :: [DeclKind] -> [DeclKind]
+mapKindNub = foldr step []
+  where
+    step k acc
+      | any ((== namespaceOf k) . namespaceOf) acc = acc
+      | otherwise = k : acc
+
+-- | The names a module's imports bring, as one table.
+importedOf :: Enums -> Map FilePath Table -> [Import] -> Table
+importedOf enums tables = foldl' add Map.empty
+  where
+    add acc i = foldl' one acc (resolveImport enums tables i)
+    one acc (_, Nothing) = acc
+    one acc (local, Just imp) = addEntry local imp acc
+
+addEntry :: Text -> Imported -> Table -> Table
+addEntry local imp acc = case Map.lookup local acc of
+  Nothing -> Map.insert local [imp] acc
+  Just others
+    | imp `elem` others -> acc
+    | otherwise -> Map.insert local (others <> [imp]) acc
 
 -- | The table a module sees: everything it imports, with two imports of one
 --   name reported.
@@ -484,14 +546,24 @@ strictPublish nodes tables p = case mhExports (Ast.modHeader (nChunk n)) of
 strictVisible :: Map FilePath Node -> Map FilePath Table -> FilePath -> Either LoadError Table
 strictVisible nodes tables p = do
   imported <- foldlM add Map.empty (nImports n)
-  pure $ Map.withoutKeys imported (Map.keysSet own)
+  pure $ Map.filter (not . null) $ Map.mapWithKey shadowed imported
   where
     n = nodes Map.! p
     own = declaredTable nodes p
 
+    -- A declaration of the module wins over an import of the same name -- but
+    -- only in its own namespace: a file that declares `funct f` may still
+    -- import `type f`, because a use tells the two apart by position.
+    shadowed name imps =
+      [ imp
+      | imp <- imps
+      , not (any ((== namespaceOf (imKind imp)) . namespaceOf . imKind)
+                 (Map.findWithDefault [] name own))
+      ]
+
     add acc i = do
       names <- strictImport nodes tables i
-      foldlM (insertImport (iSpan i)) acc [ (n, Just imp) | (n, imp) <- names ]
+      foldlM (insertImport (iSpan i)) acc names
 
 -- | The strict form of 'resolveImport': every name an import names must be one
 --   the source offers.
@@ -505,7 +577,7 @@ strictVisible nodes tables p = do
 strictImport :: Map FilePath Node -> Map FilePath Table -> Import -> Either LoadError [(Text, Imported)]
 strictImport nodes tables i = case iSource i of
   SrcNative m
-    | T.null m -> Right $ [ (n, imp) | (n, imp) <- Map.toList wholeNative ]
+    | T.null m -> Right (tableEntries wholeNative)
     | otherwise -> case nativeTable m of
         Left e -> Left e {leSpan = iSpan i}
         Right t -> keep t Nothing
@@ -514,12 +586,18 @@ strictImport nodes tables i = case iSource i of
     wholeNative = either (const Map.empty) id (nativeTable "")
 
     keep t src = case iNames i of
-      Nothing -> Right [ (n, imp) | (n, imp) <- Map.toList t ]
-      Just decls -> concat <$> traverse (one t src (map edName decls)) decls
+      Nothing -> Right (tableEntries t)
+      Just decls -> concat <$> traverse (one t src) decls
 
-    one t src spelled ed = case Map.lookup (edName ed) t of
-      Just imp -> Right (entriesOf (enumsOf nodes) spelled (localOf ed, imp))
-      Nothing -> Left $ missing t src ed
+    one t src ed = case namedEntries t ed of
+      [] -> Left $ missing t src ed
+      imps -> Right [ entry
+                    | imp <- imps
+                    , entry <- entriesOf (enumsOf nodes) spelled (localOf ed, imp) ]
+      where
+        -- A constructor the list names by itself is left to its own entry, so
+        -- the set has to be the whole list, not this entry.
+        spelled = maybe [] (map edName) (iNames i)
 
     missing t src ed = LoadError (edSpan ed) (T.concat [
         "`", edName ed, "` is not offered by ", where_
@@ -532,35 +610,56 @@ strictImport nodes tables i = case iSource i of
           SrcNative m -> m
           SrcModule _ -> ""
 
-        -- A name the module declares but does not export is a different
-        -- mistake from a name it never had: the first asks for the export
-        -- list to change, the second for the spelling.
-        notes t src = case src of
-          Just p | Map.member (edName ed) (declaredTable nodes p) ->
+        -- A name that is there in another namespace is a wrong kind, not a
+        -- typo: `import lib [type cell]` in a module whose `cell` is a
+        -- function is answered with the kind it actually is.
+        notes offeredBy origin =
+          case (edKind ed, Map.findWithDefault [] (edName ed) offeredBy) of
+          (Just k, others@(_ : _)) ->
             [ T.concat [
-                "`", edName ed, "` is declared in ", T.pack (baseName p),
-                " but not exported: a module offers the names its export list names"
+                "`", edName ed, "` is ", kinds others, " in ", named origin,
+                ", not ", kindName k
               ] ]
-          _ -> [ offered t ]
+          -- A name the module declares but does not export is a different
+          -- mistake from a name it never had: the first asks for the export
+          -- list to change, the second for the spelling.
+          _ -> case origin of
+            Just p | Map.member (edName ed) (declaredTable nodes p) ->
+              [ T.concat [
+                  "`", edName ed, "` is declared in ", T.pack (baseName p),
+                  " but not exported: a module offers the names its export list names"
+                ] ]
+            _ -> [ offered offeredBy ]
 
-        offered t = case Map.keys t of
+        named = \case
+          Just p -> T.pack (baseName p)
+          Nothing -> T.concat ["`@native ", nativeName, "`"]
+
+        kinds = T.intercalate " and " . map kindName . mapKindNub . map imKind
+
+        offered tbl = case Map.keys tbl of
           [] -> "the source offers nothing"
           names -> "it offers: " <> T.intercalate ", " names
 
-insertImport :: Span -> Table -> (Text, Maybe Imported) -> Either LoadError Table
-insertImport _ acc (_, Nothing) = Right acc
-insertImport sp acc (local, Just imp) = case Map.lookup local acc of
+-- | Add one import's names to a table, reporting a clash.
+--
+--   A table entry is a list, so a name that is a function in one import and a
+--   type in another is one name with both.  Two entries of one namespace under
+--   one name are a clash, and `as` is the way out.
+insertImport :: Span -> Table -> (Text, Imported) -> Either LoadError Table
+insertImport sp acc (local, imp) = case Map.lookup local acc of
+    Nothing -> Right $ Map.insert local [imp] acc
     -- The same declaration named twice -- a constructor reached both through
     -- its enum and by its own name -- is one name, not a clash.
-    Just other | other == imp -> Right acc
-    Nothing -> Right $ Map.insert local imp acc
-    Just other
-      | namespaceOf (imKind other) == namespaceOf (imKind imp) ->
-          Left $ LoadError sp (T.concat [
-              "two imports bring `", local, "`: ", describe other, " and ", describe imp
-            ]) [ "write `as` in one of the import lists to keep both names" ]
-      | otherwise -> Right acc
+    Just others | imp `elem` others -> Right acc
+      | Just other <- sameNamespace others -> Left $ LoadError sp (T.concat [
+            "two imports bring `", local, "`: ", describe other, " and ", describe imp
+          ]) [ "write `as` in one of the import lists to keep both names" ]
+      | otherwise -> Right $ Map.insert local (others <> [imp]) acc
   where
+    sameNamespace others = lookup True
+      [ (True, other) | other <- others
+      , namespaceOf (imKind other) == namespaceOf (imKind imp) ]
     describe i = T.concat [quote (imOrigin i), " (", kindName (imKind i), ")"]
     quote = \case
       FromModule path -> T.pack (baseName path)

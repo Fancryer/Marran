@@ -145,7 +145,7 @@ import Data.Text (Text)
 import Control.Lens (use)
 import ErrorContext (IrFrame (IrFrame), ErrorFrame (..))
 import Suggest (suggestionNote)
-import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), DeclKind(..), Unit(..), Program(..))
+import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), DeclKind(..), Unit(..), Program(..), tableEntries)
 import Span (Span)
 import Data.Set (Set)
 
@@ -543,7 +543,7 @@ moduleScope ::
   -> ModuleHeader
   -> TypeCheckM Scope
 moduleScope args tables header = do
-  let resolved = Map.toList (mhResolved header)
+  let resolved = tableEntries (mhResolved header)
       natives = [ imName imp | (_, imp) <- resolved, FromNative _ <- [imOrigin imp] ]
       -- An import may rename a type-level declaration: the enumeration of
       -- `enum Colour as Shade`, or the effect of `effect Write as Save`.  Every

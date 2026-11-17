@@ -29,7 +29,7 @@ import Data.Scientific (Scientific, fromFloatDigits, normalize, scientific)
 import Control.Monad.Cont (ContT(..), callCC)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Span (Span, noSpan)
-import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), Unit(..), Program(..), moduleAt)
+import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), Unit(..), Program(..), moduleAt, tableEntries, DeclKind(..))
 import Utils (TextMap, Pretty (..))
 import Data.Foldable (find)
 import Data.List (intercalate, nub)
@@ -566,15 +566,19 @@ evalProgram prog root = do
       pure $ Map.union here envs
 
     linkImports envs eid m =
-      forM_ (Map.toList (mhResolved (modHeader m))) $ \(local, imp) -> case imOrigin imp of
-        -- A native name is already bound in the root environment, which is
-        -- this module's parent; only a renamed one needs a local binding.
-        FromNative _
-          | local == imName imp -> pure ()
-          | otherwise -> copyFrom eid root local (imName imp)
-        FromModule path -> case Map.lookup path envs of
-          Nothing -> pure ()
-          Just src -> copyFrom eid src local (imName imp)
+      forM_ (tableEntries (mhResolved (modHeader m))) $ \(local, imp) ->
+        -- Only a value is a binding: a type, an effect or a row of the same
+        -- spelling lives in the checker's scope, not in the environment, and a
+        -- name may be both at once (`type f` imported beside a local `funct f`).
+        if imKind imp /= KindFunct then pure () else case imOrigin imp of
+          -- A native name is already bound in the root environment, which is
+          -- this module's parent; only a renamed one needs a local binding.
+          FromNative _
+            | local == imName imp -> pure ()
+            | otherwise -> copyFrom eid root local (imName imp)
+          FromModule path -> case Map.lookup path envs of
+            Nothing -> pure ()
+            Just src -> copyFrom eid src local (imName imp)
 
     copyFrom eid src local declared =
       findBindingEnvMaybe src declared >>= \case

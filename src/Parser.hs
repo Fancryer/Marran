@@ -505,9 +505,11 @@ exportList = brackets (some exportDecl)
 
 -- | One name of an export list, with an optional kind and an optional alias.
 --
---   The kind is only a hint: the checker compares it with the declaration it
---   names, so `enum E` in the list of a module that declares `type E` is an
---   error rather than a second namespace.
+--   The kind names the namespace, not the declaration: a module may declare a
+--   function and a type under one spelling, and `[funct f type f]` is how a list
+--   says it means both.  `enum` and `type` are one namespace, so a list that
+--   writes either of them asks for the type-level declaration it names; what a
+--   kind cannot do is turn a function into a type.
 exportDecl :: Parser ExportDecl
 exportDecl = do
   start <- currentPos
