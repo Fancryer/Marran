@@ -260,7 +260,7 @@ missing, a native signature arrived as a value.
 | E0013 | a syntax error reported by the lexer or the grammar |
 | E0014 | a duplicate definition (a function, an effect, or a handler clause) |
 | E0015 | a record error (an unknown field, a non-record base, a field whose mutability changes) |
-| E0016 | a handler error (an operation the effect does not declare, a missing or repeated clause) |
+| E0016 | a handler error (an operation the effect does not declare, a missing or repeated clause, a marker effect such as `Var` that has no operations, or an effect declared with no operations) |
 | E0017 | an application or arity error (`with` arguments, an effect parameter list, a non-function head) |
 | E0018 | an inference limitation (an occurs check, an escaping rigid variable, a failed instantiation, a forbidden effect in a constrained row, or an operation name provided by two effects in the same row) |
 | E0019 | the program exhausted memory (the heap or the stack), reported at the body of `main` |
