@@ -516,7 +516,7 @@ exportDecl = do
   start <- currentPos
   kind <- optional declKind
   n <- name
-  alias <- optional (symbolAs *> name)
+  alias <- optional (keyword KWAs *> name)
   sp <- spanUpToHere (spanFromPositions start start)
   pure $ ExportDecl sp kind n alias
 
@@ -659,12 +659,12 @@ blockExp = do
 matchClause :: Parser MatchClause
 matchClause = do
   pipesym
-  -- `as` is an ordinary name, so a pattern would happily take it as a binder;
-  -- here it belongs to the clause.  A pattern is therefore only tried when the
-  -- next token is not `as`.
-  ps <- some (try (notFollowedBy symbolAs *> patternNoAs))
+  -- `as` is a keyword, so a pattern cannot take it as a binder; here it
+  -- belongs to the clause.  A pattern is therefore only tried when the next
+  -- token is not `as`.
+  ps <- some (try (notFollowedBy (keyword KWAs) *> patternNoAs))
   alias <- optional $ do
-    symbolAs
+    keyword KWAs
     name
   guard' <- optional (keyword KWIf *> Parser.exp)
   symbol TMatchArrow
@@ -674,18 +674,11 @@ matchClause = do
   where
     withAlias' n p = MkPattern (patSpan p) (PAs p n)
 
--- | @as@ is a name, not a keyword: a program may still call a function `as`,
---   and only a pattern position needs the word here.
-symbolAs :: Parser ()
-symbolAs = tok $ \case
-  TName "as" -> Just ()
-  _ -> Nothing
-
 -- | A pattern that may carry a trailing @as@.
 pattern :: Parser Pattern
 pattern = do
   p <- patternNoAs
-  m <- optional (symbolAs *> name)
+  m <- optional (keyword KWAs *> name)
   pure $ maybe p (withAlias p) m
 
 withAlias :: Pattern -> Text -> Pattern
@@ -783,7 +776,7 @@ charCon = do
   -- `#Some x as whole` is the constructor pattern and then an alias of the
   -- whole clause, not `Some` applied to three fields: `as` belongs to the
   -- clause, so a field is only tried when the next token is not `as`.
-  args <- many (try (notFollowedBy symbolAs *> patternNoAs))
+  args <- many (try (notFollowedBy (keyword KWAs) *> patternNoAs))
   pure $ PCon n args
 
 locPattern :: Parser PatternNode -> Parser Pattern
@@ -999,23 +992,21 @@ functDef = do
   colonsym
   try $ do
     fx <- optional effRow
+    -- A leading name or type variable may be a row or the result type itself:
+    -- `: Main ()` is the row `Main` and the type `()`, `: Int = 1` is the type
+    -- `Int` and no row, and ``: `T = ...`` is the type variable `T` and no
+    -- row.  The definition only knows which one it read after it looks for the
+    -- type, so it decides here and drops the row when there is none.
+    let bareResult row whenBare = do
+          out <- optional typ
+          symbol TAssign
+          b <- block
+          case out of
+            Just t -> pure $ \sp -> FunctDef sp n ts es args row t b
+            Nothing -> pure $ \sp -> FunctDef sp n ts es args Nothing whenBare b
     case fx of
-      -- A leading name is a row only when a result type follows it: `: Main
-      -- ()` is the row `Main` and the type `()`, while `: Int = 1` is the type
-      -- `Int` and no row at all.  The definition only knows which one it read
-      -- after it looks for the type, so it decides here and drops the row when
-      -- there is none.
-      Just (ERAlias a apps) -> do
-        out <- optional typ
-        symbol TAssign
-        case out of
-          Just t -> do
-            b <- block
-            pure $ \sp -> FunctDef sp n ts es args fx t b
-          Nothing -> do
-            b <- block
-            let outTyp = maybe (TFlat a) (TGenericAlias a) apps
-            pure $ \sp -> FunctDef sp n ts es args Nothing outTyp b
+      Just (ERAlias a apps) -> bareResult fx (maybe (TFlat a) (TGenericAlias a) apps)
+      Just (ERVar v) -> bareResult fx (TVar v)
       _ -> do
         out <- typ
         symbol TAssign
@@ -1134,6 +1125,15 @@ functArg = parens $ do
 typeApps :: Parser TypeApps
 typeApps = TypeApps <$> sharpBrackets (sepBy typeArg semisym <* optional semisym)
 
+-- | The type arguments of @with@.  An ordinary call spells them as @#[...]@,
+--   like every other type application, but the canonical form after `with` is
+--   a plain @[...]@: @parse with [Int] s@.  Both are accepted so that the
+--   existing spelling keeps working.
+withTypeApps :: Parser TypeApps
+withTypeApps = TypeApps <$> (sharpBrackets args <|> brackets args)
+  where
+    args = sepBy typeArg semisym <* optional semisym
+
 typeArg :: Parser TypeArg
 typeArg = makeExprParser typeArgAtom table
   where
@@ -1147,7 +1147,10 @@ typeArgAtom =
   choice [
     try $ TAGenericAlias <$> name <*> typeApps,
     TAFlat <$> name,
-    TANil <$ nil,
+    -- `nil` consumes `(` before it discovers that the parentheses are not
+    -- empty, so it needs `try`: otherwise `with [(Int, String)]` fails at the
+    -- `Int` and the parenthesised type below is never reached.
+    try $ TANil <$ nil,
     try $ TAParen <$> parens typeArg,
     TAArray <$> brackets typeArg,
     TAMeta <$> meta,
@@ -1249,7 +1252,25 @@ applyExp = do
 accessExp :: Parser Exp
 accessExp = do
   e <- prefixExp
-  parseAccessOps e
+  e' <- parseAccessOps e
+  parseWithArgs e'
+
+-- | @e with [T]@ binds tighter than application: @parse with [Int] s@ is
+--   @(parse with [Int]) s@, and @loop with [Int] 5@ is @(loop with [Int]) 5@.
+--   The type argument belongs to the name, not to the whole application, so
+--   the interpreter can pass it where the name is applied.
+parseWithArgs :: Exp -> Parser Exp
+parseWithArgs e = do
+  m <- optional $ keyword KWWith *> do
+    (ts, es) <- choice [
+        try $ (,) <$> withTypeApps <*> effApps,
+        (, EffApps [] []) <$> withTypeApps,
+        (TypeApps [], ) <$> effApps
+      ]
+    withSpanFrom (expSpan e) (NWith e ts es)
+  case m of
+    Just e' -> parseWithArgs e'
+    Nothing -> pure e
 
 parseAccessOps :: Exp -> Parser Exp
 parseAccessOps e = do
@@ -1262,8 +1283,8 @@ parseWithOps :: Exp -> Parser Exp
 parseWithOps e = do
   m <- optional $ keyword KWWith *> do
     (ts, es) <- choice [
-        try $ (,) <$> typeApps <*> effApps,
-        (, EffApps [] []) <$> typeApps,
+        try $ (,) <$> withTypeApps <*> effApps,
+        (, EffApps [] []) <$> withTypeApps,
         (TypeApps [], ) <$> effApps
       ]
     withSpanFrom (expSpan e) (NWith e ts es)
@@ -1328,8 +1349,8 @@ postfixOp e =
         withSpanFrom (expSpan e) (NPropAccess e n)
   <|> (keyword KWWith *> do
         (ts, es) <- choice [
-            try $ (,) <$> typeApps <*> effApps,
-            (, EffApps [] []) <$> typeApps,
+            try $ (,) <$> withTypeApps <*> effApps,
+            (, EffApps [] []) <$> withTypeApps,
             (TypeApps [], ) <$> effApps
           ]
         withSpanFrom (expSpan e) (NWith e ts es)

@@ -1,8 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleInstances #-}
 
@@ -71,7 +69,10 @@ instance Pretty d => Pretty (Module d) where
 --
 --   The export list is optional.  When it is present it is the whole interface:
 --   a declaration it does not name is private to the module.  When it is absent
---   the module exports everything it declares and everything it imports.
+--   the module exports everything it declares and everything it imports from
+--   another module; the native names it imported for its own use are not passed
+--   on, because `import @native` is how a file gets the library, not a promise
+--   to offer it.
 --
 --   The imports are kept twice: as they were written ('mhImports', which the
 --   printer shows and the loader reads) and as they resolve ('mhResolved', for
@@ -157,8 +158,7 @@ namespaceOf = \case
 instance Sexp ModuleHeader where sexp = show
 
 instance Pretty ModuleHeader where
-  pretty (ModuleHeader n imports _ _ exports _) = T.intercalate "\n" $
-    (T.concat [
+  pretty (ModuleHeader n imports _ _ exports _) = T.intercalate "\n" (T.concat [
         "module ", n,
         maybe "" (\ds -> T.concat [" [", T.unwords (map pretty ds), "]"]) exports
       ] : map pretty imports)
@@ -166,8 +166,7 @@ instance Pretty ModuleHeader where
 -- | A header as the parser produces it: nothing is resolved yet, so both tables
 --   are empty and the loader fills them in.
 parsedHeader :: Text -> [ImportDecl] -> Maybe [ExportDecl] -> Span -> ModuleHeader
-parsedHeader n imports exports sp =
-  ModuleHeader n imports Map.empty Map.empty exports sp
+parsedHeader n imports = ModuleHeader n imports Map.empty Map.empty
 
 -- | Does this header export everything it declares, rather than a list?
 headerExportsAll :: ModuleHeader -> Bool

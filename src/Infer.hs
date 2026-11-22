@@ -103,11 +103,12 @@ import qualified Eff
 import qualified Scope
 import Control.Monad (foldM, when, forM, unless)
 import Scope (enterScope)
+import qualified Builtins
 import Utils (uniqPreserveOrder, Pretty (pretty))
 import qualified Data.Text as T
 import Data.List (nub, find)
 import Text.Printf (printf)
-import Data.Maybe (isNothing, fromMaybe, catMaybes)
+import Data.Maybe (isNothing, fromMaybe, catMaybes, listToMaybe)
 import TypedIR (
     Scope(..),
     ValueBinding(..),
@@ -129,6 +130,11 @@ import TypedIR (
     pattern TEPropAccess, pattern TEIfElse,
     pattern TEAnnot,
     pattern TEMatch,
+    pattern TEWith,
+    TypeRep(..),
+    TypeShape(..),
+    TypeRepProp(..),
+    typeRepOfTyp,
     Pattern(..),
     PatternNode(..),
     MatchClause(..),
@@ -228,6 +234,7 @@ substituteTypedExpr scope = \case
   TEPropAccess e f -> TEPropAccess <$> substituteTypedExpr scope e <*> pure f
   TEIfElse p t f -> TEIfElse <$> substituteTypedExpr scope p <*> substituteTypedExpr scope t <*> substituteTypedExpr scope f
   TEAnnot e t -> TEAnnot <$> substituteTypedExpr scope e <*> applyTypeSubst scope t
+  TEWith e reps passed -> TEWith <$> substituteTypedExpr scope e <*> pure reps <*> pure passed
   TEMatch e t cs -> do
     e' <- substituteTypedExpr scope e
     t' <- applyTypeSubst scope t
@@ -859,6 +866,16 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
   Boolean b -> pure  $ InferResult (TEBoolean b) Eff.empty scope
   String s -> pure  $ InferResult (TEString s) Eff.empty scope
   Nil -> pure  $ InferResult TENil Eff.empty scope
+  XVar v
+    -- A type-directed builtin has no run-time meaning without its type
+    -- argument: `parse` alone would have to guess the type of the value it
+    -- builds.  The `with` path below constructs the node directly, so this
+    -- branch only sees a bare use.
+    | Just binding <- Scope.findBindingWithRow True scope v
+    , isTypeDirectedBinding v binding ->
+        throwTypeCheckError $ ApplicationError $ T.concat [
+            "`", v, "` needs a type argument: write `", v, " with [T] ...`"
+          ]
   XVar v -> do
     (bindingT, pending, scope', mut) <- case Scope.findBindingWithRow True scope v of
       Nothing -> case Scope.findOperations True scope v of
@@ -943,119 +960,35 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
   XLambda lam -> do
     InferResult lam' fxs scope' <- inferLambda scope lam
     wrapInferResultWithCell $ InferResult (TEXLambda lam') fxs scope'
-  Apply callee arg -> do
-    InferResult calleeT calleeFxs calleeScope <- inferExpr scope callee
-    calleeT' <- typeOfTypedExprIn calleeScope calleeT
-
-    -- A callee whose type is already known and is not a function is an
-    -- application error, not a unification error: reporting it as a failed
-    -- unification would leak inference variables (`m6 -> { | `m8} `m7`) into
-    -- a message about `n 2` where `n : Int`.
-    calleeResolved0 <- applyTypeSubst calleeScope calleeT'
-    case calleeResolved0 of
-      TFunct _ -> pure ()
-      TForall{} -> pure ()
-      TVar{} -> pure ()
-      other -> throwTypeCheckError $ ApplicationError $ T.concat [
-          "`", pretty callee, "` has type `", pretty other,
-          "`, which is not a function, so it cannot be applied"
-        ]
-
-    expectedFromT <- freshMetaTypeM
-    expectedToT <- freshMetaTypeM
-    expectedCalleeT <- TFunct . Funct expectedFromT expectedToT . ROpen [] <$> freshMetaM
-    scope' <- unifyTypes calleeScope calleeT' expectedCalleeT
-    -- T-App: the parameter's row names the effects the argument may perform,
-    -- so their operations are in scope while the argument is checked.
-    argScope0 <- withRowOperations scope' expectedFromT
-    InferResult argT argFxs argScope <- inferExpr argScope0 arg
-    argT' <- typeOfTypedExprIn argScope argT
-    -- T-App: the argument's row must be included in the parameter's latent
-    -- row, not equal to it.
-    scope'' <- unifyArgType argScope argT' expectedFromT
-
-    -- Эффект вызова (T-App): латентный ряд callee ПОСЛЕ унификации
-    -- берётся собственный ряд callee (а не ожидаемый: унификация открытых рядов
-    -- привязывает хвост ожидаемого к разности и теряет эффекты)
-    calleeResolved <- applyTypeSubst scope'' calleeT'
-    resultRow <- case calleeResolved of
-      TFunct (Funct _ _ row) -> applyEffRowSubst scope'' row
-      _ -> throwTypeCheckError $ ApplicationError "the left side of an application is not a function"
-
-    -- T-App (paper): @R₂ ∪ Men(Γ,t₂) ⊆ R@.  The row of the argument is
-    -- charged right here -- it is part of 'finalFxs' below -- so the call site
-    -- already pays for it, and the parameter's latent row need not be widened
-    -- to a bound of the *variable* the argument reads: for `line unit q`, where
-    -- `unit` is a `var`, requiring `ρ_unit ∪ {Read} ⊆ {Read}` would close the
-    -- variable's pending row and make the later `unit := ...` illegal.  What
-    -- the callee must be able to pay for, though, is an argument it may force
-    -- later, and that is exactly what 'unifyArgType' checks: if the argument is
-    -- itself a delayed computation, its latent row is included in the
-    -- parameter's arrow row.
-    let finalFxs = Eff.unionEffRowsList [argFxs, resultRow, calleeFxs]
-
-    wrapInferResultWithCell $ InferResult (TEApply calleeT argT) finalFxs scope''
+  Apply callee arg -> inferApply scope callee arg
   NLambda n@(NativeLambdaSign{}) -> wrapInferResultWithCell $
     InferResult
       (TENLambda n)
       Eff.empty
       scope
   With withExpr ts es rs -> do
-    InferResult exprExpr exprFxs exprScope <- inferExpr scope withExpr
-
-    typeOfTypedExprUnsafe exprExpr >>= \case
-      TForall tvars evars rvars boundEffLacks boundRowLacks _ -> do
-        let typesLength = length ts
-            tvarsLength = length tvars
-            fxsLength = length es
-            evarsLength = length evars
-            rowsLength = length rs
-            rvarsLength = length rvars
-
-        when (typesLength /= tvarsLength) $
-          throwTypeCheckError $ ApplicationError $ T.pack $
-            printf "`with` applied %d type argument(s) to an expression that abstracts over %d" typesLength tvarsLength
-
-        when (fxsLength /= evarsLength) $
-          throwTypeCheckError $ ApplicationError $ T.pack $
-            printf "`with` applied %d effect argument(s) to an expression that abstracts over %d" fxsLength evarsLength
-
-        when (rowsLength /= rvarsLength) $
-          throwTypeCheckError $ ApplicationError $ T.pack $
-            printf "`with` applied %d row argument(s) to an expression that abstracts over %d" rowsLength rvarsLength
-
-        let scope1 = enterScope exprScope
-
-        -- Переносим ограничения на аргументы эффектов.
-        scope2 <- foldM
-          (\sc (evar, fxArg) ->
-            maybe (pure sc)
-              (addRowLacksToRow sc (RClosed [fxArg]))
-              (Map.lookup evar boundEffLacks))
-          scope1
-          (zip evars es)
-
-        -- Переносим ограничения на аргументы строк эффектов.
-        scope3 <- foldM
-          (\sc (rvar, rowArg) ->
-            maybe (pure sc)
-              (addRowLacksToRow sc rowArg)
-              (Map.lookup rvar boundRowLacks))
-          scope2
-          (zip rvars rs)
-
-        let scope4 = foldl (\sc (tvar, typArg) -> substituteType sc tvar typArg) scope3 (zip tvars ts)
-            scope5 = foldl (\sc (evar, fxArg) -> substituteEffCons sc evar fxArg) scope4 (zip evars es)
-            scope6 = foldl (\sc (rvar, rowArg) -> substituteEffRow sc rvar rowArg) scope5 (zip rvars rs)
-
-        exprExpr' <- substituteTypedExpr scope6 exprExpr
-        row <- applyEffRowSubst scope6 exprFxs
-
-        wrapInferResultWithCell $
-          InferResult exprExpr' row scope6
-
-      t -> throwTypeCheckError $ ApplicationError $ T.concat
-        ["`with` needs a polymorphic expression, but this one has the type `", pretty t, "`"]
+    -- `with` on a *name* works from the name's scheme, not from the type the
+    -- name happens to have: `XVar` instantiates a scheme at once, so the
+    -- abstraction over the type variables is already gone by the time the
+    -- ordinary inference would see it.  Non-names keep the old `TForall`
+    -- path.
+    let binding = case withExpr of
+          XVar v -> Scope.findBindingWithRow True scope v
+          _ -> Nothing
+        operations = case withExpr of
+          XVar v -> Scope.findOperations True scope v
+          _ -> []
+    case (withExpr, binding, operations) of
+      (XVar v, Just b, _)
+        | isTypeDirectedBinding v b ->
+            inferWithTypeDirected scope v b ts es rs
+      (XVar v, Just b, _)
+        | not (null ts && null es && null rs) ->
+            inferWithBinding scope v b ts es rs
+      (XVar v, Nothing, [(eff, params, opTyp)])
+        | not (null ts) ->
+            inferWithOperation scope v eff params opTyp ts es rs
+      _ -> inferWithForall scope withExpr ts es rs
   Handle handler -> inferHandler scope handler
   Record a ps -> inferRecord scope a ps
   Paren b -> do
@@ -1581,6 +1514,174 @@ inferLetPattern row scope = \case
 
             pure (accProps <> [TRecordProp m name t'], scope''')
 
+-- | Does this binding name a type-directed native?  A user binding that
+--   shadows the name keeps its ordinary meaning, so the declaration's
+--   expression has to be the native signature too.
+isTypeDirectedBinding :: Text -> ValueBinding -> Bool
+isTypeDirectedBinding v (ValueBinding _ expr _ _) =
+  Builtins.isTypeDirected v && case expr of
+    NLambda (NativeLambdaSign n _ _ _) -> n == v
+    _ -> False
+
+-- | The first part of a type that a type-directed native cannot build.
+--   Enums are not expanded: their fields are known per constructor, and a
+--   value that never reaches an unsupported field is still buildable.
+firstUnsupported :: TypeRep -> Maybe Text
+firstUnsupported rep = case trShape rep of
+  ShapeUnsupported what -> Just what
+  ShapeArray t -> firstUnsupported t
+  ShapePair a b -> case firstUnsupported a of
+    Just what -> Just what
+    Nothing -> firstUnsupported b
+  ShapeRecord props ->
+    listToMaybe (catMaybes [firstUnsupported (trpTyp p) | p <- props])
+  _ -> Nothing
+
+-- | `name with [T]`: a type-directed builtin, whose value is the parsed one.
+inferWithTypeDirected
+  :: Scope -> Text -> ValueBinding -> [TypeArg] -> [EffCons] -> [EffRow]
+  -> InferM TypedExpr
+inferWithTypeDirected scope v (ValueBinding scheme _ _ _) ts es rs = do
+  unless (null es && null rs) $
+    throwTypeCheckError $ ApplicationError $ T.concat [
+        "`", v, "` takes no effect or row arguments"
+      ]
+  case (_ts scheme, ts) of
+    ([_], [ta]) -> do
+      let ty = typeArgToTyp ta
+          rep = typeRepOfTyp (Scope.findEnum True scope) ty
+      case firstUnsupported rep of
+        Just what -> throwTypeCheckError $ ApplicationError $ T.concat [
+            "`", v, "` cannot build a value of ", what,
+            "; it supports Int, Float, Boolean, String, (), arrays, pairs, records and enums"
+          ]
+        Nothing -> pure ()
+      (t, _, sc) <- instantiateTypeSchemeExplicit scope scheme [ty] [] [] Eff.empty
+      pure $ InferResult (TEWith (TEXVar v t) [rep] True) Eff.empty sc
+    (tvars, args) ->
+      throwTypeCheckError $ ApplicationError $ T.concat [
+          "`", v, "` needs exactly ", T.pack (show (length tvars)),
+          " type argument(s), but `with` supplied ", T.pack (show (length args))
+        ]
+
+-- | `name with [T]` for an ordinary polymorphic binding.  The explicit
+--   arguments go to the first type variables of the scheme, the rest are
+--   instantiated with fresh metas, and the run-time types are erased.
+inferWithBinding
+  :: Scope -> Text -> ValueBinding -> [TypeArg] -> [EffCons] -> [EffRow]
+  -> InferM TypedExpr
+inferWithBinding scope v (ValueBinding scheme _ mut row) ts es rs = do
+  let tys = map typeArgToTyp ts
+  when (length tys > length (_ts scheme)) $
+    throwTypeCheckError $ ApplicationError $ T.concat [
+        "`with` applied ", T.pack (show (length tys)),
+        " type argument(s) to `", v, "`, which abstracts over ",
+        T.pack (show (length (_ts scheme)))
+      ]
+  when (length es > length (_es scheme)) $
+    throwTypeCheckError $ ApplicationError $ T.concat [
+        "`with` applied ", T.pack (show (length es)),
+        " effect argument(s) to `", v, "`, which abstracts over ",
+        T.pack (show (length (_es scheme)))
+      ]
+  when (length rs > length (_rs scheme)) $
+    throwTypeCheckError $ ApplicationError $ T.concat [
+        "`with` applied ", T.pack (show (length rs)),
+        " row argument(s) to `", v, "`, which abstracts over ",
+        T.pack (show (length (_rs scheme)))
+      ]
+  (t, row', sc) <- instantiateTypeSchemeExplicit scope scheme tys es rs row
+  let reps = map (typeRepOfTyp (Scope.findEnum True scope) . typeArgToTyp) ts
+      finalRow =
+        if mut == Var
+          then Eff.unionEffRows row' (Eff.closedOfFlat "Read")
+          else row'
+  pure $ InferResult (TEWith (TEXVar v t) reps False) finalRow sc
+
+-- | `loop with [Int]`: an operation of a parameterised effect.  The
+--   arguments substitute the effect's parameters in the operation's type and
+--   in the effect its use charges.
+inferWithOperation
+  :: Scope -> Text -> Text -> [Taste] -> Funct -> [TypeArg] -> [EffCons] -> [EffRow]
+  -> InferM TypedExpr
+inferWithOperation scope v eff params opTyp ts es rs = do
+  unless (null es && null rs) $
+    throwTypeCheckError $ ApplicationError $ T.concat [
+        "`", v, "` takes no effect or row arguments"
+      ]
+  when (length ts /= length params) $
+    throwTypeCheckError $ ApplicationError $ T.concat [
+        "`with` applied ", T.pack (show (length ts)),
+        " type argument(s) to `", v, "`, which abstracts over ",
+        T.pack (show (length params))
+      ]
+  let opTyp' = case instantiateOps params [(v, opTyp)] ts of
+        ((_, t') : _) -> t'
+        [] -> opTyp
+  (t, sc) <- instantiateTypeScheme scope (monoScheme (TFunct opTyp'))
+  pure $ InferResult (TEXVar v t) (Eff.closedOfFlatWith eff ts) sc
+
+-- | The old path: `with` on an expression whose type is a `TForall`.
+inferWithForall
+  :: Scope -> Expr -> [TypeArg] -> [EffCons] -> [EffRow]
+  -> InferM TypedExpr
+inferWithForall scope withExpr ts es rs = do
+  InferResult exprExpr exprFxs exprScope <- inferExpr scope withExpr
+
+  typeOfTypedExprUnsafe exprExpr >>= \case
+    TForall tvars evars rvars boundEffLacks boundRowLacks _ -> do
+      let typesLength = length ts
+          tvarsLength = length tvars
+          fxsLength = length es
+          evarsLength = length evars
+          rowsLength = length rs
+          rvarsLength = length rvars
+
+      when (typesLength /= tvarsLength) $
+        throwTypeCheckError $ ApplicationError $ T.pack $
+          printf "`with` applied %d type argument(s) to an expression that abstracts over %d" typesLength tvarsLength
+
+      when (fxsLength /= evarsLength) $
+        throwTypeCheckError $ ApplicationError $ T.pack $
+          printf "`with` applied %d effect argument(s) to an expression that abstracts over %d" fxsLength evarsLength
+
+      when (rowsLength /= rvarsLength) $
+        throwTypeCheckError $ ApplicationError $ T.pack $
+          printf "`with` applied %d row argument(s) to an expression that abstracts over %d" rowsLength rvarsLength
+
+      let scope1 = enterScope exprScope
+
+      -- Переносим ограничения на аргументы эффектов.
+      scope2 <- foldM
+        (\sc (evar, fxArg) ->
+          maybe (pure sc)
+            (addRowLacksToRow sc (RClosed [fxArg]))
+            (Map.lookup evar boundEffLacks))
+        scope1
+        (zip evars es)
+
+      -- Переносим ограничения на аргументы строк эффектов.
+      scope3 <- foldM
+        (\sc (rvar, rowArg) ->
+          maybe (pure sc)
+            (addRowLacksToRow sc rowArg)
+            (Map.lookup rvar boundRowLacks))
+        scope2
+        (zip rvars rs)
+
+      let scope4 = foldl (\sc (tvar, typArg) -> substituteType sc tvar typArg) scope3 (zip tvars ts)
+          scope5 = foldl (\sc (evar, fxArg) -> substituteEffCons sc evar fxArg) scope4 (zip evars es)
+          scope6 = foldl (\sc (rvar, rowArg) -> substituteEffRow sc rvar rowArg) scope5 (zip rvars rs)
+
+      exprExpr' <- substituteTypedExpr scope6 exprExpr
+      row <- applyEffRowSubst scope6 exprFxs
+
+      wrapInferResultWithCell $
+        InferResult exprExpr' row scope6
+
+    t -> throwTypeCheckError $ ApplicationError $ T.concat
+      ["`with` needs a polymorphic expression, but this one has the type `", pretty t, "`"]
+
 inferRecord :: Scope -> Maybe Expr -> [ERecordProp] -> InferM TypedExpr
 inferRecord scope Nothing props = withNewLevel $ do
   (recProps, finalFxs, finalScope) <- foldM
@@ -1946,6 +2047,192 @@ withRowOperations scope typ = do
         sc' <- Scope.addBinding opName opT (XVar opName) Val sc
         pure (sc', Map.insert opName opEff seen)
 
+-- | Apply a callee to the arguments of one application spine.
+--
+--   `f a b` is two nested applications, but its arguments are read together:
+--   a later argument may be what tells an earlier lambda what its parameter is.
+--   `map {i = i@price} items` has no type for `i` until `items` says the
+--   element is an `Item`, and a field access on an unknown type is an error.
+--   So a bare lambda whose parameter type is still an inference variable waits
+--   until the rest of the spine has settled it, and is then checked against
+--   the type it must have ('checkExpr').
+--
+--   The arguments are otherwise checked left to right, exactly as before, and
+--   each one is checked against the arrow the callee must have at that step:
+--   the shape of the spine is fixed by the callee, the arguments only fill it
+--   in.
+inferApply :: Scope -> Expr -> Expr -> InferM TypedExpr
+inferApply scope callee0 arg0 = do
+  let (callee, args) = applicationSpine callee0 [arg0]
+
+  InferResult calleeT calleeFxs calleeScope <- inferExpr scope callee
+  calleeT' <- typeOfTypedExprIn calleeScope calleeT
+
+  -- A callee whose type is already known and is not a function is an
+  -- application error, not a unification error: reporting it as a failed
+  -- unification would leak inference variables (`m6 -> { | `m8} `m7`) into
+  -- a message about `n 2` where `n : Int`.
+  calleeResolved0 <- applyTypeSubst calleeScope calleeT'
+  case calleeResolved0 of
+    TFunct _ -> pure ()
+    TForall{} -> pure ()
+    TVar{} -> pure ()
+    other -> throwTypeCheckError $ ApplicationError $ T.concat [
+        "`", pretty callee, "` has type `", pretty other,
+        "`, which is not a function, so it cannot be applied"
+      ]
+
+  -- One arrow per argument.  `chain` keeps the callee type of every step:
+  -- each step is a call of its own, and the row it charges is the latent row of
+  -- the arrow it used.
+  (scope1, chain, inputs) <- foldM addStep (calleeScope, [calleeT'], []) args
+
+  (scope2, slots, waiting, argFxs) <-
+    foldM checkOne (scope1, [], [], Eff.empty) (zip3 [0 ..] args inputs)
+
+  -- The lambdas that waited are read now, against the parameter type the other
+  -- arguments have settled.
+  (scope3, slots', lateFxs) <- foldM checkWaiting (scope2, slots, Eff.empty) waiting
+
+  args' <- case sequence slots' of
+    Just ts -> pure ts
+    Nothing -> throwTypeCheckError $
+      InferenceError "an application left an argument unchecked"
+
+  -- T-App: every step of the spine is a call of its own, and each charges the
+  -- latent row of the arrow it used.  The row is read after the arguments have
+  -- been checked, because checking one may extend a row variable.  The callee's
+  -- own row after unification is what the call charges, not the fresh one the
+  -- step introduced: unifying two open rows binds the tail of the expected one
+  -- to the difference and would lose the callee's effects.
+  rows <- mapM (arrowRow scope3) (init chain)
+
+  -- T-App (paper): @R₂ ∪ Men(Γ,t₂) ⊆ R@.  The row of every argument is
+  -- charged right here -- it is part of 'finalFxs' -- so the call site already
+  -- pays for it, and the parameter's latent row need not be widened to a bound
+  -- of the *variable* an argument reads: for `line unit q`, where `unit` is a
+  -- `var`, requiring `ρ_unit ∪ {Read} ⊆ {Read}` would close the variable's
+  -- pending row and make the later `unit := ...` illegal.  What the callee must
+  -- be able to pay for, though, is an argument it may force later, and that is
+  -- exactly what 'unifyArgType' checks: if the argument is itself a delayed
+  -- computation, its latent row is included in the parameter's arrow row.
+  let finalFxs = Eff.unionEffRowsList
+        ([Eff.unionEffRows argFxs lateFxs, calleeFxs] <> rows)
+
+  wrapInferResultWithCell $
+    InferResult (foldl TEApply calleeT args') finalFxs scope3
+  where
+    arrowRow sc ct = do
+      t <- applyTypeSubst sc ct
+      case t of
+        TFunct (Funct _ _ row) -> applyEffRowSubst sc row
+        _ -> throwTypeCheckError $
+          ApplicationError "the left side of an application is not a function"
+
+    addStep (sc, cts, is) _ = do
+      from <- freshMetaTypeM
+      to <- freshMetaTypeM
+      arrow <- TFunct . Funct from to . ROpen [] <$> freshMetaM
+      sc' <- unifyTypes sc (last cts) arrow
+      pure (sc', cts <> [to], is <> [from])
+
+    checkOne (sc, slots, waiting, fxs) (i, arg, input) = do
+      waits <- bareLambdaWaits sc arg input
+      if waits
+        then pure (sc, slots <> [Nothing], waiting <> [(i, arg, input)], fxs)
+        else do
+          -- T-App: the parameter's row names the effects the argument may
+          -- perform, so their operations are in scope while it is checked.
+          argScope <- withRowOperations sc input
+          InferResult t afxs sc' <- checkExpr argScope input arg
+          pure (sc', slots <> [Just t], waiting, Eff.unionEffRows fxs afxs)
+
+    checkWaiting (sc, slots, fxs) (i, arg, input) = do
+      argScope <- withRowOperations sc input
+      InferResult t afxs sc' <- checkExpr argScope input arg
+      pure (sc', setAt i t slots, Eff.unionEffRows fxs afxs)
+
+    setAt i x xs = [ if j == i then Just x else y | (j, y) <- zip [0 ..] xs ]
+
+-- | `f a b` as the callee and its arguments, in order.
+applicationSpine :: Expr -> [Expr] -> (Expr, [Expr])
+applicationSpine (Apply f a) acc = applicationSpine f (a : acc)
+applicationSpine f acc = (f, acc)
+
+-- | Does this argument have to wait for the ones after it?
+--
+--   Only a bare lambda can: every type it knows is the one the expectation
+--   supplies, and its body cannot be read before the parameter's type is a
+--   shape rather than a variable.  An annotated lambda and every other
+--   expression carry their own type and are checked at once.
+bareLambdaWaits :: Scope -> Expr -> Typ -> TypeCheckM Bool
+bareLambdaWaits scope (XLambda lam) input
+  | isBareLambda lam = unknownInput scope input
+bareLambdaWaits _ _ _ = pure False
+
+-- | A lambda that names no type of its own.
+isBareLambda :: Types.Lambda -> Bool
+isBareLambda lam = case (lam.lArgT, lam.lRetT, lam.lFxs) of
+  (Nothing, Nothing, RClosed []) -> True
+  _ -> False
+
+-- | Is the type of the parameter still an inference variable?
+--
+--   A lambda can be checked against an arrow whose parameter is a metavariable
+--   -- `map`'s `a -{r}-> b` is one -- but not against `a` alone: `i@price`
+--   needs to know that `i` is a record.  The second case is the one a spine
+--   waits on.
+unknownInput :: Scope -> Typ -> TypeCheckM Bool
+unknownInput scope typ = do
+  t <- applyTypeSubst scope typ
+  case t of
+    TVar Meta{} -> pure True
+    TFunct (Funct i _ _) -> do
+      i' <- applyTypeSubst scope i
+      pure $ case i' of
+        TVar Meta{} -> True
+        _ -> False
+    _ -> pure False
+
+-- | Check an expression against the type it must have.
+--
+--   Inferring first and unifying afterwards is wrong for a lambda: its body may
+--   need the parameter's type to be readable at all.  A bare lambda checked
+--   against an arrow is therefore read with the arrow's parameter and result in
+--   scope -- the one place where the information flows from the expectation
+--   into the expression -- and everything else falls back to inference
+--   followed by the inclusion check of 'unifyArgType'.
+checkExpr :: Scope -> Typ -> Expr -> InferM TypedExpr
+checkExpr scope expected expr = do
+  expectedT <- applyTypeSubst scope expected
+  case (expr, expectedT) of
+    (XLambda lam, TFunct (Funct i o fxs))
+      | isBareLambda lam -> checkLambdaAgainst scope lam i o fxs
+    _ -> do
+      InferResult t fxs sc <- inferExpr scope expr
+      t' <- typeOfTypedExprIn sc t
+      -- T-App: the argument's row must be included in the parameter's latent
+      -- row, not equal to it.
+      sc' <- unifyArgType sc t' expected
+      pure (InferResult t fxs sc')
+
+-- | A bare lambda read against the arrow it must have.
+checkLambdaAgainst :: Scope -> Types.Lambda -> Typ -> Typ -> EffRow -> InferM TypedExpr
+checkLambdaAgainst scope lam argT retT fxs =
+  withErrorStack (EFIr $ IrFrame (pretty (XLambda lam)) (blockSpan lam.lBlock)) $ do
+    -- Only the parameter and the result come from the expectation.  The row
+    -- stays the lambda's own fresh variable and is related to the arrow's row
+    -- by 'unifyArgType' at the end: binding the arrow's row to the body's
+    -- effects here would commit a row two arguments may share before the other
+    -- one has been read.
+    InferResult lam' lamFxs sc0 <- inferLambda scope lam {
+        Types.lArgT = Just argT, Types.lRetT = Just retT
+      }
+    let typed = TEXLambda lam'
+    actual <- typeOfTypedExprIn sc0 typed
+    sc' <- unifyArgType sc0 actual (TFunct (Funct argT retT fxs))
+    pure (InferResult typed lamFxs sc')
+
 inferLambda :: Scope -> Types.Lambda -> InferM TypedIR.Lambda
 inferLambda scope lam = withNewLevel $ do
   let scope1 = enterScope scope
@@ -2001,19 +2288,42 @@ instantiateTypeScheme scope scheme =
 --   the same mapping; otherwise a postponed effect would stay attached to the
 --   definition-site variable after every use of a polymorphic binding.
 instantiateTypeSchemeWithRow :: Scope -> TypeScheme -> EffRow -> TypeCheckM (Typ, EffRow, Scope)
-instantiateTypeSchemeWithRow scope scheme extraRow = do
+instantiateTypeSchemeWithRow scope scheme extraRow =
+  instantiateTypeSchemeExplicit scope scheme [] [] [] extraRow
+
+-- | Instantiate a scheme, giving the first type, effect and row variables the
+--   arguments written after `with` and freshening the rest.
+--
+--   The explicit arguments are not unified with fresh metas: a use such as
+--   `id with [Int]` must know that the result is an `Int` before the argument
+--   arrives, and `parse with [Int]` passes that very type to the interpreter.
+--   A scheme may have more variables than the reader names; those stay
+--   inferable, which is what makes `with` optional for an ordinary call.
+instantiateTypeSchemeExplicit
+  :: Scope -> TypeScheme -> [Typ] -> [EffCons] -> [EffRow] -> EffRow
+  -> TypeCheckM (Typ, EffRow, Scope)
+instantiateTypeSchemeExplicit scope scheme explicitTypes explicitEffects explicitRows extraRow = do
   let tvars = _ts scheme
       evars = _es scheme
       rvars = _rs scheme
       typ = _a scheme
+      (exTvars, restTvars) = splitAt (length explicitTypes) tvars
+      (exEvars, restEvars) = splitAt (length explicitEffects) evars
+      (exRvars, restRvars) = splitAt (length explicitRows) rvars
 
-  freshTypes <- mapM (const freshMetaM) tvars
-  freshEffects <- mapM (const freshMetaM) evars
-  freshRows <- mapM (const freshMetaM) rvars
+  freshTypes <- mapM (const freshMetaM) restTvars
+  freshEffects <- mapM (const freshMetaM) restEvars
+  freshRows <- mapM (const freshMetaM) restRvars
 
-  let typeMapping = Map.fromList [(tv, TVar mv) | (tv, mv) <- zip tvars freshTypes]
-      effMapping = Map.fromList [(ev, EVar mv) | (ev, mv) <- zip evars freshEffects]
-      rowMapping = Map.fromList [(rv, RVar mv) | (rv, mv) <- zip rvars freshRows]
+  let typeMapping = Map.fromList $
+        zip exTvars explicitTypes
+          ++ [(tv, TVar mv) | (tv, mv) <- zip restTvars freshTypes]
+      effMapping = Map.fromList $
+        zip exEvars explicitEffects
+          ++ [(ev, EVar mv) | (ev, mv) <- zip restEvars freshEffects]
+      rowMapping = Map.fromList $
+        zip exRvars explicitRows
+          ++ [(rv, RVar mv) | (rv, mv) <- zip restRvars freshRows]
 
       scope' = scope {
         typeSubst = Map.union typeMapping scope.typeSubst,
@@ -2021,26 +2331,40 @@ instantiateTypeSchemeWithRow scope scheme extraRow = do
         rowSubst = Map.union rowMapping scope.rowSubst
       }
 
-  scope'' <- foldM
+  -- The lacks constraints of the scheme travel to the argument the reader
+  -- supplied, exactly as they travel to a fresh variable.
+  scopeR1 <- foldM
+    (\sc (old, row) ->
+      maybe (pure sc) (addRowLacksToRow sc row) (Map.lookup old (_rowLacks scheme)))
+    scope'
+    (zip exRvars explicitRows)
+
+  scopeR2 <- foldM
     (\sc (old, new) ->
       case Map.lookup old (_rowLacks scheme) of
         Nothing -> pure sc
         Just forbidden -> addRowLacks sc new forbidden)
-    scope'
-    (zip rvars freshRows)
+    scopeR1
+    (zip restRvars freshRows)
 
-  scope''' <- foldM
+  scopeE1 <- foldM
+    (\sc (old, fx) ->
+      maybe (pure sc) (addRowLacksToRow sc (RClosed [fx])) (Map.lookup old (_effLacks scheme)))
+    scopeR2
+    (zip exEvars explicitEffects)
+
+  scopeE2 <- foldM
     (\sc (old, new) ->
       case Map.lookup old (_effLacks scheme) of
         Nothing -> pure sc
         Just forbidden -> addEffLacks sc new forbidden)
-    scope''
-    (zip evars freshEffects)
+    scopeE1
+    (zip restEvars freshEffects)
 
-  typ' <- applyTypeSubst scope''' typ
-  row' <- applyEffRowSubst scope''' extraRow
+  typ' <- applyTypeSubst scopeE2 typ
+  row' <- applyEffRowSubst scopeE2 extraRow
 
-  pure (typ', row', scope''')
+  pure (typ', row', scopeE2)
 
 inferBlock :: Scope -> Types.Block -> InferM TypedIR.Block
 inferBlock outer (stats, expr) = withNewLevel $ do
@@ -2493,6 +2817,7 @@ isFrozenExpr = \case
   TEPropAccess e _ -> isFrozenExpr e
   TEIfElse p t f -> isFrozenExpr p && isFrozenExpr t && isFrozenExpr f
   TEAnnot e _ -> isFrozenExpr e
+  TEWith e _ _ -> isFrozenExpr e
   TEMatch e _ cs ->
     isFrozenExpr e && all clauseFrozen cs
   _ -> True
@@ -2545,6 +2870,7 @@ fvTyped = \case
   TEPropAccess e _ -> fvTyped e
   TEIfElse p t f -> Set.unions [fvTyped p, fvTyped t, fvTyped f]
   TEAnnot e _ -> fvTyped e
+  TEWith e _ _ -> fvTyped e
   TEMatch e _ cs ->
     Set.unions $ fvTyped e : map clauseVars cs
   _ -> Set.empty
@@ -2637,6 +2963,7 @@ createsCell = \case
   TEIfElse p t f -> any createsCell [p, t, f]
   TEPropAccess e _ -> createsCell e
   TEAnnot e _ -> createsCell e
+  TEWith e _ _ -> createsCell e
   TEMatch e _ cs ->
     createsCell e || any (\(TMatchClause ps _ b) ->
       any patternCreatesCell ps || blockCreatesCell b) cs
@@ -2683,6 +3010,7 @@ freeze = \case
   -- frozen binding records the frozen type its scheme has, and the type stored
   -- in the node would describe the state the snapshot no longer carries.
   TEAnnot e _ -> freeze e
+  TEWith e reps passed -> TEWith (freeze e) reps passed
   TEMatch e t cs -> TEMatch (freeze e) t (map freezeClause cs)
   e -> e
   where

@@ -159,6 +159,12 @@ not exported — because the export list is what has to change. A use of a name
 that never came through any import is the ordinary ``E0007`` about a name in
 scope, and no note suggests the private spelling.
 
+A file without an export list offers what it declares and what it imported from
+another file. Native names are the exception: `import @native` is how a file
+gets `sayn` and `map` for itself, not a promise to pass them on, so a module
+that wants an importer to see one names it in an export list — which makes the
+rest of its interface explicit at the same time.
+
 The entry point is the only `main` that runs. A library may declare one; the
 interpreter calls the `main` of the module named on the command line.
 

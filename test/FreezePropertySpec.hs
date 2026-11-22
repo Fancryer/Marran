@@ -406,6 +406,7 @@ hasVarOrRebind = \case
   TEPropAccess e _ -> hasVarOrRebind e
   TEIfElse p t f -> any hasVarOrRebind [p, t, f]
   TEAnnot e _ -> hasVarOrRebind e
+  TEWith e _ _ -> hasVarOrRebind e
   _ -> False
 
 propHasVar :: TERecordProp -> Bool
@@ -611,6 +612,7 @@ genExpr depth
           <*> genExpr (depth - 1)
           <*> genExpr (depth - 1)
       , TEAnnot <$> genExpr (depth - 1) <*> pure TInt
+      , TEWith <$> genExpr (depth - 1) <*> pure [] <*> pure False
       ]
 
 genLambda :: Int -> Gen Lambda

@@ -49,6 +49,61 @@ bSpec = do
     it "binds every listed name exactly once" $ do
       length initialNames `shouldBe` length Builtins.names
 
+  describe "a lambda argument checked against its parameter" $ do
+    it "reads a field of an element that only the array names" $ do
+      -- `map {i = i@price}` has no type on its own: `i` is a variable until
+      -- `items` says the element is an `Item`, and a field access on an
+      -- unknown type is not typeable.  The argument is read against the arrow
+      -- `map` expects, so `i` has the record's fields while its body is
+      -- checked.
+      r <- check $ T.unlines
+        [ "type Item = #{val price : Int; val name : String}"
+        , ""
+        , "funct items () : [Item] = [#{val price = 1; val name = 'a'}]"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (map {i = i@price} (items ()));"
+        , "  sayn (filter {i = i@price `<` 2} (items ()))"
+        ]
+      r `shouldBe` Right ()
+
+    it "leaves the row of an arrow the two arguments share" $ do
+      -- `compose` gives both its functions the same row, and the first lambda
+      -- is pure: the row must stay free until the second lambda says it
+      -- performs `Output`, or a legal program would be rejected.
+      r <- check $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn (compose {x = x} {x = sayn x; x} 5)"
+        ]
+      r `shouldBe` Right ()
+
+    it "rejects a field the element does not have" $ do
+      -- The same checking mode must not turn a wrong field into a silent
+      -- success: the parameter is a known record, so the field is looked up in
+      -- it.
+      r <- check $ T.unlines
+        [ "type Item = #{val price : Int}"
+        , ""
+        , "funct items () : [Item] = [#{val price = 1}]"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (map {i = i@name} (items ()))"
+        ]
+      r `shouldBe` Left "E0015"
+
+    it "checks the result against the arrow's result" $ do
+      -- `filter` wants a `Boolean`, so a projection of a number is not a
+      -- predicate even though it type-checks on its own.
+      r <- check $ T.unlines
+        [ "type Item = #{val price : Int}"
+        , ""
+        , "funct items () : [Item] = [#{val price = 1}]"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (filter {i = i@price} (items ()))"
+        ]
+      r `shouldBe` Left "E0003"
+
   describe "builtins that used to be missing" $ do
     it "runs `pred`" $ do
       r <- check $ T.unlines

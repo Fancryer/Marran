@@ -10,8 +10,8 @@ import qualified Data.Text as T
 import Test.Hspec
 
 import qualified Ast
-import Ast (Typ (..), pattern EAnnot, pattern EApply, pattern EName)
-import Ast (Module(..), ModuleHeader(..), ExportDecl(..), DeclKind(..), headerExportsAll)
+import Ast (Typ (..), TypeArg (..), TypeApps (..), EffApps (..), pattern EAnnot, pattern EApply, pattern EName, pattern EWith)
+import Ast (Module(..), ModuleHeader(..), ExportDecl(..), DeclKind(..), headerExportsAll, TopLevelStat(..), EffRow(..))
 import Lexer (Keyword (..), Token (..))
 import Parser (chunk, parseFromTextNamed, parseTokensUnposed)
 import Suite (withModuleHeader)
@@ -74,6 +74,12 @@ pSpec = do
       lexemes "!= 1 2" `shouldBe` Right [TName "!=", TInt 1, TInt 2]
       lexemes "a = 1" `shouldBe` Right [TName "a", TAssign, TInt 1]
 
+    it "reads `as` as a keyword" $ do
+      -- `as` renames in exports, imports and patterns; it is not a name that a
+      -- program may bind or apply.
+      lexemes "as" `shouldBe` Right [TKW KWAs]
+      lexemes "`as" `shouldBe` Right [TTVar "as"]
+
   describe "annotations" $ do
     it "parses `e : T` around the whole expression" $ do
       -- The annotation is looser than application: `f x : Int` is
@@ -101,6 +107,33 @@ pSpec = do
         [ "error[E0013]: unexpected `val`"
         , " --> demo.marr:2:3"
         ]
+
+  describe "type arguments of `with`" $ do
+    it "binds the argument to the name, not to the application" $ do
+      -- `parse with [Int] s` is `(parse with [Int]) s`: the representation
+      -- travels with the name, so the interpreter can hand it to the native
+      -- before the real argument arrives.
+      case parseFromTextNamed "demo.marr" exp_ "parse with [Int] s" of
+        Left e -> expectationFailure e
+        Right (EApply (EWith (EName "parse") (TypeApps [TAFlat "Int"]) (EffApps [] [])) (EName "s")) ->
+          pure ()
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
+
+    it "also accepts the `#[...]` spelling" $ do
+      case parseFromTextNamed "demo.marr" exp_ "loop with #[Int] 5" of
+        Left e -> expectationFailure e
+        Right (EApply (EWith (EName "loop") (TypeApps [TAFlat "Int"]) (EffApps [] [])) _) -> pure ()
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
+
+    it "reads a parenthesised pair type inside the brackets" $ do
+      -- `nil` consumes `(` before it learns the parentheses are not empty, so
+      -- the type atom has to backtrack; without that, every `[(T1, T2)]`
+      -- argument failed at the `T1`.
+      case parseFromTextNamed "demo.marr" exp_ "parse with [(Int, String)] s" of
+        Left e -> expectationFailure e
+        Right (EApply (EWith _ (TypeApps [TAParen (TAPair (TAFlat "Int") (TAFlat "String"))]) _) _) ->
+          pure ()
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
 
   describe "match and patterns" $ do
     it "parses the clauses of a match, each with its own block" $ do
@@ -184,6 +217,32 @@ pSpec = do
     it "does not accept a keyword as a module name" $ do
       ls <- parseFailureRaw "module funct\n"
       take 1 ls `shouldBe` ["error[E0013]: unexpected `funct`"]
+
+  describe "a function's result type" $ do
+    it "reads a bare type variable as the result, not as a row" $ do
+      -- `: `T = ...` used to take the variable for the effect row and then
+      -- demand a result type after it, so a function whose result is a type
+      -- variable did not parse without a row in front of it.
+      case parseFromTextNamed "demo.marr" chunk . withModuleHeader $ T.unlines
+        [ "funct unwrap_or (default `T) (m Maybe#[`T]) : `T ="
+        , "  default"
+        ] of
+        Left e -> expectationFailure e
+        Right (Module _ [FunctDef _ _ _ _ _ row out _]) -> do
+          row `shouldBe` Nothing
+          out `shouldBe` TVar "T"
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
+
+    it "still reads a leading name as a row when a type follows it" $ do
+      case parseFromTextNamed "demo.marr" chunk . withModuleHeader $ T.unlines
+        [ "funct f () : `R () ="
+        , "  ()"
+        ] of
+        Left e -> expectationFailure e
+        Right (Module _ [FunctDef _ _ _ _ _ row out _]) -> do
+          row `shouldBe` Just (ERVar "R")
+          out `shouldBe` Ast.TNil
+        Right other -> expectationFailure $ "unexpected shape: " ++ show other
 
   describe "syntax errors" $ do
     it "reports an unexpected token with its code and position" $ do

@@ -34,7 +34,8 @@ module Builtins (
   moduleNames,
   namesOfModule,
   effectsOfModule,
-  moduleOf
+  moduleOf,
+  isTypeDirected
 ) where
 
 import Data.Text (Text)
@@ -47,6 +48,11 @@ data BuiltinKind =
     -- | An operation of a built-in effect.  The name of the effect is also the
     --   name of the module the operation comes from.
   | Op Text
+    -- | A value that needs its type argument at run time.  The checker sees
+    --   it as a polymorphic name and refuses a use without `with`; the
+    --   interpreter receives the representation of the type as a hidden first
+    --   argument.  `parse` is the first one.
+  | TypeDirected
   deriving (Eq, Ord, Show)
 
 data Builtin = Builtin {
@@ -156,6 +162,7 @@ builtins = [
     -- `1 === 1` as false: the two 1s are different values, even though they
     -- are equal.
     Builtin "Conv" "show" Native,
+    Builtin "Conv" "parse" TypeDirected,
     Builtin "Conv" "==" Native,
     Builtin "Conv" "===" Native,
     Builtin "Conv" "!=" Native,
@@ -247,3 +254,9 @@ moduleOf :: Text -> Maybe Text
 moduleOf n = case [m | Builtin m n' _ <- builtins, n' == n] of
   (m:_) -> Just m
   [] -> Nothing
+
+-- | Does this name need its type argument at run time?  A use without `with`
+--   is rejected by the checker, and `with` passes the type representation to
+--   the interpreter instead of erasing it.
+isTypeDirected :: Text -> Bool
+isTypeDirected n = any (\(Builtin _ n' k) -> n' == n && k == TypeDirected) builtins

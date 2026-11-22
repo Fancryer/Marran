@@ -370,6 +370,9 @@ nativeKind :: Builtin -> DeclKind
 nativeKind b = case bKind b of
   Op _ -> KindEffect
   Native -> KindFunct
+  -- A type-directed native is still a function to the checker: it is a value
+  -- applied to an argument, and only `with` changes how it is called.
+  TypeDirected -> KindFunct
 
 -- | The entries one name of a list asks for.
 --
@@ -453,12 +456,31 @@ enumValues enums local imp =
 localOf :: ExportDecl -> Text
 localOf ed = fromMaybe (edName ed) (edAlias ed)
 
+-- | The table a module without an export list offers: everything it declares
+--   and everything it imported from another module.
+--
+--   A native name is the exception.  `import @native` is how a file gets
+--   `sayn` and `map` for itself; it is not a promise to pass them on, and a
+--   module that re-exported the whole native scope would make its importers
+--   depend on which builtins it happened to use.  A module that wants an
+--   importer to see a native name writes an export list and names it there --
+--   which is also the moment the rest of its interface becomes explicit.
+offerByDefault :: Table -> Table -> Table
+offerByDefault own imported = mergeTables own (Map.mapMaybe keep imported)
+  where
+    keep imps = case filter (not . native) imps of
+      [] -> Nothing
+      kept -> Just kept
+
+    native (Imported (FromNative _) _ _) = True
+    native _ = False
+
 -- | The table a module offers, as far as the tables known so far allow.  A name
 --   its export list asks for and nothing provides is dropped, not reported: the
 --   strict pass does the reporting once the whole component has settled.
 publishOf :: Map FilePath Node -> Map FilePath Table -> FilePath -> Table
 publishOf nodes tables p = case mhExports (Ast.modHeader (nChunk n)) of
-    Nothing -> mergeTables own imported
+    Nothing -> offerByDefault own imported
     Just decls -> tableFromList
       [ entry
       | ed <- decls
@@ -476,7 +498,7 @@ publishOf nodes tables p = case mhExports (Ast.modHeader (nChunk n)) of
 --   that names nothing the module has is an error here.
 strictPublish :: Map FilePath Node -> Map FilePath Table -> FilePath -> Either LoadError Table
 strictPublish nodes tables p = case mhExports (Ast.modHeader (nChunk n)) of
-    Nothing -> pure $ mergeTables own imported
+    Nothing -> pure $ offerByDefault own imported
     Just decls -> tableFromList . concat <$> traverse select decls
   where
     n = nodes Map.! p

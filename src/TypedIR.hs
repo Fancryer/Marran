@@ -16,6 +16,14 @@ module TypedIR(
   pattern TEPropAccess, pattern TEIfElse,
   pattern TEAnnot,
   pattern TEMatch,
+  pattern TEWith,
+  TypeRep(..),
+  TypeShape(..),
+  TypeRepProp(..),
+  typeRepOfTyp,
+  typeRepWithEnums,
+  enumCaseReps,
+  substTypeArgsInTyp,
   Pattern(..),
   PatternNode(..),
   MatchClause(..),
@@ -51,7 +59,8 @@ import Types (
     Expr,
     Taste,
     Mutability,
-    TypeArg,
+    TypeArg(..),
+    TARecordProp(..),
     LetPattern,
     EffRow,
     TypeScheme,
@@ -63,7 +72,9 @@ import Types (
     -- NativeLambdaSign(NativeLambdaSign),
     RowDef,
     EffCons, NativeLambdaSign (..), TasteMap,
-    Pattern(..), PatternNode(..), MatchClause(..), EnumDef(..), EnumCase(..)
+    Pattern(..), PatternNode(..), MatchClause(..), EnumDef(..), EnumCase(..),
+    typeArgToTyp, enumParams, enumCases, enumCaseName, enumCaseFields,
+    tasteName
   )
 import Data.Scientific (Scientific)
 import qualified Data.Text as T
@@ -75,8 +86,178 @@ import Resume (ResumeInfo)
 import Span (Span, noSpan, mergeSpan, mergeSpans)
 import Module (Module(..))
 import Data.Set (Set)
+import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 type TypeScope  = TextMap Typ
+
+-- | The run-time shape of a type.
+--
+--   A type argument used to stop at the checker: the interpreter saw no type
+--   at all.  A type-directed native such as @parse@ needs the type at run
+--   time, so @with@ now carries one through the typed IR as a 'TypeRep'.  The
+--   representation is nominal enough to build a value -- an enum keeps its
+--   name and its arguments -- and records not only each field's name but also
+--   how it is reached, because a @var@ field becomes a cell.
+--
+--   'TypeRep' is also the seed of a stable runtime representation for a future
+--   FFI: it describes a value without depending on the checker's 'Typ'.
+data TypeShape
+  = ShapeInt
+  | ShapeFloat
+  | ShapeBoolean
+  | ShapeString
+  | ShapeNil
+  | ShapeArray TypeRep
+  | ShapePair TypeRep TypeRep
+  | ShapeRecord [TypeRepProp]
+  | ShapeEnum Text [TypeArg]
+  | ShapeVar Text
+  | ShapeUnsupported Text
+  deriving (Eq, Ord, Show)
+
+data TypeRepProp = TypeRepProp {
+    trpMut  :: Mutability
+  , trpName :: Text
+  , trpTyp  :: TypeRep
+  } deriving (Eq, Ord, Show)
+
+-- | A type as the interpreter sees it.
+--
+--   'trEnums' holds the declarations of the enumerations reachable from the
+--   type.  A recursive enum is not expanded -- its fields are looked at only
+--   when a value is built, and the shape of a value is finite -- so the map is
+--   what lets a field of an enum name another enum after elaboration.
+data TypeRep = TypeRep {
+    trShape :: TypeShape
+  , trEnums :: Map Text EnumDef
+  } deriving (Eq, Ord, Show)
+
+instance Pretty TypeRep where
+  pretty (TypeRep s _) = prettyShape s
+
+prettyShape :: TypeShape -> Text
+prettyShape = \case
+  ShapeInt -> "Int"
+  ShapeFloat -> "Float"
+  ShapeBoolean -> "Boolean"
+  ShapeString -> "String"
+  ShapeNil -> "()"
+  ShapeArray t -> "[" <> pretty t <> "]"
+  ShapePair a b -> "(" <> pretty a <> ", " <> pretty b <> ")"
+  ShapeRecord props -> T.concat [
+      "#{",
+      T.intercalate "; "
+        [T.unwords [pretty m, n, ":", pretty t] | TypeRepProp m n t <- props],
+      "}"
+    ]
+  ShapeEnum n args ->
+    n <> if null args then "" else "#[" <> T.intercalate "; " (map pretty args) <> "]"
+  ShapeVar v -> "`" <> v
+  ShapeUnsupported what -> what
+
+-- | Build the run-time representation of a type.  The lookup supplies the
+--   declaration of an enumeration the type mentions; it is the checker's
+--   scope, so a private enum of the current module is the one it finds.
+typeRepOfTyp :: (Text -> Maybe EnumDef) -> Typ -> TypeRep
+typeRepOfTyp lookupEnum t =
+  let env = collectEnums lookupEnum t
+  in typeRepWithEnums env t
+
+-- | Build a representation against an already collected enum table.  The
+--   interpreter uses it for the field of an enum: the table travels with the
+--   outer 'TypeRep', so a value can be built without asking the checker again.
+typeRepWithEnums :: Map Text EnumDef -> Typ -> TypeRep
+typeRepWithEnums env t = TypeRep (shapeWith env t) env
+
+shapeWith :: Map Text EnumDef -> Typ -> TypeShape
+shapeWith env = \case
+  TInt -> ShapeInt
+  TFloat -> ShapeFloat
+  TBoolean -> ShapeBoolean
+  TString -> ShapeString
+  TNil -> ShapeNil
+  TArray el _ -> ShapeArray (typeRepWithEnums env el)
+  TPair a b _ -> ShapePair (typeRepWithEnums env a) (typeRepWithEnums env b)
+  TRecord props _ ->
+    ShapeRecord [TypeRepProp m n (typeRepWithEnums env t) | TRecordProp m n t <- props]
+  TEnum n args -> ShapeEnum n args
+  TVar v -> ShapeVar (tasteName v)
+  TFlat n -> ShapeUnsupported ("the opaque type `" <> n <> "`")
+  TNothing -> ShapeUnsupported "Nothing"
+  TFunct _ -> ShapeUnsupported "a function type"
+  TForall {} -> ShapeUnsupported "a polymorphic type"
+
+-- | Collect the declarations of every enumeration a type mentions, directly or
+--   through the fields of another enumeration.
+--
+--   The visited set is keyed by name: an enum that mentions itself stops the
+--   walk instead of expanding forever.  A recursive value is still built
+--   correctly, because only the value's text is recursive, not its type.
+collectEnums :: (Text -> Maybe EnumDef) -> Typ -> Map Text EnumDef
+collectEnums lookupEnum = go Set.empty
+  where
+    go seen = \case
+      TEnum n args ->
+        let fromArgs = Map.unions [go seen (typeArgToTyp a) | a <- args]
+        in case lookupEnum n of
+             Nothing -> fromArgs
+             Just def
+               | Set.member n seen -> fromArgs
+               | otherwise ->
+                   let seen' = Set.insert n seen
+                       sub = zip (enumParams def) args
+                       fields =
+                         [ substTypeArgsInTyp sub ft
+                         | c <- enumCases def, (_, _, ft) <- enumCaseFields c
+                         ]
+                   in Map.insert n def (Map.unions (fromArgs : map (go seen') fields))
+      TArray el _ -> go seen el
+      TPair a b _ -> Map.union (go seen a) (go seen b)
+      TFunct (Funct i o _) -> Map.union (go seen i) (go seen o)
+      TRecord props _ -> Map.unions [go seen t | TRecordProp _ _ t <- props]
+      _ -> Map.empty
+
+-- | The constructors of the enum a representation stands for, with each
+--   field's representation already substituted for the enum's type arguments.
+enumCaseReps :: TypeRep -> [(Text, [(Mutability, TypeRep)])]
+enumCaseReps rep =
+  case trShape rep of
+    ShapeEnum n args ->
+      case Map.lookup n (trEnums rep) of
+        Nothing -> []
+        Just def ->
+          let sub = zip (enumParams def) args
+          in [ (enumCaseName c,
+                [ (m, typeRepWithEnums (trEnums rep) (substTypeArgsInTyp sub ft))
+                | (m, _, ft) <- enumCaseFields c
+                ])
+             | c <- enumCases def ]
+    _ -> []
+
+-- | Substitute the type arguments of a declaration for its parameters.  The
+--   checker has the same operation in 'Infer'; this copy keeps the runtime
+--   representation independent of the checker.
+substTypeArgsInTyp :: [(Taste, TypeArg)] -> Typ -> Typ
+substTypeArgsInTyp su = go
+  where
+    go = \case
+      TVar v -> maybe (TVar v) typeArgToTyp (lookup v su)
+      TArray t r -> TArray (go t) r
+      TPair l r fx -> TPair (go l) (go r) fx
+      TFunct (Funct i o fxs) -> TFunct (Funct (go i) (go o) fxs)
+      TRecord props r -> TRecord [p {tTyp = go (tTyp p)} | p <- props] r
+      TEnum n args -> TEnum n (map goArg args)
+      TForall ts es rs els rls t -> TForall ts es rs els rls (go t)
+      t -> t
+    goArg = \case
+      TAVar v -> maybe (TAVar v) id (lookup v su)
+      TAArray t -> TAArray (goArg t)
+      TAPair l r -> TAPair (goArg l) (goArg r)
+      TAFunct i o -> TAFunct (goArg i) (goArg o)
+      TARecord props -> TARecord [TARecordProp m n (goArg t) | TARecordProp m n t <- props]
+      TAEnum n args -> TAEnum n (map goArg args)
+      t -> t
 
 -- | A value binding in the scope.  The pending row is the effect of forcing
 --   the delayed computation the name stands for (T-Var in the paper): the
@@ -150,6 +331,11 @@ data TypedExprNode =
   -- | @e : T@.  The annotation is transparent at run time: the expression is
   --   evaluated as if it were written alone.
   | TEAnnotNode TypedExpr Typ
+  -- | @e with [T]@: the expression, the run-time types of its type
+  --   arguments, and whether the interpreter must pass them to the value.
+  --   For an ordinary polymorphic name the types are erased and the flag is
+  --   false; a type-directed native such as @parse@ receives them.
+  | TEWithNode TypedExpr [TypeRep] Bool
   -- | @match e to clauses@: the subject, the type the whole form has, and the
   --   clauses, each with the patterns it accepts, an optional guard and the
   --   block it selects.
@@ -240,9 +426,15 @@ pattern TEMatch :: TypedExpr -> Typ -> [TMatchClause] -> TypedExpr
 pattern TEMatch e t cs <- MkTypedExpr _ (TEMatchNode e t cs) where
   TEMatch e t cs = MkTypedExpr (teSpan e) (TEMatchNode e t cs)
 
+-- | @e with [T]@.  The node is transparent: its type is the type of the
+--   expression it wraps, which already has the type arguments substituted.
+pattern TEWith :: TypedExpr -> [TypeRep] -> Bool -> TypedExpr
+pattern TEWith e reps passed <- MkTypedExpr _ (TEWithNode e reps passed) where
+  TEWith e reps passed = MkTypedExpr (teSpan e) (TEWithNode e reps passed)
+
 {-# COMPLETE TEInt, TEFloat, TEBoolean, TEString, TENil, TEXVar, TEArray
    , TEPair, TEXLambda, TENLambda, TEApply, TERecord, TEHandle, TEParen
-   , TEResume, TELet, TEPropAccess, TEIfElse, TEAnnot, TEMatch #-}
+   , TEResume, TELet, TEPropAccess, TEIfElse, TEAnnot, TEMatch, TEWith #-}
 
 -- | Move a typed expression to the given span.
 atTypedSpan :: Span -> TypedExpr -> TypedExpr
@@ -270,6 +462,7 @@ instance Show TypedExpr where
     TEPropAccess expr field -> "(Prop " <> show expr <> " " <> show field <> ")"
     TEIfElse cond thenExpr elseExpr -> "(If " <> show cond <> " " <> show thenExpr <> " " <> show elseExpr <> ")"
     TEAnnot e t -> "(Annot " <> show e <> " " <> show t <> ")"
+    TEWith e reps passed -> "(With " <> show e <> " " <> show reps <> " " <> show passed <> ")"
     TEMatch e t cs -> "(Match " <> show e <> " " <> show t <> " " <> show (length cs) <> ")"
 
 instance Pretty TypedExpr where
@@ -294,6 +487,8 @@ instance Pretty TypedExpr where
     -- PropAccess e n -> pretty e <> "@" <> n
     TEIfElse p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
     TEAnnot e t -> pretty e <> " : " <> pretty t
+    TEWith e reps _ ->
+      pretty e <> " with [" <> T.intercalate "; " (map pretty reps) <> "]"
     TEMatch e _ cs -> T.concat [
         "match ", pretty e, " to ", T.concat (map ((" " <>) . pretty) cs)
       ]
@@ -594,6 +789,7 @@ typeOfTypedExpr = \case
       r -> Left $ "PropAccess on non-record: " <> T.pack (show r)
   TEIfElse _ thenExpr _ -> typeOfTypedExpr thenExpr
   TEAnnot _ t -> Right t
+  TEWith e _ _ -> typeOfTypedExpr e
   -- The checker stores the type of the whole form in the node: every clause
   -- has that type already, and the clauses may be empty of a common subject.
   TEMatch _ t _ -> Right t

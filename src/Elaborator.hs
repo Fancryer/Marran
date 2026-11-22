@@ -301,6 +301,7 @@ renameAstTyp renames = go
     rename n = fromMaybe n (lookup n renames)
 
     go = \case
+      Ast.TNil -> Ast.TNil
       Ast.TFlat n -> Ast.TFlat (rename n)
       Ast.TArray t -> Ast.TArray (go t)
       Ast.TParen t -> Ast.TParen (go t)
@@ -318,6 +319,7 @@ renameAstApps :: [(Text, Text)] -> Ast.TypeApps -> Ast.TypeApps
 renameAstApps renames (Ast.TypeApps args) = Ast.TypeApps (map goArg args)
   where
     goArg = \case
+      Ast.TANil -> Ast.TANil
       Ast.TAFlat n -> Ast.TAFlat (fromMaybe n (lookup n renames))
       Ast.TAArray t -> Ast.TAArray (goArg t)
       Ast.TAParen t -> Ast.TAParen (goArg t)

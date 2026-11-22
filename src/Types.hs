@@ -246,7 +246,9 @@ data TRecordProp = TRecordProp {
   }
   deriving (Show, Eq, Ord)
 
-instance Pretty TRecordProp where pretty = T.pack . show
+instance Pretty TRecordProp where
+  pretty (TRecordProp m n t) =
+    T.unwords [pretty m, n, ":", pretty t]
 
 data EffRow =
   RClosed [EffCons]       -- Закрытый ряд: {Console; File}

@@ -210,6 +210,7 @@ token = choice [
     sym "=" TAssign,
     sym "_" TUnderscore,
     sym "->" TArrow,
+    kw "as" KWAs,
     kw "effect" KWEffect,
     kw "else" KWElse,
     kw "end" KWEnd,
@@ -336,7 +337,8 @@ instance Pretty Token where
     TNil      -> "()"
 
 data Keyword =
-  KWEffect
+  KWAs
+  | KWEffect
   | KWElse
   | KWEnd
   | KWEnum
@@ -365,6 +367,7 @@ data Keyword =
 
 instance Pretty Keyword where
   pretty = \case
+    KWAs      -> "as"
     KWEffect  -> "effect"
     KWElse    -> "else"
     KWEnd     -> "end"

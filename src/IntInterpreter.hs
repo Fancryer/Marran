@@ -42,21 +42,25 @@ import TypedIR (
     pattern TEPropAccess, pattern TEIfElse,
     pattern TEAnnot,
     pattern TEMatch,
+    pattern TEWith,
+    TypeRep(..), TypeShape(..), TypeRepProp(..),
+    typeRepWithEnums, enumCaseReps,
     TPattern(..), TPatternNode(..), TMatchClause(..),
     Lambda(..), Block, TERecordProp(..))
 import Control.Monad.State.Strict
-import Control.Monad (foldM, forM, forM_, void, unless, when, zipWithM)
+import Control.Monad (foldM, forM, forM_, void, unless, when, zipWithM, (>=>))
 import Infer (freezeMutability, freeze, freezeBlock, freezeLambda, touches)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import qualified Eff
 import qualified Parser
 import System.Random (randomIO, randomRIO)
-import Data.Char (chr)
+import Data.Char (chr, isAlpha, isAlphaNum, isDigit, isSpace)
 import System.CPUTime (getCPUTime)
 import Control.Concurrent (threadDelay)
 import Resume (ResumeInfo(..))
 import Text.Printf (printf)
+import Text.Read (readMaybe)
 import Data.Maybe (isJust, listToMaybe)
 import System.Environment (lookupEnv)
 import Control.Exception (AsyncException (..), IOException, evaluate, fromException, throwIO, try)
@@ -101,6 +105,14 @@ data Value
   | VClosure EnvId (Maybe (IntMap Address)) (Maybe Code) (Address -> Interp Address)
   | VThunk TypedExpr EnvId
   | VBThunk Block EnvId
+  -- | A run-time type, carried by @with@.  It is a value so that a
+  --   type-directed native can receive it as a hidden argument, and so that
+  --   @parse with [Int]@ can be stored, passed and applied like any function.
+  | VType IR.TypeRep
+  -- | A value waiting for its type arguments: @parse with [Int]@.  Applying it
+  --   first feeds the representations to the underlying function and then the
+  --   real argument.
+  | VTypeApp Address [IR.TypeRep]
   | VBottom
   -- deriving Show
 
@@ -118,6 +130,8 @@ instance Show Value where
     VClosure _ _ code _ -> T.unpack (codeName code)
     VThunk te _ -> "!vthunk" <> show te <> "!"
     VBThunk b _ -> "!bthunk" <> show b <> "!"
+    VType r -> concat ["(VType ", show (pretty r), ")"]
+    VTypeApp _ reps -> concat ["(VTypeApp ", show reps, ")"]
     VBottom -> "!bottom!"
 
 instance Pretty Value where
@@ -135,6 +149,8 @@ instance Pretty Value where
     VClosure _ _ code _ -> codeName code
     VThunk e _env -> T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> T.concat ["!vthunk: ", pretty b,"!"]
+    VType r -> pretty r
+    VTypeApp _ reps -> "<" <> T.intercalate " " (map pretty reps) <> ">"
     VBottom -> "⊥"
 
 instance Stringify Value where
@@ -176,6 +192,8 @@ instance Stringify Value where
     VClosure _ _ code _ -> pure $ codeName code
     VThunk e _env -> pure $ T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> pure $ T.concat ["!bthunk: ", pretty b,"!"]
+    VType r -> pure $ pretty r
+    VTypeApp _ reps -> pure $ T.concat ["<", T.intercalate " " (map pretty reps), ">"]
     VBottom -> pure "⊥"
 
 -- | A cell of the store.
@@ -927,6 +945,8 @@ describe = \case
   VClosure {} -> "a function"
   VThunk _ _ -> "an unevaluated expression"
   VBThunk _ _ -> "an unevaluated expression"
+  VType _ -> "a type"
+  VTypeApp _ _ -> "a function waiting for type arguments"
   VBottom -> "an undefined value"
 
 globalHandlers :: [HandlerFrame]
@@ -1201,6 +1221,9 @@ buildInitialEnv _cmdArgs = do
         fAddr' <- whnf fAddr
         v <- readCell fAddr'
         case v of
+          VTypeApp target reps -> do
+            g <- applyTypeArgs target reps
+            applyValue g argAddr
           VClosure env _ _ clos -> do
             oldEnv <- gets sEnv
             modify $ \s -> s {sEnv = env}
@@ -1278,7 +1301,7 @@ buildInitialEnv _cmdArgs = do
     alloc $ VArray (concat parts)
   zipAddr <- native2 "zip" $ \a b -> withArray "zip" a $ \as ->
     withArray "zip" b $ \bs -> do
-      pairs <- mapM (uncurry pairOf) (zip as bs)
+      pairs <- zipWithM pairOf as bs
       alloc $ VArray pairs
   atAddr <- native2 "at" $ \a i -> withArray "at" a $ \xs ->
     withInt "at" i $ \n ->
@@ -1313,6 +1336,18 @@ buildInitialEnv _cmdArgs = do
   showAddr <- native1 "show" $ \a -> do
     s <- force a >>= stringify
     alloc $ VString s
+
+  -- `parse with [T] s`: the checker made the type argument a hidden first
+  -- argument, so the native receives the representation and builds values of
+  -- that type.  A type that cannot be built is reported through `Error`, like
+  -- malformed input.
+  parseAddr <- nativeN "parse" 2 $ \case
+    [typeA, textA] -> do
+      rep <- valueOfArg typeA >>= \case
+        VType r -> pure r
+        other -> rtError $ "`parse` expected a type, but got " <> describe other
+      withString "parse" textA $ \s -> parseTextAs rep s
+    args -> arityError "parse" 2 args
 
   -- `==` and `!=` compare two values of one type structurally; `===` and
   -- `!==` compare the values themselves, so `1 === 1` is false: the two 1s are
@@ -1350,7 +1385,7 @@ buildInitialEnv _cmdArgs = do
           catchClause args k = case args of
             [msgAddr] -> do
               modify $ \s -> s {sKstack = kstack0, sEnv = env}
-              applyTo "try" onError msgAddr >>= \r -> whnf r >>= finishWithThen
+              applyTo "try" onError msgAddr >>= (whnf >=> finishWithThen)
             args -> arityError "error" 1 args
           handler = HandlerFrame
             handlerId
@@ -1444,6 +1479,7 @@ buildInitialEnv _cmdArgs = do
           ("fst", fstAddr),
           ("snd", sndAddr),
           ("show", showAddr),
+          ("parse", parseAddr),
           ("==", eqAddr),
           ("!=", neqAddr),
           ("===", refEqAddr),
@@ -1600,6 +1636,36 @@ makeClosureChain env name (argName:rest) block = pure $ \argAddr -> do
 allocClosure :: EnvId -> Maybe (IntMap Address) -> Code -> (Address -> Interp Address) -> Interp Address
 allocClosure env cache code fn = alloc (VClosure env cache (Just code) fn)
 
+-- | Apply the type arguments of a @with@ to a function, one `VType` at a
+--   time.  A type-directed native is a curried function whose first hidden
+--   argument is a `VType`, so ordinary application does the rest.
+applyTypeArgs :: Address -> [TypeRep] -> Interp Address
+applyTypeArgs f = foldM step f
+  where
+    step g rep = do
+      typeAddr <- alloc (VType rep)
+      applyValue g typeAddr
+
+-- | Apply a value to an argument, unwrapping pending type arguments first.
+--   Used where the callee may be the result of `with`, which the ordinary
+--   closure dispatch of 'TEApply' would otherwise reject.
+applyValue :: Address -> Address -> Interp Address
+applyValue fAddr argAddr = do
+  fAddr' <- whnf fAddr
+  v <- readCell fAddr'
+  case v of
+    VTypeApp target reps -> do
+      g <- applyTypeArgs target reps
+      applyValue g argAddr
+    VClosure env _ _ clos -> do
+      oldEnv <- gets sEnv
+      modify $ \s -> s {sEnv = env}
+      result <- clos argAddr
+      modify $ \s -> s {sEnv = oldEnv}
+      pure result
+    other ->
+      rtError $ "the left side of an application is not a function: it is " <> describe other
+
 -- | Run an action as if the interpreter stood at this node, so that a runtime
 --   error raised inside it points at the right place.  The previous position is
 --   restored afterwards: the caller is still evaluating its own node.
@@ -1666,6 +1732,11 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
       xAddr <- delayArg x
       v <- readCell fAddr
       case v of
+        -- `parse with [Int] s`: the type argument is applied first, then the
+        -- real argument.  `applyTypeArgs` builds one `VType` per argument.
+        VTypeApp target reps -> do
+          g <- applyTypeArgs target reps
+          applyValue g xAddr
         VClosure env' (Just cache) code clos -> do
           noMemo <- gets sNoMemo
           case (if noMemo then Nothing else IM.lookup (addrToInt xAddr) cache) of
@@ -1831,6 +1902,14 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
                     runClauses rest
       runClauses clauses
     TEAnnot e _ -> evalExpr e cont
+    TEWith e reps passed -> do
+      traceEval $ "evalExpr [TEWith] | types: " <> T.unpack (T.intercalate ", " (map pretty reps))
+      a <- evalExpr e pure
+      -- An ordinary polymorphic name erases its type arguments; a
+      -- type-directed native is applied to them first.
+      if passed
+        then cont =<< alloc (VTypeApp a reps)
+        else cont a
 
 -- | Mark a cell whose value is being computed, and report a cycle when the
 --   same cell is reached again before it has a value.
@@ -2591,6 +2670,224 @@ needsValue = \case
     ALPNil -> False
     ALPUnderscore -> False
 
+-- | A value read from text, before it is placed in the store.
+data ParsedValue
+  = ParsedInt Integer
+  | ParsedFloat Scientific
+  | ParsedBoolean Bool
+  | ParsedString Text
+  | ParsedUnit
+  | ParsedArray [ParsedValue]
+  | ParsedPair ParsedValue ParsedValue
+  | ParsedRecord [(Text, ParsedValue)]
+  | ParsedEnum Text [ParsedValue]
+
+-- | `parse with [T] s`: read @s@ as a value of the type described by @rep@.
+--
+--   A top-level `String` is the text itself, so `parse with [String] s` is the
+--   identity; a string inside an array, pair or record is quoted, with either
+--   quote character.  Aggregates use the same spelling as a value literal:
+--   @[1, 2]@, @(1, 2)@, @#{x = 1; y = 2}@, and an enum is @Con@ or
+--   @Con v1 v2@.
+parseTextAs :: TypeRep -> Text -> Interp Address
+parseTextAs rep text =
+  case trShape rep of
+    ShapeString | not (startsQuoted (T.unpack text)) ->
+      alloc (VString (T.strip text))
+    _ ->
+      case parseValueText (T.unpack text) of
+        Left msg -> callError ("`parse`: " <> msg)
+        Right (value, rest) ->
+          case skipSpaces rest of
+            [] -> buildParsedValue rep value
+            _ -> callError $ T.concat [
+                "`parse`: unexpected text after the value: `",
+                T.strip (T.pack rest), "`"
+              ]
+  where
+    startsQuoted s = case skipSpaces s of
+      (c:_) -> c == '"' || c == '\''
+      [] -> False
+
+-- | A small recursive-descent reader for the value syntax.  It is separated
+--   from the store so that a malformed input is reported as a diagnostic
+--   before any cell is allocated.
+parseValueText :: String -> Either Text (ParsedValue, String)
+parseValueText s0 =
+  case skipSpaces s0 of
+    [] -> Left "the value is empty"
+    (c:cs)
+      | c == '[' -> parseArray cs
+      | c == '(' -> parseParen cs
+      | c == '"' || c == '\'' -> parseQuoted c cs
+      | c == '#' -> case cs of
+          ('{':rest) -> parseRecord rest
+          _ -> Left "expected `{` after `#`"
+      | c == '-' || isDigit c -> parseNumber (c:cs)
+      | isAlpha c || c == '_' -> parseName (c:cs)
+      | otherwise -> Left ("unexpected character `" <> T.singleton c <> "`")
+
+parseArray :: String -> Either Text (ParsedValue, String)
+parseArray s =
+  case skipSpaces s of
+    (']':rest) -> Right (ParsedArray [], rest)
+    t -> go [] t
+  where
+    go acc t = do
+      (v, rest) <- parseValueText t
+      case skipSpaces rest of
+        (',':r) -> go (v:acc) r
+        (';':r) -> go (v:acc) r
+        (']':r) -> Right (ParsedArray (reverse (v:acc)), r)
+        _ -> Left "expected `,` or `]` in an array"
+
+parseParen :: String -> Either Text (ParsedValue, String)
+parseParen s =
+  case skipSpaces s of
+    (')':rest) -> Right (ParsedUnit, rest)
+    t -> do
+      (a, rest) <- parseValueText t
+      case skipSpaces rest of
+        (',':r) -> do
+          (b, rest') <- parseValueText r
+          case skipSpaces rest' of
+            (')':rest'') -> Right (ParsedPair a b, rest'')
+            _ -> Left "expected `)` after the second component of a pair"
+        _ -> Left "expected `,` in a pair"
+
+parseQuoted :: Char -> String -> Either Text (ParsedValue, String)
+parseQuoted quote = go []
+  where
+    go acc = \case
+      [] -> Left "unterminated string"
+      (c:rest)
+        | c == quote -> Right (ParsedString (T.pack (reverse acc)), rest)
+      ('\\':'n':rest) -> go ('\n':acc) rest
+      ('\\':'t':rest) -> go ('\t':acc) rest
+      ('\\':c:rest) -> go (c:acc) rest
+      (c:rest) -> go (c:acc) rest
+
+parseNumber :: String -> Either Text (ParsedValue, String)
+parseNumber s =
+  let (tok, rest) = span (\c -> isDigit c || c `elem` ("+-.eE" :: String)) s
+  in if any (`elem` (".eE" :: String)) tok
+       then case readMaybe tok :: Maybe Scientific of
+         Just f -> Right (ParsedFloat f, rest)
+         Nothing -> Left ("`" <> T.pack tok <> "` is not a number")
+       else case readMaybe tok :: Maybe Integer of
+         Just i -> Right (ParsedInt i, rest)
+         Nothing -> Left ("`" <> T.pack tok <> "` is not a number")
+
+parseName :: String -> Either Text (ParsedValue, String)
+parseName s =
+  let (name, rest) = span (\c -> isAlphaNum c || c == '_' || c == '.') s
+  in case name of
+       "true" -> Right (ParsedBoolean True, rest)
+       "false" -> Right (ParsedBoolean False, rest)
+       _ -> do
+         (args, rest') <- parseArgs [] rest
+         Right (ParsedEnum (T.pack name) args, rest')
+  where
+    parseArgs acc t =
+      case skipSpaces t of
+        [] -> Right (reverse acc, [])
+        (c:_)
+          | c `elem` (",]);}" :: String) -> Right (reverse acc, t)
+        _ -> do
+          (v, rest) <- parseValueText t
+          parseArgs (v:acc) rest
+
+parseRecord :: String -> Either Text (ParsedValue, String)
+parseRecord s = go [] (skipSpaces s)
+  where
+    go acc t = case t of
+      ('}':rest) -> Right (ParsedRecord (reverse acc), rest)
+      _ -> do
+        let (word, afterWord) = span (\c -> isAlphaNum c || c == '_') t
+        -- A field may carry the mutability word of a record type; it is not
+        -- part of the value's syntax, so it is skipped.
+        let (name, afterName) =
+              if word `elem` ["val", "var", "imm"]
+                then span (\c -> isAlphaNum c || c == '_') (skipSpaces afterWord)
+                else (word, afterWord)
+        if null name
+          then Left "expected a record field name"
+          else case skipSpaces afterName of
+            ('=':r) -> do
+              (v, rest) <- parseValueText r
+              case skipSpaces rest of
+                (';':r') -> go ((T.pack name, v):acc) (skipSpaces r')
+                (',':r') -> go ((T.pack name, v):acc) (skipSpaces r')
+                ('}':r') -> Right (ParsedRecord (reverse ((T.pack name, v):acc)), r')
+                _ -> Left "expected `;` or `}` after a record field"
+            _ -> Left "expected `=` after a record field name"
+
+skipSpaces :: String -> String
+skipSpaces = dropWhile isSpace
+
+-- | Put a parsed value in the store, checking it against the type.
+buildParsedValue :: TypeRep -> ParsedValue -> Interp Address
+buildParsedValue rep value =
+  case (trShape rep, value) of
+    (ShapeInt, ParsedInt i) -> alloc (VInt i)
+    (ShapeFloat, ParsedInt i) -> alloc (VFloat (fromInteger i))
+    (ShapeFloat, ParsedFloat f) -> alloc (VFloat f)
+    (ShapeBoolean, ParsedBoolean b) -> alloc (VBoolean b)
+    (ShapeString, ParsedString s) -> alloc (VString s)
+    (ShapeNil, ParsedUnit) -> alloc VNil
+    (ShapeArray el, ParsedArray xs) ->
+      alloc . VArray =<< mapM (buildParsedValue el) xs
+    (ShapePair a b, ParsedPair x y) -> do
+      x' <- buildParsedValue a x
+      y' <- buildParsedValue b y
+      alloc (VPair x' y')
+    (ShapeRecord props, ParsedRecord fields) -> buildRecord props fields
+    (ShapeEnum _ _, ParsedEnum n args) ->
+      case lookup n (enumCaseReps rep) of
+        Nothing -> callError $ "`parse`: `" <> n <> "` is not a constructor of " <> pretty rep
+        Just fieldReps
+          | length fieldReps /= length args ->
+              callError $ T.concat [
+                  "`parse`: `", n, "` takes ", T.pack (show (length fieldReps)),
+                  " field(s), but the text supplies ", T.pack (show (length args))
+                ]
+          | otherwise -> do
+              addrs <- zipWithM (\(m, t) v -> (m,) <$> buildParsedValue t v) fieldReps args
+              alloc (VEnum n addrs)
+    (ShapeVar v, _) ->
+      callError $ T.concat [
+          "`parse`: the type variable `", v,
+          "` is not known at run time, so no value can be built"
+        ]
+    (ShapeUnsupported what, _) ->
+      callError $ "`parse`: cannot build a value of " <> what
+    _ -> callError $ "`parse`: the text is not a value of type " <> pretty rep
+
+buildRecord :: [TypeRepProp] -> [(Text, ParsedValue)] -> Interp Address
+buildRecord props fields = do
+  let wanted = Set.fromList (map trpName props)
+      given = Set.fromList (map fst fields)
+      fieldMap = Map.fromList fields
+  when (length fieldMap /= length fields) $
+    void $ callError "`parse`: a record field is given twice"
+  when (wanted /= given) $
+    void $ callError $ T.concat [
+        "`parse`: the record fields do not match the type; expected ",
+        T.intercalate ", " (Set.toList wanted),
+        ", got ", T.intercalate ", " (Set.toList given)
+      ]
+  triples <- forM props $ \p -> do
+    let fieldValue = case Map.lookup (trpName p) fieldMap of
+          Just v -> v
+          Nothing -> ParsedUnit
+    addr <- buildParsedValue (trpTyp p) fieldValue
+    pure (trpMut p, trpName p, addr)
+  eid <- newEnv Env {
+      bindings = Map.fromList [(n, (m, a)) | (m, n, a) <- triples],
+      parent = Nothing
+    }
+  alloc (VRecord eid)
+
 -- | A constructor of a declared enumeration, as a curried function.
 --
 --   `Some 5` is an ordinary application: the checker binds every constructor
@@ -2742,6 +3039,7 @@ equalValues seen a b
         (VBoolean x, VBoolean y) -> pure $ x == y
         (VString x, VString y) -> pure $ x == y
         (VNil, VNil) -> pure True
+        (VType x, VType y) -> pure (x == y)
         (VArray xs, VArray ys)
           | length xs == length ys -> and <$> zipWithM (equalValues seen') xs ys
           | otherwise -> pure False

@@ -460,6 +460,48 @@ iSpec = describe "imports" $ do
       ]
     printed r `shouldBe` Right ["ok"]
 
+  it "offers a native name its export list names" $ do
+    -- The valve for the rule below: a module that wants an importer to see a
+    -- builtin writes it in the export list, and it travels with the rest of
+    -- the interface.  The rename makes the point: `Main` calls `m`, and only
+    -- `Loud` can have offered it under that spelling.
+    let loud = T.unlines
+          [ "module Loud [funct run funct map]"
+          , "import @native"
+          , ""
+          , "funct run () : [Int] = map {x = + x 1} [1, 2]"
+          ]
+    r <- runFiles [ ("loud.marr", loud) ] $ T.unlines
+      [ "module Main"
+      , "import @native"
+      , "import loud [funct run funct map as m]"
+      , ""
+      , "funct main () : {Output} () = sayn (m {x = * x 2} (run ()))"
+      ]
+    printed r `shouldBe` Right ["[4, 6]"]
+
+  it "does not offer the native names it imported for itself" $ do
+    -- A file without an export list passes on what it declares and what it
+    -- imported from another file.  `import @native` is how a file gets `sayn`
+    -- for itself, not a promise to offer it, so an importer that asks for the
+    -- name is told the source does not have it.
+    let quiet = T.unlines
+          [ "module Quiet"
+          , "import @native"
+          , ""
+          , "funct one () : Int = 1"
+          ]
+    r <- runFiles [ ("quiet.marr", quiet) ] $ T.unlines
+      [ "module Main"
+      , "import quiet [funct sayn]"
+      , ""
+      , "funct main () : () = ()"
+      ]
+    case r of
+      Left err -> err `shouldSatisfy`
+        ("is not offered by the module `quiet.marr`" `isInfixOf`)
+      Right _ -> expectationFailure "a native name must not be re-exported by default"
+
   it "brings the constructors of an enumeration with its name" $ do
     -- `Colour` in a signature and `#Red` in a pattern are not enough: an
     -- expression has to be able to write `Red`, so the export list names the

@@ -341,6 +341,9 @@ buildNativeScope visible _args = do
   boundWhnf <- freshBoundM
 
   boundError <- freshBoundM
+  -- `parse` is the first type-directed builtin: its type argument is the type
+  -- of the value it returns, and `with` supplies it at the call site.
+  boundParse <- freshBoundM
   -- `exit` never returns, so its result is the bottom of every type.
   boundExit <- freshBoundM
 
@@ -689,6 +692,11 @@ buildNativeScope visible _args = do
         -- type cannot express: the call is charged as if it may, and a program
         -- that asserts inside `under Error to ...` pays for the handler.
         , native "assert" (TFunct $ Funct TBoolean (TFunct $ Funct TString TNil Eff.fxError) Eff.empty)
+        -- `parse with [T] s`: the type argument is the type of the result.
+        -- It is a hidden argument at run time (see `Builtins.TypeDirected`),
+        -- so the visible type is a plain `String -> {Error} `T`.
+        , quantified "parse" [boundParse] $
+            TFunct $ Funct TString (TVar boundParse) Eff.fxError
         ]
 
       flatNames = map (\(n, _, _, _) -> n) (entries <> polyEntries)
