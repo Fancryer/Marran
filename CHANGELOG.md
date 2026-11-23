@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## 0.2.2.0 - 2026-11-23
+
+Explicit type application and the first type-directed native arrive together:
+`with` now works without a `forall` in the type, and `parse` uses it to know
+the type it has to build.  Imports gain a re-export rule, so a module can say
+which of its names an importer sees.
+
+- `with` no longer requires a `TForall`: `TypedIR.TEWith` carries a `TypeRep`,
+  and the checker resolves the scheme of the name, substitutes the explicit
+  arguments and instantiates the rest.  Names and effect operations take type
+  arguments; the old path stays for non-names.  `with [T]` and `with #[T]` are
+  the same, and the argument is attached to the name, so `parse with [Int] s`
+  is `(parse with [Int]) s`.
+- `parse` is the first type-directed native (`Conv@parse`).  It reads Int,
+  Float, Boolean, String, `()`, arrays, pairs, records and enums from text.
+  The checker sees a polymorphic scheme and requires `with`; a type it cannot
+  build is a static error, and a type variable is a run-time `E0020`, because
+  the interpreter no longer has the type.
+- The parser backtracks a `nil` in a type argument, so `with [(Int, String)]`
+  parses as a pair type.  `as` is a keyword.
+- A file without an export list offers what it declares and what it imported
+  from another file.  The native names it imported for itself are not passed
+  on: `import @native` is how a file gets `sayn` and `map` for itself, not a
+  promise to pass them to an importer, which names what it wants to share.
+- The checker reads a lambda argument against the arrow it is passed to, so
+  `map {i = i@price}` sees the fields of the element before the array is
+  known.
+- `Pretty TRecordProp` prints a property as `val name : type` instead of its
+  `Show` form.
+- `app/modules.marr` is removed.  It was marked deprecated, and the module
+  system replaces it.
+
+Known limitations of the 0.2 line remain open in `docs/todo.md`: the soundness
+of the `Cell` analysis and the completeness of `freeze`.
+
+Tests: 483 examples, 0 failures.
+
 ## 0.2.0.0 - 2026-11-14
 
 The 0.2 line drops the paper and the talk from the project and concentrates on

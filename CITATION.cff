@@ -8,8 +8,8 @@ authors:
     alias: "Fancryer"
     orcid: "https://orcid.org/0009-0003-1304-0984"
     affiliation: "University of Electronic Science and Technology of China"
-version: 0.2.0.0
-date-released: "2026-11-14"
+version: 0.2.2.0
+date-released: "2026-11-23"
 license: BSD-3-Clause
 repository-code: https://github.com/Fancryer/Marran
 abstract: >-
