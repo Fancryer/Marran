@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1480"
+     viewBox="0 0 1280 1480" role="img" aria-labelledby="roadmap-title roadmap-desc">
+  <title id="roadmap-title">Mårran 0.2 release roadmap</title>
+  <desc id="roadmap-desc">Seven themes from 0.2.3.0 to 0.2.9.9: correctness and names,
+    configuration and artifacts, LSP and guide, standard library core and containers,
+    text and data, system and network, ecosystem.</desc>
+
+  <style>
+    text {
+      font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      fill: #141412;
+    }
+    .mono {
+      font-family: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    .eyebrow { font-size: 11.5px; letter-spacing: 3.4px; fill: #8C8C84; font-weight: 600; }
+    .title { font-size: 52px; font-weight: 600; letter-spacing: -1.6px; }
+    .subtitle { font-size: 15.5px; fill: #6E6E67; }
+    .sub-mono { font-size: 13.5px; fill: #4A4A44; letter-spacing: 0; }
+    .version { font-size: 27px; font-weight: 600; letter-spacing: -0.6px; }
+    .range { font-size: 11px; fill: #8A8A82; }
+    .theme { font-size: 21px; font-weight: 600; letter-spacing: -0.3px; }
+    .desc { font-size: 14.5px; fill: #66665E; }
+    .chip { fill: #F1F0EA; }
+    .chip-ver { font-size: 10.5px; fill: #3F3F3A; font-weight: 600; }
+    .chip-label { font-size: 10.5px; fill: #66665E; font-weight: 400; }
+    .legend { font-size: 12.5px; fill: #6E6E67; }
+    .footer { font-size: 12px; fill: #8A8A82; }
+    .inline-mono { font-size: 13px; }
+  </style>
+
+  <rect width="1280" height="1480" fill="#FAFAF7"/>
+
+  <!-- Header -->
+  <text x="72" y="96" class="eyebrow">MÅRRAN / 0.2</text>
+  <text x="72" y="152" class="title">Release roadmap</text>
+  <text x="72" y="190" class="subtitle">Seven themes, one frozen syntax, P0 first.
+    <tspan class="mono sub-mono">0.2.3.0 → 0.2.9.9</tspan></text>
+
+  <!-- Legend -->
+  <g class="legend">
+    <circle cx="900" cy="100" r="4" fill="#B45309"/>
+    <text x="916" y="104">Foundation · 0.2.3</text>
+    <circle cx="900" cy="126" r="4" fill="#1D4ED8"/>
+    <text x="916" y="130">Tooling · 0.2.4–0.2.5</text>
+    <circle cx="900" cy="152" r="4" fill="#047857"/>
+    <text x="916" y="156">Standard library · 0.2.6–0.2.8</text>
+    <circle cx="900" cy="178" r="4" fill="#6D28D9"/>
+    <text x="916" y="182">Ecosystem · 0.2.9</text>
+  </g>
+
+  <line x1="72" y1="226" x2="1208" y2="226" stroke="#D8D7CF" stroke-width="1.5"/>
+
+  <!-- Row separators -->
+  <g stroke="#ECEBE4" stroke-width="1">
+    <line x1="72" y1="420" x2="1208" y2="420"/>
+    <line x1="72" y1="580" x2="1208" y2="580"/>
+    <line x1="72" y1="740" x2="1208" y2="740"/>
+    <line x1="72" y1="900" x2="1208" y2="900"/>
+    <line x1="72" y1="1060" x2="1208" y2="1060"/>
+    <line x1="72" y1="1220" x2="1208" y2="1220"/>
+  </g>
+
+  <!-- Timeline -->
+  <line x1="300" y1="280" x2="300" y2="1392" stroke="#DDDCD5" stroke-width="2"/>
+  <path d="M295 1398 L300 1405 L305 1398" fill="none" stroke="#DDDCD5" stroke-width="2"/>
+
+  <!-- 0.2.3 -->
+  <rect x="56" y="314" width="3" height="52" rx="1.5" fill="#B45309"/>
+  <circle cx="300" cy="340" r="11" fill="#FAFAF7" stroke="#B45309" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="300" cy="340" r="5" fill="#B45309"/>
+  <text x="72" y="334" class="mono version">0.2.3</text>
+  <text x="72" y="356" class="mono range">0.2.3.0 – 0.2.3.2</text>
+  <text x="340" y="316" class="theme">Correctness &amp; names</text>
+  <text x="340" y="342" class="desc">P0 closed, qualified names in every namespace, syntax frozen for the line.</text>
+  <g>
+    <rect class="chip" x="340" y="360" width="92" height="22" rx="11"/>
+    <text x="350" y="375" class="mono chip-ver">0.2.3.0<tspan class="chip-label" dx="5">P0</tspan></text>
+    <rect class="chip" x="440" y="360" width="115" height="22" rx="11"/>
+    <text x="450" y="375" class="mono chip-ver">0.2.3.1<tspan class="chip-label" dx="5">Names</tspan></text>
+    <rect class="chip" x="563" y="360" width="122" height="22" rx="11"/>
+    <text x="573" y="375" class="mono chip-ver">0.2.3.2<tspan class="chip-label" dx="5">Freeze</tspan></text>
+  </g>
+
+  <!-- 0.2.4 -->
+  <rect x="56" y="474" width="3" height="52" rx="1.5" fill="#1D4ED8"/>
+  <circle cx="300" cy="500" r="11" fill="#FAFAF7" stroke="#1D4ED8" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="300" cy="500" r="5" fill="#1D4ED8"/>
+  <text x="72" y="494" class="mono version">0.2.4</text>
+  <text x="72" y="516" class="mono range">0.2.4.0 – 0.2.4.2</text>
+  <text x="340" y="476" class="theme">Configuration &amp; artifacts</text>
+  <text x="340" y="502" class="desc"><tspan class="mono inline-mono">marr.ilyn</tspan>, a real CLI, phase dumps and <tspan class="mono inline-mono">.marr.iface</tspan> — the base for tooling.</text>
+  <g>
+    <rect class="chip" x="340" y="520" width="115" height="22" rx="11"/>
+    <text x="350" y="535" class="mono chip-ver">0.2.4.0<tspan class="chip-label" dx="5">Config</tspan></text>
+    <rect class="chip" x="463" y="520" width="96" height="22" rx="11"/>
+    <text x="473" y="535" class="mono chip-ver">0.2.4.1<tspan class="chip-label" dx="5">CLI</tspan></text>
+    <rect class="chip" x="567" y="520" width="146" height="22" rx="11"/>
+    <text x="577" y="535" class="mono chip-ver">0.2.4.2<tspan class="chip-label" dx="5">Interfaces</tspan></text>
+  </g>
+
+  <!-- 0.2.5 -->
+  <rect x="56" y="634" width="3" height="52" rx="1.5" fill="#1D4ED8"/>
+  <circle cx="300" cy="660" r="11" fill="#FAFAF7" stroke="#1D4ED8" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="300" cy="660" r="5" fill="#1D4ED8"/>
+  <text x="72" y="654" class="mono version">0.2.5</text>
+  <text x="72" y="676" class="mono range">0.2.5.0 – 0.2.5.2</text>
+  <text x="340" y="636" class="theme">LSP &amp; guide I</text>
+  <text x="340" y="662" class="desc">Diagnostics, hover, definition and completion, then the first part of the guide.</text>
+  <g>
+    <rect class="chip" x="340" y="680" width="121" height="22" rx="11"/>
+    <text x="350" y="695" class="mono chip-ver">0.2.5.0<tspan class="chip-label" dx="5">LSP MVP</tspan></text>
+    <rect class="chip" x="469" y="680" width="115" height="22" rx="11"/>
+    <text x="479" y="695" class="mono chip-ver">0.2.5.1<tspan class="chip-label" dx="5">LSP v1</tspan></text>
+    <rect class="chip" x="592" y="680" width="121" height="22" rx="11"/>
+    <text x="602" y="695" class="mono chip-ver">0.2.5.2<tspan class="chip-label" dx="5">Guide I</tspan></text>
+  </g>
+
+  <!-- 0.2.6 -->
+  <rect x="56" y="794" width="3" height="52" rx="1.5" fill="#047857"/>
+  <circle cx="300" cy="820" r="11" fill="#FAFAF7" stroke="#047857" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="300" cy="820" r="5" fill="#047857"/>
+  <text x="72" y="814" class="mono version">0.2.6</text>
+  <text x="72" y="836" class="mono range">0.2.6.0 – 0.2.6.2</text>
+  <text x="340" y="796" class="theme">stdlib: core &amp; containers</text>
+  <text x="340" y="822" class="desc">prelude, maybe, either, ordering; array, list, map, set and iter.</text>
+  <g>
+    <rect class="chip" x="340" y="840" width="108" height="22" rx="11"/>
+    <text x="350" y="855" class="mono chip-ver">0.2.6.0<tspan class="chip-label" dx="5">Core</tspan></text>
+    <rect class="chip" x="456" y="840" width="146" height="22" rx="11"/>
+    <text x="466" y="855" class="mono chip-ver">0.2.6.1<tspan class="chip-label" dx="5">Containers</tspan></text>
+    <rect class="chip" x="610" y="840" width="108" height="22" rx="11"/>
+    <text x="620" y="855" class="mono chip-ver">0.2.6.2<tspan class="chip-label" dx="5">Docs</tspan></text>
+  </g>
+
+  <!-- 0.2.7 -->
+  <rect x="56" y="954" width="3" height="52" rx="1.5" fill="#047857"/>
+  <circle cx="300" cy="980" r="11" fill="#FAFAF7" stroke="#047857" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="300" cy="980" r="5" fill="#047857"/>
+  <text x="72" y="974" class="mono version">0.2.7</text>
+  <text x="72" y="996" class="mono range">0.2.7.0 – 0.2.7.2</text>
+  <text x="340" y="956" class="theme">stdlib: text &amp; data</text>
+  <text x="340" y="982" class="desc">text, bytes, encoding, parse, format; json, csv, regex, math, sort and random.</text>
+  <g>
+    <rect class="chip" x="340" y="1000" width="108" height="22" rx="11"/>
+    <text x="350" y="1015" class="mono chip-ver">0.2.7.0<tspan class="chip-label" dx="5">Text</tspan></text>
+    <rect class="chip" x="456" y="1000" width="108" height="22" rx="11"/>
+    <text x="466" y="1015" class="mono chip-ver">0.2.7.1<tspan class="chip-label" dx="5">Data</tspan></text>
+    <rect class="chip" x="572" y="1000" width="108" height="22" rx="11"/>
+    <text x="582" y="1015" class="mono chip-ver">0.2.7.2<tspan class="chip-label" dx="5">Docs</tspan></text>
+  </g>
+
+  <!-- 0.2.8 -->
+  <rect x="56" y="1114" width="3" height="52" rx="1.5" fill="#047857"/>
+  <circle cx="300" cy="1140" r="11" fill="#FAFAF7" stroke="#047857" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="300" cy="1140" r="5" fill="#047857"/>
+  <text x="72" y="1134" class="mono version">0.2.8</text>
+  <text x="72" y="1156" class="mono range">0.2.8.0 – 0.2.8.2</text>
+  <text x="340" y="1116" class="theme">stdlib: system, test &amp; network</text>
+  <text x="340" y="1142" class="desc">io, file, path, args, env, process, time; test, log, net and http.</text>
+  <g>
+    <rect class="chip" x="340" y="1160" width="121" height="22" rx="11"/>
+    <text x="350" y="1175" class="mono chip-ver">0.2.8.0<tspan class="chip-label" dx="5">System</tspan></text>
+    <rect class="chip" x="469" y="1160" width="126" height="22" rx="11"/>
+    <text x="479" y="1175" class="mono chip-ver">0.2.8.1<tspan class="chip-label" dx="5">Test/log</tspan></text>
+    <rect class="chip" x="603" y="1160" width="127" height="22" rx="11"/>
+    <text x="613" y="1175" class="mono chip-ver">0.2.8.2<tspan class="chip-label" dx="5">Network</tspan></text>
+  </g>
+
+  <!-- 0.2.9 -->
+  <rect x="56" y="1274" width="3" height="52" rx="1.5" fill="#6D28D9"/>
+  <circle cx="300" cy="1300" r="11" fill="#FAFAF7" stroke="#6D28D9" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="300" cy="1300" r="5" fill="#6D28D9"/>
+  <text x="72" y="1294" class="mono version">0.2.9</text>
+  <text x="72" y="1316" class="mono range">0.2.9.0 – 0.2.9.9</text>
+  <text x="340" y="1276" class="theme">Ecosystem</text>
+  <text x="340" y="1302" class="desc">Mörkö, the stdlib as packages, TUI, concurrency, UX polish and a graphics stretch.</text>
+  <g>
+    <rect class="chip" x="340" y="1320" width="108" height="22" rx="11"/>
+    <text x="350" y="1335" class="mono chip-ver">0.2.9.0<tspan class="chip-label" dx="5">Mörkö</tspan></text>
+    <rect class="chip" x="454" y="1320" width="126" height="22" rx="11"/>
+    <text x="464" y="1335" class="mono chip-ver">0.2.9.1<tspan class="chip-label" dx="5">Packages</tspan></text>
+    <rect class="chip" x="586" y="1320" width="96" height="22" rx="11"/>
+    <text x="596" y="1335" class="mono chip-ver">0.2.9.2<tspan class="chip-label" dx="5">TUI</tspan></text>
+    <rect class="chip" x="688" y="1320" width="146" height="22" rx="11"/>
+    <text x="698" y="1335" class="mono chip-ver">0.2.9.3<tspan class="chip-label" dx="5">Concurrency</tspan></text>
+    <rect class="chip" x="840" y="1320" width="92" height="22" rx="11"/>
+    <text x="850" y="1335" class="mono chip-ver">0.2.9.4<tspan class="chip-label" dx="5">UX</tspan></text>
+    <rect class="chip" x="938" y="1320" width="126" height="22" rx="11"/>
+    <text x="948" y="1335" class="mono chip-ver">0.2.9.5<tspan class="chip-label" dx="5">Graphics</tspan></text>
+    <rect class="chip" x="1070" y="1320" width="92" height="22" rx="11"/>
+    <text x="1080" y="1335" class="mono chip-ver">0.2.9.9<tspan class="chip-label" dx="5">RC</tspan></text>
+  </g>
+
+  <!-- Footer -->
+  <line x1="72" y1="1415" x2="1208" y2="1415" stroke="#D8D7CF" stroke-width="1.5"/>
+  <text x="72" y="1445" class="footer">P0 closed at 0.2.3.0 · syntax frozen at 0.2.3.2 · docs in English</text>
+  <text x="1208" y="1445" class="footer" text-anchor="end">Next → 0.3.0 · FFI</text>
+</svg>
