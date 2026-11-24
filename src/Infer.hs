@@ -1382,25 +1382,34 @@ substTypeArgs su = go
       t -> t
 
 -- | Does the value of this type hold a cell that inspecting it would read?
+--
+--   An enum is nominal, so its fields come from the declaration.  The visited
+--   set stops a recursive enum (`enum Nat | Succ (val n : Nat)`) from asking
+--   about itself forever: a cycle without a `var` field holds no cell.
 typeHoldsCell :: Scope -> Typ -> TypeCheckM Bool
-typeHoldsCell scope = \case
-  TEnum n args -> case Scope.findEnum True scope n of
-    Nothing -> pure False
-    Just def -> do
-      let fieldTypes =
-            [ substTypeArgs (zip (enumParams def) args) ft
-            | c <- enumCases def
-            , (_, _, ft) <- enumCaseFields c
-            ]
-          hasVarField = any (any (\(m, _, _) -> m == Var) . enumCaseFields) (enumCases def)
-      if hasVarField
-        then pure True
-        else or <$> mapM (typeHoldsCell scope) fieldTypes
-  TRecord props _ -> or <$> mapM (\(TRecordProp m _ t) ->
-      if m == Var then pure True else typeHoldsCell scope t) props
-  TArray t _ -> typeHoldsCell scope t
-  TPair l r _ -> (||) <$> typeHoldsCell scope l <*> typeHoldsCell scope r
-  _ -> pure False
+typeHoldsCell scope = go Set.empty
+  where
+    go seen = \case
+      TEnum n args
+        | Set.member n seen -> pure False
+        | otherwise -> case Scope.findEnum True scope n of
+            Nothing -> pure False
+            Just def -> do
+              let fieldTypes =
+                    [ substTypeArgs (zip (enumParams def) args) ft
+                    | c <- enumCases def
+                    , (_, _, ft) <- enumCaseFields c
+                    ]
+                  hasVarField =
+                    any (any (\(m, _, _) -> m == Var) . enumCaseFields) (enumCases def)
+              if hasVarField
+                then pure True
+                else or <$> mapM (go (Set.insert n seen)) fieldTypes
+      TRecord props _ -> or <$> mapM (\(TRecordProp m _ t) ->
+          if m == Var then pure True else go seen t) props
+      TArray t _ -> go seen t
+      TPair l r _ -> (||) <$> go seen l <*> go seen r
+      _ -> pure False
 
 -- | Check that the clauses without a guard accept every value of the subject
 --   type.
@@ -2119,8 +2128,10 @@ inferApply scope callee0 arg0 = do
   let finalFxs = Eff.unionEffRowsList
         ([Eff.unionEffRows argFxs lateFxs, calleeFxs] <> rows)
 
-  wrapInferResultWithCell $
-    InferResult (foldl TEApply calleeT args') finalFxs scope3
+  pure $ InferResult
+    (foldl TEApply calleeT args')
+    finalFxs
+    scope3
   where
     arrowRow sc ct = do
       t <- applyTypeSubst sc ct
@@ -2379,8 +2390,13 @@ inferBlock outer (stats, expr) = withNewLevel $ do
   -- модель (T-Block): Cell, если локальный var достижим из результата блока (состояние
   -- уходит наружу, например в замыкании); иначе Var, если var есть; иначе ничего
   exprTyp <- typeOfTypedExprIn scope' exprT
+  -- The result's type decides whether the block can carry state out at all.
+  -- An enum is nominal, so its fields are not in the type: they are looked up
+  -- in the declaration, which is why this question has to be asked inside the
+  -- checker rather than by a pure function on `Typ`.
+  holdsState <- canHoldStateIn scope' exprTyp
   let varNames = [n | TypedIR.Bind Var n _ <- stats']
-      escapes = canHoldState exprTyp && any (`Set.member` reachNames stats' exprT) varNames
+      escapes = holdsState && any (`Set.member` reachNames stats' exprT) varNames
       phi
         | null varNames = Eff.empty
         | escapes = Eff.closedOfFlat "Cell"
@@ -2430,6 +2446,19 @@ inferStatNode scope stat =
           -- Freeze the inferred type, including latent function effects.
           inferredTyp' <- applyTypeSubst scope1 inferredTyp
           (scope', frozenTyp) <- freezeTypExcept excluded scope1 inferredTyp'
+
+          -- Freezing rewrites the `var` bindings of the code it captures into
+          -- `val`, so the only storage a frozen function can still create is
+          -- the `var` field of a constructor: a constructor is a native and is
+          -- not rewritten.  Such a function would allocate on every call while
+          -- its frozen row promises nothing.  A value built before the
+          -- snapshot is a different matter: 'freezeCell' copies it.
+          when (mentionsVarCtor scope1 inferredTypedExpr && isFunctionTyp frozenTyp) $
+            throwTypeCheckError $ TypeError $ T.concat [
+                "a snapshot cannot hold a function that applies a constructor ",
+                "with a `var` field: the constructor allocates storage each ",
+                "time it is applied"
+              ]
 
           -- Remove explicit mutation effects and constrain the remaining
           -- effect variables and row tails that belong to the frozen value.
@@ -2892,6 +2921,26 @@ fvTyped = \case
       TPEnds l r -> Set.union (patternVars l) (patternVars r)
       _ -> Set.empty
 
+-- | Does the expression mention a constructor whose declaration has a `var`
+--   field?  The occurrence may be a direct application, a name stored for a
+--   later one, or a use inside a lambda the snapshot would keep.
+mentionsVarCtor :: Scope -> TypedExpr -> Bool
+mentionsVarCtor scope e = any isVarCtor (Set.toList (fvTyped e))
+  where
+    isVarCtor n = case Scope.enumOfConstructor True scope n of
+      Just (_, c) -> any (\(m, _, _) -> m == Var) (enumCaseFields c)
+      Nothing -> False
+
+-- | Is the value of this type a function?  Only such a snapshot can do
+--   something when it is used later; a function inside a record or a pair is
+--   covered by the run-time check, which sees the constructor in the
+--   environment the snapshot copies.
+isFunctionTyp :: Typ -> Bool
+isFunctionTyp = \case
+  TFunct _ -> True
+  TForall _ _ _ _ _ t -> isFunctionTyp t
+  _ -> False
+
 fvTypedBlock :: TypedIR.Block -> Set.Set Text
 fvTypedBlock (stats, expr) = go Set.empty stats
   where
@@ -2915,25 +2964,51 @@ fvTypedBlock (stats, expr) = go Set.empty stats
 --   instantiated by a type that does; 'bearsState' can be more generous about a
 --   parameter, whose row is the arrow's latent row, but the capture rule of a
 --   block result must stay conservative.
-canHoldState :: Typ -> Bool
-canHoldState = \case
-  TInt -> False
-  TFloat -> False
-  TBoolean -> False
-  TString -> False
-  TNil -> False
-  TNothing -> False
-  TArray t r -> canHoldState t || effRowBearsState [] r
-  TPair l r fx -> canHoldState l || canHoldState r || effRowBearsState [] fx
-  TRecord props r ->
-    any (\p -> tMut p == Var || canHoldState (tTyp p)) props
-      || effRowBearsState [] r
-  -- An enum's fields are values the constructor holds, so an enum holds state
-  -- exactly when one of its arguments does.
-  TEnum _ args -> any (canHoldState . typeArgToTyp) args
-  TFunct (Funct _ _ row) -> effRowBearsState [] row
-  TVar _ -> True
-  _ -> True
+canHoldStateIn :: Scope -> Typ -> TypeCheckM Bool
+canHoldStateIn scope = go Set.empty
+  where
+    go seen = \case
+      TInt -> pure False
+      TFloat -> pure False
+      TBoolean -> pure False
+      TString -> pure False
+      TNil -> pure False
+      TNothing -> pure False
+      TArray t r -> (|| effRowBearsState [] r) <$> go seen t
+      TPair l r fx ->
+        (\ls rs -> ls || rs || effRowBearsState [] fx)
+          <$> go seen l <*> go seen r
+      TRecord props r -> do
+        fields <- or <$> mapM (go seen . tTyp) props
+        pure $ any (\p -> tMut p == Var) props
+          || fields
+          || effRowBearsState [] r
+      -- An enum's fields are values a constructor holds, but the type names
+      -- only the enum: the fields come from the declaration, with the type
+      -- arguments substituted for its parameters.  A `var` field is a cell
+      -- the constructor allocated, so such an enum always carries state.
+      -- Recursion terminates by not asking about an enum already being
+      -- expanded: a cycle that has no `var` field anywhere holds no cell.
+      TEnum n args
+        | Set.member n seen -> pure False
+        | otherwise -> case Scope.findEnum True scope n of
+            Nothing -> pure True
+            Just def ->
+              let cases' = enumCases def
+                  hasVarField =
+                    any (any (\(m, _, _) -> m == Var) . enumCaseFields) cases'
+                  fieldTypes =
+                    [ substTypeArgs (zip (enumParams def) args) ft
+                    | c <- cases'
+                    , (_, _, ft) <- enumCaseFields c
+                    ]
+              in
+              if hasVarField
+                then pure True
+                else or <$> mapM (go (Set.insert n seen)) fieldTypes
+      TFunct (Funct _ _ row) -> pure (effRowBearsState [] row)
+      TVar _ -> pure True
+      _ -> pure True
 
 -- | Имена, достижимые из результата блока (модель: reach): свободные переменные результата,
 --   замкнутые относительно привязок и присваиваний блока.
@@ -3069,6 +3144,10 @@ freezeTypExcept excluded scope = \case
     (scope'', r') <- freezeRowMutInExcept excluded scope' r
     pure (scope'', TRecord props' r')
 
+  TEnum n args -> do
+    (scope', args') <- foldM freezeArg (scope, []) args
+    pure (scope', TEnum n args')
+
   TForall ts es rs els rls t -> do
     let scope' = scope {
       effLacks = foldr Map.delete scope.effLacks es,
@@ -3097,6 +3176,52 @@ freezeTypExcept excluded scope = \case
     freezeProp (sc, acc) p = do
       (sc', typ') <- freezeTypExcept excluded sc (tTyp p)
       pure (sc', acc <> [p {tMut = freezeMutability (tMut p), tTyp = typ'}])
+
+    freezeArg (sc, acc) t = do
+      (sc', t') <- freezeTypeArgExcept excluded sc t
+      pure (sc', acc <> [t'])
+
+-- | Freeze a type argument.
+--
+--   An enum is nominal, so `Wrap[#{ var n : Int }]` carries the field type
+--   only through its argument.  Freezing the argument is what makes the
+--   snapshot of an enum value immutable: without it the checker would still
+--   see a `var` field and let the program assign to it.
+freezeTypeArgExcept :: Set Taste -> Scope -> TypeArg -> TypeCheckM (Scope, TypeArg)
+freezeTypeArgExcept excluded = go
+  where
+    go scope = \case
+      TAArray t -> do
+        (scope', t') <- go scope t
+        pure (scope', TAArray t')
+
+      TAPair l r -> do
+        (scope', l') <- go scope l
+        (scope'', r') <- go scope' r
+        pure (scope'', TAPair l' r')
+
+      TAFunct i o -> do
+        (scope', i') <- go scope i
+        (scope'', o') <- go scope' o
+        pure (scope'', TAFunct i' o')
+
+      TARecord props -> do
+        (scope', props') <- foldM freezeProp (scope, []) props
+        pure (scope', TARecord props')
+
+      TAEnum n args -> do
+        (scope', args') <- foldM freezeArg (scope, []) args
+        pure (scope', TAEnum n args')
+
+      other -> pure (scope, other)
+
+    freezeProp (sc, acc) (TARecordProp m name t) = do
+      (sc', t') <- go sc t
+      pure (sc', acc <> [TARecordProp (freezeMutability m) name t'])
+
+    freezeArg (sc, acc) t = do
+      (sc', t') <- go sc t
+      pure (sc', acc <> [t'])
 
 freezeRowMutIn :: Scope -> EffRow -> TypeCheckM (Scope, EffRow)
 freezeRowMutIn = freezeRowMutInExcept Set.empty

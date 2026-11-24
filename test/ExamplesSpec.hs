@@ -294,6 +294,175 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
           filter (not . isReport) (lines out) `shouldBe` ["5"]
           out `shouldSatisfy` ("EVENTS: licensed" `isInfixOf`)
 
+    it "reports Cell when a local var escapes inside an enum" $ do
+      -- The enum is nominal: its fields are not in the type, so the checker
+      -- has to look them up.  A constructor whose field reaches the local var
+      -- carries that var out of the block, exactly as an array does.
+      r <- runSourceWithInput "enum_escape.marr" "" $ T.unlines
+        [ "enum Box | MkBox (val f : () -> {Read; Rebind} Int)"
+        , ""
+        , "funct make () : {Var; Read; Rebind} Box ="
+        , "  var x = 0;"
+        , "  MkBox {x := + x 1; x}"
+        , ""
+        , "funct main () : {Output; Var; Read; Rebind} () ="
+        , "  val b = make ();"
+        , "  match b to"
+        , "    | #MkBox f => sayn (f ())"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Cell" `isInfixOf`)
+        Right _ -> expectationFailure
+          "the constructor holds a thunk that reaches the local var, so the block must report Cell"
+
+    it "reports Cell when a constructor allocates a var field" $ do
+      -- A `var` field of a constructor is a cell the value owns, just as a
+      -- `var` field of a record literal is.
+      r <- runSourceWithInput "ctor_cell.marr" "" $ T.unlines
+        [ "enum Box | MkBox (var n : Int)"
+        , ""
+        , "funct main () : {Output; Var} () ="
+        , "  sayn (MkBox 1)"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Cell" `isInfixOf`)
+        Right _ -> expectationFailure
+          "the constructor allocates a cell for its var field, so the row must charge Cell"
+
+    it "charges Cell through an aliased constructor" $ do
+      -- The charge lives on the constructor's last arrow, so binding the
+      -- constructor to a name does not lose it.
+      r <- runSourceWithInput "ctor_alias_cell.marr" "" $ T.unlines
+        [ "enum Box | MkBox (var n : Int)"
+        , ""
+        , "funct make () : {Var} Box ="
+        , "  val c = MkBox;"
+        , "  c 1"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Cell" `isInfixOf`)
+        Right _ -> expectationFailure
+          "the alias does not change what the constructor allocates"
+
+    it "charges Cell through a constructor passed as a function" $ do
+      r <- runSourceWithInput "ctor_arg_cell.marr" "" $ T.unlines
+        [ "enum Box | MkBox (var n : Int)"
+        , ""
+        , "funct apply2 (g Int -> {Var; Cell} Box) : {Var; Cell} Box ="
+        , "  g 1"
+        , ""
+        , "funct main () : {Output; Var} () ="
+        , "  sayn (apply2 MkBox)"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("Cell" `isInfixOf`)
+        Right _ -> expectationFailure
+          "main receives a Box that owns a cell, so it must declare Cell"
+
+    it "keeps an enum snapshot apart from later writes" $ do
+      -- The snapshot copies the record inside the enum, so the write to `x`
+      -- afterwards is invisible through `w`.
+      r <- runSourceWithInput "enum_isolation.marr" "" $ T.unlines
+        [ "enum Wrap[a] | Wrap (val v : a)"
+        , ""
+        , "funct main () : {Output; Var; Read; Rebind; Cell} () ="
+        , "  var x = 7;"
+        , "  imm w = Wrap #{ var n = x };"
+        , "  x := 99;"
+        , "  sayn x;"
+        , "  match w to"
+        , "    | #Wrap r => sayn r@n"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a snapshot of an enum must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["99", "7"]
+
+    it "refuses a write that reaches a frozen field of an enum" $ do
+      -- The type argument of the enum is a record with a `var` field; the
+      -- frozen type cannot spell that record as a `val` one (a type argument
+      -- has no effect row), so the checker still allows the write.  The
+      -- interpreter refuses it, which keeps the snapshot immutable.
+      r <- runSourceWithInput "enum_frozen_write.marr" "" $ T.unlines
+        [ "enum Wrap[a] | Wrap (val v : a)"
+        , ""
+        , "funct main () : {Output; Var; Read; Rebind; Cell} () ="
+        , "  var x = 7;"
+        , "  imm w = Wrap #{ var n = x };"
+        , "  match w to"
+        , "    | #Wrap r => r@n := 5; sayn r@n"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("not `var`" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a frozen field must not be assignable, but the program printed: "
+            ++ take 200 out
+
+    it "copies the arguments of a snapshot of a partially applied native" $ do
+      -- `+ x` is a native waiting for its second argument; the address of `x`
+      -- it already holds is copied by the snapshot, so the later `:=` is not
+      -- visible through `g`.
+      r <- runSourceWithInput "native_partial_snapshot.marr" "" $ T.unlines
+        [ "funct main () : {Output; Var; Read; Rebind} () ="
+        , "  var x = 5;"
+        , "  val f = + x;"
+        , "  imm g = f;"
+        , "  x := 10;"
+        , "  sayn (g 1)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a snapshot of a partial native must work: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["6"]
+
+    it "copies the arguments of a snapshot of a partial constructor" $ do
+      r <- runSourceWithInput "ctor_partial_snapshot.marr" "" $ T.unlines
+        [ "enum Box | MkBox (val a : #{ var n : Int }) (val b : Int)"
+        , ""
+        , "funct main () : {Output; Var; Read; Rebind; Cell} () ="
+        , "  var r = #{ var n = 0 };"
+        , "  val f = MkBox r;"
+        , "  sayn f;"
+        , "  imm g = f;"
+        , "  r@n := 10;"
+        , "  match (g 2) to"
+        , "    | #MkBox a b => sayn a@n"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a snapshot of a partial constructor must work: " ++ err
+        Right out ->
+          filter (not . isReport) (lines out) `shouldBe` ["<partial: MkBox>", "0"]
+
+    it "refuses a snapshot of a constructor with a var field" $ do
+      -- Freezing rewrites the code it captures, but a constructor is a native:
+      -- applying it allocates a fresh cell, which the frozen type (no `Cell`)
+      -- cannot promise.  Such a snapshot is refused rather than silently
+      -- handing out storage behind a pure type.
+      r <- runSourceWithInput "imm_ctor.marr" "" $ T.unlines
+        [ "enum Box | MkBox (var n : Int)"
+        , ""
+        , "funct main () : {Output; Var} () ="
+        , "  imm mk = MkBox;"
+        , "  sayn (mk 1)"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("allocates storage" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a frozen constructor would allocate storage, but the program printed: "
+            ++ take 200 out
+
+    it "refuses a snapshot of a function that builds a var field" $ do
+      r <- runSourceWithInput "imm_ctor_lambda.marr" "" $ T.unlines
+        [ "enum Box | MkBox (var n : Int)"
+        , ""
+        , "funct main () : {Output; Var} () ="
+        , "  imm f = {(n) = MkBox n};"
+        , "  sayn (f 1)"
+        ]
+      case r of
+        Left err -> err `shouldSatisfy` ("allocates storage" `isInfixOf`)
+        Right out -> expectationFailure $
+          "a frozen function that builds a var field is not pure, but the program printed: "
+            ++ take 200 out
+
   describe "annotations on expressions" $ do
     it "lets an annotation refine an aggregate the checker could not pin down" $ do
       -- `[]` on its own has element type `Nothing`; the annotation says which
@@ -1531,7 +1700,7 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         , "    | #Box x => x"
         , "    | #Empty => 0"
         , ""
-        , "funct main () : {Output; Var; Read} () ="
+        , "funct main () : {Output; Var; Read; Cell} () ="
         , "  sayn (unbox (Box 7));"
         , "  sayn (unbox Empty)"
         ]

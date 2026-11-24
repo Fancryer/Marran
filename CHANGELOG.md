@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## 0.2.3.0 - 2026-11-24
+
+The two P0 items of the 0.2 line are closed: the `Cell` analysis no longer
+lets a block carry mutable storage out of itself unannounced, and `freeze` now
+reaches every value a snapshot can hold.  Both were holes in the model of
+`imm`, not in its implementation.
+
+- `Cell` is charged for state that escapes through a declared enumeration.
+  `canHoldState` became the monadic `canHoldStateIn`, which looks the fields of
+  an enum up in its declaration (`Scope.findEnum`) instead of reading them off
+  the type, and substitutes the type arguments for the parameters.  An enum
+  declared with a `var` field therefore carries state by construction.
+- The last arrow of a constructor with a `var` field now carries `Var; Cell`
+  (`Types.constructorTyp`): applying the constructor creates a mutable binding
+  and the value owns that cell.  The charge sits on the type, so an aliased
+  constructor (`val c = MkBox; c 1`) and one passed to a function
+  (`apply2 MkBox`) pay it exactly as `MkBox 1` does; a program that builds a
+  `var`-field enum must declare `Cell`, as it already had to for a record
+  literal with a `var` field.
+- Recursive enums terminate both questions (`canHoldStateIn`, `typeHoldsCell`)
+  through a visited set; a cycle without a `var` field holds no cell.
+- `freezeTyp` descends into the type arguments of an enum through the new
+  `freezeTypeArgExcept` (`TAArray`, `TAPair`, `TAFunct`, `TARecord` with its
+  mutabilities, `TAEnum`), so a record inside an enum becomes frozen too.
+- A partially applied native or constructor is now a run-time value of its
+  own (`VPartial`): the arguments it already received are addresses, not
+  hidden inside a Haskell closure.  `share`ing such a value used to leave a
+  snapshot aliasing live cells -- `val f = MkBox r; imm g = f; r@n := 10`
+  read `10` through `g` and now reads the frozen `0`.  `applyValue`,
+  `applyPartial`, `nativeN`, `makeEffectClosure` and `makeConstructor` build
+  and apply it; `freezeCell` copies its arguments.
+- `freezeCell` also copies the target of a `with` (`VTypeApp`).
+- The checker refuses a snapshot of a function that applies a constructor with
+  a `var` field (`imm f = {(n) = MkBox n}`), and `freezeCell` refuses a
+  snapshot of the constructor itself: a constructor is a native, so freezing
+  cannot rewrite its code, and applying the frozen value would allocate a
+  fresh cell behind a type that no longer says `Cell`.
+- Assigning a field whose mutability is not `Var` is now a run-time error
+  instead of a silent write into a frozen copy.  This is the backstop for the
+  one case the frozen type cannot spell: a state-bearing record used as an
+  enum's type argument stays a `TAVar`, because `TypeArg` has no effect row to
+  carry the record's, so the static check still admits `w@v@n := 5` and the
+  interpreter refuses it.
+
+Tests: 494 examples, 0 failures.
+
 ## 0.2.2.0 - 2026-11-23
 
 Explicit type application and the first type-directed native arrive together:

@@ -61,7 +61,7 @@ import Control.Concurrent (threadDelay)
 import Resume (ResumeInfo(..))
 import Text.Printf (printf)
 import Text.Read (readMaybe)
-import Data.Maybe (isJust, listToMaybe)
+import Data.Maybe (isJust, listToMaybe, fromMaybe)
 import System.Environment (lookupEnv)
 import Control.Exception (AsyncException (..), IOException, evaluate, fromException, throwIO, try)
 import System.IO.Error (isEOFError)
@@ -103,6 +103,15 @@ data Value
   --   `Read`, exactly as a `var` field of a record does.
   | VEnum Text [(Mutability, Address)]
   | VClosure EnvId (Maybe (IntMap Address)) (Maybe Code) (Address -> Interp Address)
+  -- | A native function applied to some of its arguments.
+  --
+  --   A curried native used to keep the arguments it had already received
+  --   inside the Haskell closure of its next stage, where a snapshot could not
+  --   see them: `share`ing such a value would leave the snapshot aliasing live
+  --   cells.  Keeping the arguments as addresses, next to the pure Haskell
+  --   code that consumes them, makes them copyable -- exactly as the argument
+  --   environments of a user function's partial application are.
+  | VPartial EnvId Text [Address] Int ([Address] -> Interp Address)
   | VThunk TypedExpr EnvId
   | VBThunk Block EnvId
   -- | A run-time type, carried by @with@.  It is a value so that a
@@ -128,6 +137,7 @@ instance Show Value where
     VRecord fields -> "!record" <> show fields <> "!"
     VEnum n fs -> concat ["(VEnum ", T.unpack n, " [", unwords $ map (show . snd) fs, "])"]
     VClosure _ _ code _ -> T.unpack (codeName code)
+    VPartial _ name args _ _ -> T.unpack (T.concat ["(VPartial ", name, " ", T.pack (show (length args)), ")"])
     VThunk te _ -> "!vthunk" <> show te <> "!"
     VBThunk b _ -> "!bthunk" <> show b <> "!"
     VType r -> concat ["(VType ", show (pretty r), ")"]
@@ -147,6 +157,9 @@ instance Pretty Value where
     VRecord eid -> "!record[" <> pretty eid <> "]!"
     VEnum n fs -> T.intercalate " " (n : map (pretty . snd) fs)
     VClosure _ _ code _ -> codeName code
+    -- A native that has not received an argument yet is still the whole
+    -- function, and prints by its name; only a partial says so.
+    VPartial _ name args _ _ -> if null args then name else partialName name
     VThunk e _env -> T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> T.concat ["!vthunk: ", pretty b,"!"]
     VType r -> pretty r
@@ -190,6 +203,7 @@ instance Stringify Value where
       fields <- mapM (stringify . snd) fs
       pure $ T.intercalate " " (n : fields)
     VClosure _ _ code _ -> pure $ codeName code
+    VPartial _ name args _ _ -> pure $ if null args then name else partialName name
     VThunk e _env -> pure $ T.concat ["!vthunk: ", pretty e,"!"]
     VBThunk b _env -> pure $ T.concat ["!bthunk: ", pretty b,"!"]
     VType r -> pure $ pretty r
@@ -271,8 +285,7 @@ findBindingEnv eid name = do
         Nothing -> rtError $ "`" <> name <> "` is not in scope"
         Just (eff, arity) -> do
           env <- gets sEnv
-          clos <- makeEffectClosure env arity eff name
-          a <- alloc (VClosure env Nothing (Just (CodeNative Whole name)) clos)
+          a <- makeEffectClosure env arity eff name
           pure (env, Val, a)
 
 findBindingEnvMaybe :: EnvId -> Text -> Interp (Maybe (EnvId, Mutability, Address))
@@ -404,6 +417,7 @@ data InterpState = InterpState
   , sForcing    :: Set Int               -- ^ cells whose value is being computed
   , sSpan       :: Span                  -- ^ where the interpreter currently is
   , sCmdArgs    :: [String]              -- ^ the command line, read by `System@args`
+  , sVarCtors   :: Set Text              -- ^ constructors that allocate a `var` field
   }
 
 type Clause = [Address] -> (Address -> Interp Address) -> Interp Address
@@ -621,6 +635,15 @@ evalModule env0 chunk = do
   -- The constructors of a declared enumeration are ordinary functions of the
   -- module's scope, so a value is built by applying one: `Some 5`.
   let enumDefs = [ed | IR.SEnumDef ed <- chunk]
+      allocatesCell c = any (\(m, _, _) -> m == Var) (enumCaseFields c)
+      varCtors =
+        Set.fromList
+          [ enumCaseName c
+          | def <- enumDefs
+          , c <- enumCases def
+          , allocatesCell c
+          ]
+  modify $ \st -> st {sVarCtors = Set.union varCtors st.sVarCtors}
   forM_ enumDefs $ \def ->
     forM_ (enumCases def) $ \c -> do
       let muts = [m | (m, _, _) <- enumCaseFields c]
@@ -943,6 +966,11 @@ describe = \case
   VRecord _ -> "a record"
   VEnum _ _ -> "an enum value"
   VClosure {} -> "a function"
+  VPartial _ name args _ _
+    | null args -> T.concat ["the function `", name, "`"]
+    | otherwise -> T.concat
+        [ "a partially applied `", name, "` with "
+        , T.pack (show (length args)), " argument(s)" ]
   VThunk _ _ -> "an unevaluated expression"
   VBThunk _ _ -> "an unevaluated expression"
   VType _ -> "a type"
@@ -978,8 +1006,7 @@ buildInitialEnv _cmdArgs = do
   -- замыкания операций строятся из той же таблицы, что и клаузы (арность не дублируется)
   let allocEffectCall eff (op, o) = do
         env <- gets sEnv
-        clos <- makeEffectClosure env o.opArity eff op
-        addr <- alloc $ VClosure env Nothing (Just (CodeNative Whole op)) clos
+        addr <- makeEffectClosure env o.opArity eff op
         pure (op, (Val, addr))
   opBindings <- fmap concat $ forM globalOps $ \(eff, ops) -> mapM (allocEffectCall eff) ops
   let operations = Map.fromList opBindings
@@ -993,11 +1020,7 @@ buildInitialEnv _cmdArgs = do
       -- of the function and says whether it is the whole function or the rest
       -- of one, so `sayn (map f)` says `map` is applied, not that it is `map`.
       nativeN :: Text -> Int -> ([Address] -> Interp Address) -> Interp Address
-      nativeN name n body = go [] n Whole
-        where
-          go acc 0 _ = body (reverse acc)
-          go acc k stage = alloc $ VClosure st.sEnv emptyCache (Just (CodeNative stage name)) $ \arg ->
-            go (arg : acc) (k - 1) Partial
+      nativeN name n body = alloc $ VPartial st.sEnv name [] n body
 
       native1 name f = nativeN name 1 $ \case [a] -> f a; _ -> arityError name 1 []
       native2 name f = nativeN name 2 $ \case [a, b] -> f a b; _ -> arityError name 2 []
@@ -1224,12 +1247,9 @@ buildInitialEnv _cmdArgs = do
           VTypeApp target reps -> do
             g <- applyTypeArgs target reps
             applyValue g argAddr
-          VClosure env _ _ clos -> do
-            oldEnv <- gets sEnv
-            modify $ \s -> s {sEnv = env}
-            result <- clos argAddr
-            modify $ \s -> s {sEnv = oldEnv}
-            pure result
+          VClosure env _ _ clos -> runInEnv env (clos argAddr)
+          VPartial env name args arity run ->
+            applyPartial env name args arity run argAddr
           other -> rtError $ "`" <> what <> "` expected a function, but got " <> describe other
 
       -- Two addresses as a pair, for `curry` and `zip`.
@@ -1657,14 +1677,29 @@ applyValue fAddr argAddr = do
     VTypeApp target reps -> do
       g <- applyTypeArgs target reps
       applyValue g argAddr
-    VClosure env _ _ clos -> do
-      oldEnv <- gets sEnv
-      modify $ \s -> s {sEnv = env}
-      result <- clos argAddr
-      modify $ \s -> s {sEnv = oldEnv}
-      pure result
+    VClosure env _ _ clos -> runInEnv env (clos argAddr)
+    VPartial env name args arity run ->
+      applyPartial env name args arity run argAddr
     other ->
       rtError $ "the left side of an application is not a function: it is " <> describe other
+
+-- | Feed one argument to a partially applied native.  The arguments are kept
+--   as addresses so that a snapshot can copy them; the Haskell code that
+--   consumes them is pure and captures no bindings of the program.
+applyPartial ::
+  EnvId -> Text -> [Address] -> Int -> ([Address] -> Interp Address)
+  -> Address -> Interp Address
+applyPartial env name args arity run argAddr
+  | length args + 1 >= arity = runInEnv env (run (args <> [argAddr]))
+  | otherwise = alloc (VPartial env name (args <> [argAddr]) arity run)
+
+runInEnv :: EnvId -> Interp a -> Interp a
+runInEnv env action = do
+  oldEnv <- gets sEnv
+  modify $ \s -> s {sEnv = env}
+  result <- action
+  modify $ \s -> s {sEnv = oldEnv}
+  pure result
 
 -- | Run an action as if the interpreter stood at this node, so that a runtime
 --   error raised inside it points at the right place.  The previous position is
@@ -1763,12 +1798,8 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
               -- costs a recomputation.
               writeCell fAddr (VClosure env' (Just (IM.singleton (addrToInt xAddr) result)) code clos)
               pure result
-        VClosure env' _ _ clos -> do
-          oldEnv <- gets sEnv
-          modify $ \s -> s {sEnv = env'}
-          result <- clos xAddr
-          modify $ \s -> s {sEnv = oldEnv}
-          pure result
+        VClosure env' _ _ clos -> runInEnv env' (clos xAddr)
+        VPartial {} -> applyValue fAddr xAddr
         _ -> rtError $ "the left side of an application is not a function: it is " <> describe v
     TERecord _ ps _ -> do
       st <- get
@@ -1812,8 +1843,8 @@ evalExpr expr cont = atSpan (teSpan expr) $ case expr of
         -- операции эффекта живут в собственном окружении, а не в текущем
         opsEnv <- newEnv Env {bindings = Map.empty, parent = Just env}
         forM_ clauses $ \(name, _, _, arity) -> do
-          fn <- makeEffectClosure opsEnv arity fx name
-          void $ bindValIn opsEnv name (VClosure opsEnv (Just IM.empty) (Just (CodeNative Whole name)) fn)
+          a <- makeEffectClosure opsEnv arity fx name
+          void $ bindValAddrIn opsEnv name a
         modify $ \s -> s {sEnv = opsEnv, sKstack = handler : s.sKstack}
         -- The body is evaluated to weak head normal form while the handler is
         -- still installed: a thunk returned by the body must not escape and
@@ -2082,14 +2113,9 @@ makeEffectClosure ::
   -> Int
   -> ECons
   -> Text
-  -> Interp (Address -> Interp Address)
+  -> Interp Address
 makeEffectClosure env arity eff op =
-    go [] arity
-  where
-    go acc n =
-      pure $ \arg -> case n of
-        1 -> callEffect eff op $ reverse (arg : acc)
-        _ -> alloc . VClosure env (Just IM.empty) (Just (CodeNative Partial op)) =<< go (arg : acc) (n - 1)
+  alloc $ VPartial env op [] arity $ \args -> callEffect eff op args
 
 makeClause ::
   Int                             -- the handler that owns the clauses
@@ -2370,6 +2396,31 @@ freezeCell a = do
             pure (freezeMutability m, x')
           setCell a' (VEnum n fs')
           pure a'
+        -- A partially applied native keeps its arguments as addresses, so a
+        -- snapshot can copy them.  The Haskell code stays: it consumes the
+        -- arguments and captures no binding of the program.
+        VPartial env name args arity run -> do
+          -- A constructor with a `var` field is the one native whose code the
+          -- snapshot cannot rewrite: applying it allocates a fresh cell for
+          -- the field, after the frozen type has promised the caller that it
+          -- creates nothing.  Refusing the snapshot is the honest answer.
+          varCtors <- gets sVarCtors
+          when (name `Set.member` varCtors) $
+            rtError $ T.concat [
+                "cannot take a snapshot of `", name, "`: a constructor with a ",
+                "`var` field allocates storage each time it is applied"
+              ]
+          a' <- placeholder
+          args' <- mapM freezeCell args
+          setCell a' (VPartial env name args' arity run)
+          pure a'
+        -- @f with [T]@ is a function waiting for its type arguments; the
+        -- target is a real value the snapshot has to copy.
+        VTypeApp target reps -> do
+          a' <- placeholder
+          target' <- freezeCell target
+          setCell a' (VTypeApp target' reps)
+          pure a'
         _ -> share a
   where
     remember x y = modify $ \s -> s {sFreezeMemo = IM.insert (addrId x) y s.sFreezeMemo}
@@ -2419,6 +2470,20 @@ rebindPath name names t = do
   -- assigned field is not read, just as `x := e` does not read `x`.
   when (m == Var) $ logEvent EvRead
   levels <- walk addr names
+  -- The static check is the primary guard: only a `var` field is assignable.
+  -- A snapshot froze every field it copied, so a write that reaches a `val`
+  -- field here would silently mutate an `imm` value.  Refusing it keeps the
+  -- promise even when the type of the value could not express the frozen
+  -- form (an enum whose type argument is a record).
+  case levels of
+    [] -> pure ()
+    _ ->
+      let (_, target, targetMut, _) = last levels
+      in when (targetMut /= Var) $
+           rtError $ T.concat [
+               "cannot assign to `", lhs, "`: the field `", target,
+               "` is bound with `", pretty targetMut, "`, not `var`"
+             ]
   -- The copies are built from the inside out: the innermost copy keeps its
   -- bindings, so the right-hand side reads the assigned field's old value, and
   -- every outer copy points its own path field at the copy below it.
@@ -2694,16 +2759,14 @@ parseTextAs rep text =
   case trShape rep of
     ShapeString | not (startsQuoted (T.unpack text)) ->
       alloc (VString (T.strip text))
-    _ ->
-      case parseValueText (T.unpack text) of
-        Left msg -> callError ("`parse`: " <> msg)
-        Right (value, rest) ->
-          case skipSpaces rest of
-            [] -> buildParsedValue rep value
-            _ -> callError $ T.concat [
-                "`parse`: unexpected text after the value: `",
-                T.strip (T.pack rest), "`"
-              ]
+    _ -> case parseValueText (T.unpack text) of
+      Left msg -> callError ("`parse`: " <> msg)
+      Right (value, rest) -> case skipSpaces rest of
+        [] -> buildParsedValue rep value
+        _ -> callError $ T.concat [
+            "`parse`: unexpected text after the value: `",
+            T.strip (T.pack rest), "`"
+          ]
   where
     startsQuoted s = case skipSpaces s of
       (c:_) -> c == '"' || c == '\''
@@ -2721,8 +2784,8 @@ parseValueText s0 =
       | c == '(' -> parseParen cs
       | c == '"' || c == '\'' -> parseQuoted c cs
       | c == '#' -> case cs of
-          ('{':rest) -> parseRecord rest
-          _ -> Left "expected `{` after `#`"
+        ('{':rest) -> parseRecord rest
+        _ -> Left "expected `{` after `#`"
       | c == '-' || isDigit c -> parseNumber (c:cs)
       | isAlpha c || c == '_' -> parseName (c:cs)
       | otherwise -> Left ("unexpected character `" <> T.singleton c <> "`")
@@ -2771,28 +2834,27 @@ parseNumber :: String -> Either Text (ParsedValue, String)
 parseNumber s =
   let (tok, rest) = span (\c -> isDigit c || c `elem` ("+-.eE" :: String)) s
   in if any (`elem` (".eE" :: String)) tok
-       then case readMaybe tok :: Maybe Scientific of
-         Just f -> Right (ParsedFloat f, rest)
-         Nothing -> Left ("`" <> T.pack tok <> "` is not a number")
-       else case readMaybe tok :: Maybe Integer of
-         Just i -> Right (ParsedInt i, rest)
-         Nothing -> Left ("`" <> T.pack tok <> "` is not a number")
+    then case readMaybe tok :: Maybe Scientific of
+      Just f -> Right (ParsedFloat f, rest)
+      Nothing -> Left ("`" <> T.pack tok <> "` is not a number")
+    else case readMaybe tok :: Maybe Integer of
+      Just i -> Right (ParsedInt i, rest)
+      Nothing -> Left ("`" <> T.pack tok <> "` is not a number")
 
 parseName :: String -> Either Text (ParsedValue, String)
 parseName s =
   let (name, rest) = span (\c -> isAlphaNum c || c == '_' || c == '.') s
   in case name of
-       "true" -> Right (ParsedBoolean True, rest)
-       "false" -> Right (ParsedBoolean False, rest)
-       _ -> do
-         (args, rest') <- parseArgs [] rest
-         Right (ParsedEnum (T.pack name) args, rest')
+    "true" -> Right (ParsedBoolean True, rest)
+    "false" -> Right (ParsedBoolean False, rest)
+    _ -> do
+      (args, rest') <- parseArgs [] rest
+      Right (ParsedEnum (T.pack name) args, rest')
   where
     parseArgs acc t =
       case skipSpaces t of
         [] -> Right (reverse acc, [])
-        (c:_)
-          | c `elem` (",]);}" :: String) -> Right (reverse acc, t)
+        (c:_) | c `elem` (",]);}" :: String) -> Right (reverse acc, t)
         _ -> do
           (v, rest) <- parseValueText t
           parseArgs (v:acc) rest
@@ -2847,13 +2909,13 @@ buildParsedValue rep value =
         Nothing -> callError $ "`parse`: `" <> n <> "` is not a constructor of " <> pretty rep
         Just fieldReps
           | length fieldReps /= length args ->
-              callError $ T.concat [
-                  "`parse`: `", n, "` takes ", T.pack (show (length fieldReps)),
-                  " field(s), but the text supplies ", T.pack (show (length args))
-                ]
+            callError $ T.concat [
+                "`parse`: `", n, "` takes ", T.pack (show (length fieldReps)),
+                " field(s), but the text supplies ", T.pack (show (length args))
+              ]
           | otherwise -> do
-              addrs <- zipWithM (\(m, t) v -> (m,) <$> buildParsedValue t v) fieldReps args
-              alloc (VEnum n addrs)
+            addrs <- zipWithM (\(m, t) v -> (m,) <$> buildParsedValue t v) fieldReps args
+            alloc (VEnum n addrs)
     (ShapeVar v, _) ->
       callError $ T.concat [
           "`parse`: the type variable `", v,
@@ -2877,9 +2939,7 @@ buildRecord props fields = do
         ", got ", T.intercalate ", " (Set.toList given)
       ]
   triples <- forM props $ \p -> do
-    let fieldValue = case Map.lookup (trpName p) fieldMap of
-          Just v -> v
-          Nothing -> ParsedUnit
+    let fieldValue = fromMaybe ParsedUnit (Map.lookup (trpName p) fieldMap)
     addr <- buildParsedValue (trpTyp p) fieldValue
     pure (trpMut p, trpName p, addr)
   eid <- newEnv Env {
@@ -2896,13 +2956,12 @@ buildRecord props fields = do
 --   mutability travels with the field and reading it later costs `Read`,
 --   exactly as a `var` field of a record does.
 makeConstructor :: EnvId -> Text -> [Mutability] -> Interp Address
-makeConstructor env name muts = go muts []
-  where
-    go [] acc = alloc $ VEnum name (reverse acc)
-    go (m : rest) acc =
-      alloc $ VClosure env Nothing
-        (Just (CodeNative (if null acc then Whole else Partial) name)) $ \arg ->
-          go rest ((m, arg) : acc)
+makeConstructor env name muts = case muts of
+  -- A constructor without fields is the value itself, not a function.
+  [] -> alloc (VEnum name [])
+  _ ->
+    alloc $ VPartial env name [] (length muts) $ \args ->
+      alloc (VEnum name (zip muts args))
 
 -- | Decide whether a value is the one a pattern accepts, and return the names
 --   the pattern binds.
@@ -3108,6 +3167,10 @@ isImmutableValue v = evalStateT (go v) IntMap.empty
       VPair l r -> (&&) <$> checkAddr l <*> checkAddr r
       VEnum _ fs -> foldM (\acc (m, a) ->
         if m == Var then pure False else (acc &&) <$> checkAddr a) True fs
+      -- A partial keeps the arguments it already received; they are values of
+      -- the snapshot too.
+      VPartial _ _ args _ _ -> foldM (\acc a -> (acc &&) <$> checkAddr a) True args
+      VTypeApp target _ -> checkAddr target
       VRecord eid -> do
         env <- lift $ getEnv eid
         foldM
@@ -3157,7 +3220,8 @@ initialInterpState root = InterpState {
   sNoMemo     = False,
   sForcing    = Set.empty,
   sSpan       = noSpan,
-  sCmdArgs    = []
+  sCmdArgs    = [],
+  sVarCtors   = Set.empty
 }
 
 prepareSnapshotBenchmark :: Int -> [(Int, Int)] -> IO (IO (Int, Int, Int))

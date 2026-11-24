@@ -809,10 +809,16 @@ constructorTyp def c =
     [t | (_, _, t) <- enumCaseFields c]
     (TEnum (enumName def) (map TAVar (enumParams def)))
   where
-    -- A constructor with a `var` field creates a cell, so applying it is what
-    -- performs `Var`; the row sits on the arrow that yields the value.
+    -- A constructor with a `var` field allocates that field's cell, so its
+    -- last arrow performs `Var` (a mutable binding is created) and carries
+    -- `Cell` (the value owns storage the block did not have before).  The row
+    -- is on the type rather than on the application so that the charge cannot
+    -- be lost: an aliased constructor (`val c = MkBox; c 1`) or one passed to
+    -- a function (`apply2 MkBox`) pays the same row as a direct `MkBox 1`.
     createsCell = any (\(m, _, _) -> m == Var) (enumCaseFields c)
-    outRow = if createsCell then RClosed [EffCons $ ECons "Var" []] else RClosed []
+    outRow
+      | createsCell = RClosed [EffCons $ ECons "Var" [], EffCons $ ECons "Cell" []]
+      | otherwise = RClosed []
     buildCurriedEnum fs out = case fs of
       [] -> out
       [t] -> TFunct (Funct t out outRow)

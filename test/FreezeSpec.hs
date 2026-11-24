@@ -25,6 +25,8 @@ import Types
   , ECons(..)
   , Funct(..)
   , TRecordProp(..)
+  , TypeArg(..)
+  , TARecordProp(..)
   , Mutability(..)
   , Scheme(..)
   )
@@ -291,6 +293,29 @@ fSpec = do
 
         Map.lookup r (rowLacks scope') `shouldBe` Just mutationEffects
       )
+
+    it "freezes record type arguments of an enum" $
+      -- A type argument has no effect row of its own, so a state-bearing
+      -- record can only reach a frozen type through `TAVar`; when the checker
+      -- does see the record, its fields must still become `val`.
+      runWithScope (\scope -> do
+        let typ = TEnum "Wrap"
+              [ TARecord
+                  [ TARecordProp Var "n" TAInt
+                  , TARecordProp Val "f" (TAFunct TAInt TAInt)
+                  ]
+              , TAEnum "Inner" [TARecord [TARecordProp Var "m" (TAArray TAInt)]]
+              ]
+        (scope', frozen) <- Infer.freezeTyp scope typ
+        pure (scope', frozen)
+      ) `expectRight` \(_, frozen) ->
+        frozen `shouldBe` TEnum "Wrap"
+          [ TARecord
+              [ TARecordProp Val "n" TAInt
+              , TARecordProp Val "f" (TAFunct TAInt TAInt)
+              ]
+          , TAEnum "Inner" [TARecord [TARecordProp Val "m" (TAArray TAInt)]]
+          ]
 
   describe "freezeTyp: forall" $ do
 
