@@ -42,7 +42,10 @@ reaches every value a snapshot can hold.  Both were holes in the model of
   a `var` field (`imm f = {(n) = MkBox n}`), and `freezeCell` refuses a
   snapshot of the constructor itself: a constructor is a native, so freezing
   cannot rewrite its code, and applying the frozen value would allocate a
-  fresh cell behind a type that no longer says `Cell`.
+  fresh cell behind a type that no longer says `Cell`.  The value such a
+  constructor builds is ordinary data and freezes normally: the `imm` builds
+  it where its right-hand side already charges `Cell`, then snapshots the
+  value (`imm s = MkBox 2`, also through a `val` binding).
 - Assigning a field whose mutability is not `Var` is now a run-time error
   instead of a silent write into a frozen copy.  This is the backstop for the
   one case the frozen type cannot spell: a state-bearing record used as an
@@ -50,7 +53,7 @@ reaches every value a snapshot can hold.  Both were holes in the model of
   carry the record's, so the static check still admits `w@v@n := 5` and the
   interpreter refuses it.
 
-Tests: 494 examples, 0 failures.
+Tests: 496 examples, 0 failures.
 
 ## 0.2.2.0 - 2026-11-23
 

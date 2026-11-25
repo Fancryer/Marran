@@ -463,6 +463,50 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
           "a frozen function that builds a var field is not pure, but the program printed: "
             ++ take 200 out
 
+    it "snapshots a value built by a constructor with a var field" $ do
+      -- The constructor cannot be frozen, but the value it builds is ordinary
+      -- data.  The `imm` builds it right away -- its row already charges Cell
+      -- for the call -- and the snapshot is the value, not the thunk that
+      -- would allocate on first use.
+      r <- runSourceWithInput "imm_enum_value.marr" "" $ T.unlines
+        [ "enum Box | MkBox (var n : Int)"
+        , ""
+        , "funct get (b Box) : {Read} Int ="
+        , "  match (b) to"
+        , "    | #MkBox n => n"
+        , ""
+        , "funct main () : {Output; Var; Read; Cell} () ="
+        , "  imm s = MkBox 2;"
+        , "  sayn s;"
+        , "  sayn (get s)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a snapshot of the value must work: " ++ err
+        Right out ->
+          filter (not . isReport) (lines out) `shouldBe` ["MkBox 2", "2"]
+
+    it "snapshots a value reached through a val binding" $ do
+      -- Here the constructor is hidden in the environment of a thunk, and the
+      -- snapshot reaches it by copying that thunk; the value is still what the
+      -- user asked for, so it is built before the copy is taken.
+      r <- runSourceWithInput "imm_enum_via_val.marr" "" $ T.unlines
+        [ "enum Box | MkBox (var n : Int)"
+        , ""
+        , "funct get (b Box) : {Read} Int ="
+        , "  match (b) to"
+        , "    | #MkBox n => n"
+        , ""
+        , "funct main () : {Output; Var; Read; Cell} () ="
+        , "  val b = MkBox 3;"
+        , "  imm s = b;"
+        , "  sayn s;"
+        , "  sayn (get s)"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a snapshot through a val must work: " ++ err
+        Right out ->
+          filter (not . isReport) (lines out) `shouldBe` ["MkBox 3", "3"]
+
   describe "annotations on expressions" $ do
     it "lets an annotation refine an aggregate the checker could not pin down" $ do
       -- `[]` on its own has element type `Nothing`; the annotation says which

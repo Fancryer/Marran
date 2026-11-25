@@ -2363,10 +2363,27 @@ freezeCell a = do
               setCell a' (VClosure env' (fmap (const IM.empty) cache) (Just code') fn')
               pure a'
         VThunk expr env -> do
-          a' <- placeholder
-          env' <- snapshotEnv env (freeVars expr)
-          setCell a' (VThunk (freeze expr) env')
-          pure a'
+          -- A thunk that mentions a constructor with a `var` field cannot be
+          -- frozen lazily: forcing it later would allocate a cell, after the
+          -- snapshot has already been given a type that creates nothing.  The
+          -- expression is a *value* the user is snapshotting, so evaluate it
+          -- here -- the `imm` charges the row of its right-hand side, `Cell`
+          -- included -- and freeze the value it makes.
+          varCtors <- gets sVarCtors
+          if Set.null (Set.intersection varCtors (freeVars expr))
+            then do
+              a' <- placeholder
+              env' <- snapshotEnv env (freeVars expr)
+              setCell a' (VThunk (freeze expr) env')
+              pure a'
+            else do
+              valueAddr <- whnf a
+              a' <- freezeCell valueAddr
+              -- Keep sharing: another occurrence of this thunk in the snapshot
+              -- must see this very copy, not force the expression again.
+              modify $ \st ->
+                st {sFreezeMemo = IM.insert (addrId a) a' st.sFreezeMemo}
+              pure a'
         VArray as -> do
           a' <- placeholder
           as' <- mapM freezeCell as
@@ -2610,14 +2627,29 @@ bindVarAddrIn e x a = do
 bindImm :: Text -> TypedExpr -> Interp Address
 bindImm name expr = do
   st <- get
+  varCtors <- gets sVarCtors
   -- общая таблица копий на один снимок: сохраняет разделение и обрывает циклы (рекурсивные функции)
   saved <- gets sFreezeMemo
   modify $ \s -> s {sFreezeMemo = IM.empty}
-  frozenEnv <- snapshotEnv st.sEnv (freeVars expr)
-  modify $ \s -> s {sFreezeMemo = saved}
-  addr <- alloc $ VThunk expr frozenEnv
-  _ <- extendEnv name Imm addr
-  pure addr
+  if Set.null (Set.intersection varCtors (freeVars expr))
+    then do
+      frozenEnv <- snapshotEnv st.sEnv (freeVars expr)
+      modify $ \s -> s {sFreezeMemo = saved}
+      addr <- alloc $ VThunk expr frozenEnv
+      _ <- extendEnv name Imm addr
+      pure addr
+    else do
+      -- The expression applies a constructor with a `var` field.  The
+      -- constructor is a native whose code freezing cannot rewrite, so a
+      -- snapshot of the *thunk* would allocate a cell when it is forced later,
+      -- behind a type that creates nothing.  The value itself, however, is
+      -- plain data: build it now -- the `imm` already charges the row of its
+      -- right-hand side, `Cell` included -- and snapshot the value.
+      a <- evalExpr expr pure
+      a' <- freezeCell a
+      modify $ \s -> s {sFreezeMemo = saved}
+      _ <- extendEnv name Imm a'
+      pure a'
 
 lookupCell :: EnvId -> Text -> Interp (Mutability, Address)
 lookupCell eid name = do
