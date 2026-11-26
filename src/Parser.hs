@@ -100,7 +100,7 @@ import Span (Span(..), mergeSpan)
 import Ast
 import Control.Monad (MonadPlus)
 import qualified Data.Text as T
-import Utils (Pretty(pretty))
+import Utils (Pretty(pretty), qualifyName)
 import Data.Foldable (toList)
 
 type Parser = Parsec Void [LToken]
@@ -396,11 +396,21 @@ keyword kw = tok test
     test (TKW k) | k == kw = Just ()
     test _ = Nothing
 
-name, infixName, meta :: Parser Text
+name, qualifiedName, infixName, meta :: Parser Text
 name = tok test
   where
     test (TName t) = Just t
     test _ = Nothing
+
+-- | A name a use may qualify with its module: @Name@ or @Module::Name@.
+--
+--   Only a reference is qualified.  A declaration, a parameter, a field and a
+--   type variable are plain @name@: a module does not declare names in another
+--   module's namespace, and @::@ there would only be a mistake.
+qualifiedName = do
+  m <- name
+  n <- optional (try (symbol TColonColon *> name))
+  pure $ maybe m (qualifyName m) n
 
 infixName = tok test
   where
@@ -755,7 +765,7 @@ patternAtom = locPattern $ choice [
 valPath :: Parser (Exp, [Text])
 valPath = do
   start <- currentPos
-  n <- name
+  n <- qualifiedName
   base <- withSpanFrom (spanFromPositions start start) (NName n)
   path <- many (symbol TAt *> name)
   pure (base, path)
@@ -772,7 +782,7 @@ arrayPatternTail = do
 charCon :: Parser PatternNode
 charCon = do
   symbol TSharp
-  n <- name
+  n <- qualifiedName
   -- `#Some x as whole` is the constructor pattern and then an alias of the
   -- whole clause, not `Some` applied to three fields: `as` belongs to the
   -- clause, so a field is only tried when the next token is not `as`.
@@ -832,7 +842,7 @@ arrowEffRow :: Parser EffRow
 arrowEffRow =
   try (braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> meta))
   <|> try (do
-    n <- name
+    n <- qualifiedName
     -- `T#[...]` applies a row alias.  The bracket itself says so, which is the
     -- one case where a name followed by something is unambiguously a row: a
     -- row followed by a type would be a row alias and a type, which only the
@@ -873,7 +883,7 @@ typAtom = do
 typAtomBase :: Parser Typ
 typAtomBase =
   choice [
-    try $ TGenericAlias <$> name <*> typeApps,
+    try $ TGenericAlias <$> qualifiedName <*> typeApps,
     TFlat <$> flatName,
     -- `nil` consumes `(` before it discovers that the parentheses are not
     -- empty, and without `try` the choice would not reach the parenthesised
@@ -897,7 +907,7 @@ typAtomBase =
 --   spelling the reader needs.
 flatName :: Parser Text
 flatName = do
-  n <- name
+  n <- qualifiedName
   noBareApplication n
   pure n
 
@@ -1025,7 +1035,7 @@ effRow =
     -- only a leftover of a type application, so it is reported rather than
     -- left for the bracket to fail at.
     try $ do
-      n <- name
+      n <- qualifiedName
       apps <- optional typeApps
       case apps of
         Just ts -> pure $ ERAlias n (Just ts)
@@ -1045,7 +1055,7 @@ effCons = (EVar <$> meta) <|> (EffCons <$> eCons)
 
 eCons :: Parser ECons
 eCons = do
-  n <- name
+  n <- qualifiedName
   -- An effect is applied with a hash too: `Loop#[Int]`.  Saying so beats
   -- letting the name through and failing at the bracket.
   noBareApplication n
@@ -1145,8 +1155,8 @@ typeArg = makeExprParser typeArgAtom table
 typeArgAtom :: Parser TypeArg
 typeArgAtom =
   choice [
-    try $ TAGenericAlias <$> name <*> typeApps,
-    TAFlat <$> name,
+    try $ TAGenericAlias <$> qualifiedName <*> typeApps,
+    TAFlat <$> qualifiedName,
     -- `nil` consumes `(` before it discovers that the parentheses are not
     -- empty, so it needs `try`: otherwise `with [(Int, String)]` fails at the
     -- `Int` and the parenthesised type below is never reached.
@@ -1308,7 +1318,7 @@ prefixExp =
   <|> try matchExp
   <|> try (loc $ NLiteral <$> literal)
   <|> try parensThing
-  <|> loc (NName <$> name)
+  <|> loc (NName <$> qualifiedName)
 
 -- Постфикс и инфикс операторы
 parsePostfix :: Exp -> Parser Exp
@@ -1464,12 +1474,12 @@ simpleTerm :: Parser Exp
 simpleTerm =
     loc (NLiteral <$> literal)
     <|> parensThing
-    <|> loc (NName <$> name)
+    <|> loc (NName <$> qualifiedName)
 
 handlerClause :: Parser HandlerClause
 handlerClause = do
   pipesym
-  n <- name
+  n <- qualifiedName
   args <- many name
   symbol TMatchArrow
   HandlerClause n args <$> block

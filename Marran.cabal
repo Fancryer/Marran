@@ -5,7 +5,7 @@ cabal-version: 2.2
 -- see: https://github.com/sol/hpack
 
 name:           Marran
-version:        0.2.3.0
+version:        0.2.3.1
 description:    Please see the README on GitHub at <https://github.com/Fancryer/Marran#readme>
 homepage:       https://github.com/Fancryer/Marran#readme
 bug-reports:    https://github.com/Fancryer/Marran/issues
@@ -42,6 +42,7 @@ library
       Module
       Occurs
       Parser
+      Qualified
       Record
       Resume
       Scope
@@ -124,7 +125,7 @@ test-suite marran-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      UnifySpec UnifyPropertySpec FreezePropertySpec GeneralizeSpec FreezeSpec ExamplesSpec SpanSpec DiagnosticSpec ParserSpec SuggestSpec BuiltinSpec ImportSpec BenchmarkSpec
+      UnifySpec UnifyPropertySpec FreezePropertySpec GeneralizeSpec FreezeSpec ExamplesSpec SpanSpec DiagnosticSpec ParserSpec SuggestSpec BuiltinSpec ImportSpec QualifiedSpec BenchmarkSpec
   hs-source-dirs:
       test
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N

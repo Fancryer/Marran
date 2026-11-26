@@ -43,14 +43,17 @@ import Data.Maybe (fromMaybe)
 import qualified Data.Graph as Graph
 import Data.Graph (SCC(..))
 import System.Directory (doesFileExist)
-import System.FilePath (takeDirectory, (</>), normalise, isAbsolute)
+import System.FilePath (takeDirectory, (</>), normalise, isAbsolute, dropExtension)
 
 import qualified Ast
 import Ast (Chunk)
 import Builtins (Builtin(..), BuiltinKind(..), builtins, moduleNames)
 import Module
 import Parser (chunk, parseFromTextNamed)
+import Qualified (UseKind(..), QualUse(..), qualUses, mapQualified)
 import Span (Span, noSpan)
+import Utils (splitQualified, qualifyName)
+import qualified Suggest
 
 -- | A failure of the loader.  The message is the text a reader sees and the
 --   span says where in which file, so the renderer can quote the line.
@@ -296,10 +299,391 @@ settleComponent nodes comp = do
   visible <- foldlM (\t p -> do
                 vis <- strictVisible nodes allTables p
                 pure $ Map.insert p vis t) Map.empty paths
-  pure $ foldl' (\ns p -> case (Map.lookup p published, Map.lookup p visible) of
-      (Just pub, Just vis) ->
-        Map.adjust (\n -> n {nPublished = pub, nVisible = vis}) p ns
+  -- Qualification is the last step of settling: it reads the published table
+  -- of every imported module, which is only now final, and the visible table of
+  -- the module itself, which says what an import actually reached.
+  let info = ModuleInfo nodes allTables (enumsOf nodes) (effectsOf nodes)
+  qualified <- foldlM (\t p -> do
+                  chunk' <- qualifyNode info (visible Map.! p) (nodes Map.! p)
+                  pure $ Map.insert p chunk' t) Map.empty paths
+  pure $ foldl' (\ns p -> case (Map.lookup p published, Map.lookup p visible, Map.lookup p qualified) of
+      (Just pub, Just vis, Just chunk') ->
+        Map.adjust (\n -> n {nPublished = pub, nVisible = vis, nChunk = chunk'}) p ns
       _ -> ns) nodes paths
+
+-- ---------------------------------------------------------------------------
+-- Qualified names
+-- ---------------------------------------------------------------------------
+
+-- | Everything a qualified name may need to see.
+data ModuleInfo = ModuleInfo {
+    miNodes   :: Map FilePath Node
+  , miTables  :: Map FilePath Table
+  , miEnums   :: Enums
+    -- | The operations each effect declares, per module.  An operation is not
+    --   a top-level name: it travels with its effect, so the published table
+    --   cannot answer `M::op` on its own.
+  , miEffects :: Map FilePath (Map Text [Text])
+  }
+
+-- | The effects each module declares, and the operations of each.
+effectsOf :: Map FilePath Node -> Map FilePath (Map Text [Text])
+effectsOf nodes = Map.map ofNode nodes
+  where
+    ofNode n = Map.fromList
+      [ (name, [ op | Ast.EffectOp op _ <- ops ])
+      | Ast.EffectDef _ name _ ops <- Ast.modDecls (nChunk n)
+      ]
+
+-- | What a resolved qualified name asks the file to do with the spelling.
+--
+--   A value keeps its spelling and becomes a binding of its own; every other
+--   namespace is resolved here and the syntax tree carries the local name.
+data Decision = Decision {
+    dRewrite :: Maybe Text
+  , dAlias   :: Maybe QualifiedAlias
+  }
+
+-- | A declaration a qualified name can name.
+data Target =
+    TableTarget Imported
+    -- | An operation, and the effect that declares it as the source offers it.
+    --   The operation's own name is the one the use writes.
+  | OpTarget Text Imported
+
+-- | The spellings a file may use for the modules it imports.
+--
+--   A module answers to its header's name and to the name of its file: the
+--   header is what it calls itself, the file name is what `import` writes, and
+--   a reader may have either in mind.
+importedSpellings :: Map FilePath Node -> Node -> [(Text, Source)]
+importedSpellings nodes n = nub
+  [ (spelling, src)
+  | i <- nImports n
+  , (spelling, src) <- spellings (iSource i)
+  ]
+  where
+    spellings = \case
+      -- `import @native` is the whole native scope, so every native module is
+      -- a name it can be asked about.  The source of a spelling is still the
+      -- one module that actually offers the name: `@native` brings `sayn`, but
+      -- `Numbers::sayn` must be told that `Numbers` does not offer it.
+      SrcNative m | T.null m -> [ (x, SrcNative x) | x <- moduleNames ]
+      SrcNative m -> [(m, SrcNative m)]
+      SrcModule p -> case Map.lookup p nodes of
+        Nothing -> []
+        Just src -> [ (s, SrcModule p)
+                    | s <- nub
+                        [ Ast.mhName (Ast.modHeader (nChunk src))
+                        , T.pack (dropExtension (baseName p))
+                        ] ]
+
+-- | Resolve every qualified name in one module and record what it found.
+qualifyNode :: ModuleInfo -> Table -> Node -> Either LoadError Chunk
+qualifyNode info visible n = do
+  let header = Ast.modHeader thisChunk
+  decisions <- foldlM decide Map.empty (qualUses thisChunk)
+  let (chunk', _) = mapQualified
+        (\_ kind name -> Map.lookup (kind, name) decisions >>= dRewrite)
+        thisChunk
+      -- One spelling can be used in more than one namespace: `M::Some` is a
+      -- value in an expression and a constructor in a pattern, and the two
+      -- decisions describe the same binding.  Keeping one alias per qualified
+      -- spelling and local name is what lets the checker add it once.
+      aliases = Map.map nondescript $ Map.fromListWith (<>)
+        [ (name, [alias])
+        | ((_, name), d) <- Map.toList decisions
+        , Just alias <- [dAlias d]
+        ]
+  pure chunk' { Ast.modHeader = header {mhQualified = aliases} }
+  where
+    nondescript = foldr keep []
+    keep a acc
+      | any (same a) acc = acc
+      | otherwise = a : acc
+    same a b = qaLocal a == qaLocal b
+            && qaKind a == qaKind b
+            && qaOrigin a == qaOrigin b
+            && qaName a == qaName b
+    thisChunk = nChunk n
+    sources = importedSpellings (miNodes info) n
+
+    decide acc (QualUse name sp kind)
+      | Map.member (kind, name) acc = pure acc
+      | otherwise = do
+          d <- resolveUse info visible (nImports n) sources sp kind name
+          pure $ Map.insert (kind, name) d acc
+
+-- | Resolve one qualified spelling in the namespace its position implies.
+resolveUse ::
+     ModuleInfo
+  -> Table
+  -> [Import]
+  -> [(Text, Source)]
+  -> Span
+  -> UseKind
+  -> Text
+  -> Either LoadError Decision
+resolveUse info visible imports sources sp kind q = do
+  (m, x) <- case splitQualified q of
+    Just pair -> pure pair
+    Nothing -> qualError sp (T.concat ["`", q, "` is not a qualified name"]) []
+  src <- findSource m
+  offer <- offeredTable src
+  target <- findTarget m x src offer
+  case target of
+    TableTarget imp
+      | kind == UseValue -> do
+          local <- localSpelling info visible imports src sp m x x imp
+          pure $ Decision Nothing (Just $ alias local Nothing imp)
+      | kind == UseCtor -> do
+          local <- localSpelling info visible imports src sp m x x imp
+          en <- constructorEnum info visible sp m x imp
+          -- A pattern is matched against the constructor's declared name, so
+          -- the spelling is rewritten rather than aliased: the tag a value
+          -- carries is the declared one, not the one this file imported it
+          -- under.
+          pure $ Decision (Just (imName imp)) (Just $ alias local en imp)
+      | otherwise -> do
+          local <- localSpelling info visible imports src sp m x x imp
+          pure $ Decision (Just local) Nothing
+    OpTarget offered imp -> do
+      -- An operation keeps its name; the effect is what an import brings and
+      -- what makes the operation reachable.
+      _ <- localSpelling info visible imports src sp m offered offered imp
+      pure $ Decision (Just x) Nothing
+  where
+    findSource m =
+      case nub [s | (spelling, s) <- sources, spelling == m] of
+        [] -> Left $ notImportedModule sp m (writtenNames)
+        [s] -> Right s
+        _ -> qualError sp
+          (T.concat ["`", m, "` names more than one imported module"])
+          ["import the two modules by different paths, or name one with `as`"]
+
+    -- What the file itself wrote after `import`, for a reader who is told a
+    -- module is missing.  The expanded spellings of `@native` would name every
+    -- native module; the import is one line, and the note should quote it.
+    writtenNames = nub $ concatMap written imports
+    written i = case iSource i of
+      SrcNative m | T.null m -> ["@native"]
+      SrcNative m -> [m]
+      SrcModule p -> case Map.lookup p (miNodes info) of
+        Nothing -> [T.pack (dropExtension (baseName p))]
+        Just src -> nub
+          [ Ast.mhName (Ast.modHeader (nChunk src))
+          , T.pack (dropExtension (baseName p))
+          ]
+
+    offeredTable = \case
+      SrcNative m' -> nativeTable m'
+      SrcModule p -> Right $ Map.findWithDefault Map.empty p (miTables info)
+
+    alias local en imp = QualifiedAlias
+      { qaLocal = local
+      , qaKind = imKind imp
+      , qaOrigin = imOrigin imp
+      , qaName = imName imp
+      , qaEnum = en
+      , qaOp = Nothing
+      }
+
+    -- The entries of the source's published table, and the operations its
+    -- effects declare.
+    findTarget m x src offer = case kind of
+      UseValue -> case values of
+        (imp : _) -> pure (TableTarget imp)
+        [] -> operations
+      UseCtor -> case [imp | imp <- entries, imKind imp == KindFunct] of
+        (imp : _) -> pure (TableTarget imp)
+        [] -> missing
+      UseType -> tableTarget [imp | imp <- entries, imKind imp `elem` [KindType, KindEnum]]
+      UseEffect -> case effectsOfSource of
+        (imp : _) -> pure (TableTarget imp)
+        [] -> missing
+      UseRow -> tableTarget [imp | imp <- entries, imKind imp == KindRow]
+      UseOp -> case nativeOps of
+        (imp : _) -> pure (TableTarget imp)
+        [] -> operations
+      where
+        entries = Map.findWithDefault [] x offer
+        values = [ imp | imp <- entries, imKind imp == KindFunct ]
+              <> nativeOps
+        nativeOps =
+          [ imp | imp <- entries
+                , imKind imp == KindEffect
+                , nativeOrigin (imOrigin imp) ]
+        effectsOfSource =
+          [ imp | imp <- entries
+                , imKind imp == KindEffect
+                , not (nativeOrigin (imOrigin imp)) ]
+
+        tableTarget imps = case imps of
+          (imp : _) -> pure (TableTarget imp)
+          [] -> missing
+
+        missing
+          | null entries = Left $ notOffered info src sp m x offer
+          | otherwise = Left $ kindMismatch sp m x entries kind
+
+        -- A use of an operation is the one case where the name is not in the
+        -- table: an operation belongs to its effect, and only the effect is
+        -- exported.  The effect must still be one this file imported, which
+        -- `localSpelling` checks.
+        operations = case src of
+          SrcNative _ -> missing
+          SrcModule _ -> case
+            [ (offered, imp)
+            | (offered, imps) <- Map.toList offer
+            , imp <- imps
+            , imKind imp == KindEffect
+            , FromModule p <- [imOrigin imp]
+            , x `elem` Map.findWithDefault [] (imName imp)
+                          (Map.findWithDefault Map.empty p (miEffects info))
+            ] of
+              [] -> missing
+              [(offered, imp)] -> pure (OpTarget offered imp)
+              _ -> qualError sp (T.concat [
+                  "`", x, "` is an operation of more than one effect of `", m, "`"
+                ]) ["name the effect in a row, or handle it"]
+
+-- | The local spelling of a declaration an import brought, or why it did not.
+localSpelling ::
+     ModuleInfo
+  -> Table
+  -> [Import]
+  -> Source
+  -> Span
+  -> Text
+  -> Text
+  -> Text
+  -> Imported
+  -> Either LoadError Text
+localSpelling info visible imports src sp m written offered imp =
+  case nub present of
+    [] -> case nub reconstructed of
+      [] -> qualError sp (T.concat [
+          "`", written, "` is offered by `", m, "` but not imported here"
+        ]) [T.concat ["name it in the import list of `", m, "`"]]
+      locals -> qualError sp (T.concat [
+          "`", written, "` from `", m, "` is shadowed by a declaration of ",
+          T.intercalate " or " [T.concat ["`", l, "`"] | l <- locals], " here"
+        ]) [ "a qualified name does not reach an import that a declaration shadows"
+             , "rename the import with `as`, or use the declaration's own spelling" ]
+    [local] -> pure local
+    locals
+      | offered `elem` locals -> pure offered
+      | otherwise -> qualError sp (T.concat [
+          "`", written, "` from `", m, "` is imported under more than one name: ",
+          T.intercalate ", " locals
+        ]) ["keep one spelling in the import list"]
+  where
+    present = [local | (local, i) <- tableEntries visible, i == imp]
+    -- What the imports would have brought, had nothing shadowed it.  Running
+    -- the same resolution the visible table was built from says which local
+    -- name the declaration had in mind.
+    reconstructed =
+      [ local
+      | i <- imports
+      , iSource i == src
+      , (local, Just imp') <- resolveImport (miEnums info) (miTables info) i
+      , imp' == imp
+      ]
+
+-- | The enumeration a constructor belongs to, as this file spells it.
+--
+--   A pattern needs the declaration to know the fields and the cases, so a
+--   constructor whose enumeration was not imported cannot be matched -- even
+--   when the constructor itself was imported by name.
+constructorEnum ::
+     ModuleInfo -> Table -> Span -> Text -> Text -> Imported
+  -> Either LoadError (Maybe Text)
+constructorEnum info visible sp m x imp = case imOrigin imp of
+  FromNative _ -> qualError sp
+    (T.concat ["`", x, "` is a native value, not a constructor"]) []
+  FromModule p ->
+    case [ e
+         | (e, cs) <- Map.toList (Map.findWithDefault Map.empty p (miEnums info))
+         , imName imp `elem` cs ] of
+      [] -> qualError sp (T.concat [
+          "`", x, "` is not a constructor of `", m, "`"
+        ]) ["a `#` pattern names a constructor"]
+      (e : _) -> case
+        nub [ local
+            | (local, i) <- tableEntries visible
+            , i == Imported (FromModule p) e KindEnum
+            ] of
+          [] -> qualError sp (T.concat [
+              "the constructor `", x, "` belongs to the enumeration `", e,
+              "`, which is not imported here"
+            ]) [T.concat ["a constructor pattern needs its enumeration: import `", e, "`"]]
+          (local : _) -> pure (Just local)
+
+-- | The diagnostic for a module spelling that names nothing imported.
+notImportedModule :: Span -> Text -> [Text] -> LoadError
+notImportedModule sp m known = LoadError sp
+  (T.concat ["the module `", m, "` is not imported"]) notes
+  where
+    names = nub known
+    notes = case names of
+      [] -> ["this file imports no module by a qualified name"]
+      _ -> ["the modules this file imports are: " <> T.intercalate ", " names]
+        <> maybe [] (\s -> ["did you mean `" <> s <> "`?"])
+             (Suggest.best names m)
+
+-- | The diagnostic for a name the source does not offer at all.
+notOffered :: ModuleInfo -> Source -> Span -> Text -> Text -> Table -> LoadError
+notOffered info src sp m x offer = case src of
+  SrcModule p
+    | Map.member x (declaredTable (miNodes info) p) ->
+        LoadError sp (T.concat [
+            "`", x, "` is declared in `", m, "` but not exported"
+          ]) ["a module offers the names its export list names"]
+  _ -> LoadError sp (T.concat [where_, " does not offer `", x, "`"]) (notes)
+  where
+    where_ = case src of
+      SrcModule _ -> T.concat ["the module `", m, "`"]
+      SrcNative nm -> T.concat ["`@native ", nm, "`"]
+    names = nub (Map.keys offer)
+    notes =
+      [case names of
+         [] -> "it offers nothing"
+         _ -> "it offers: " <> T.intercalate ", " names]
+      <> maybe [] (\s -> ["did you mean `" <> qualifyName m s <> "`?"])
+           (Suggest.best names x)
+
+-- | The diagnostic for a name that is there, but in another namespace.
+kindMismatch :: Span -> Text -> Text -> [Imported] -> UseKind -> LoadError
+kindMismatch sp m x entries kind = LoadError sp (T.concat [
+    "`", x, "` in `", m, "` is ", kinds, ", not ", wanted
+  ]) notes
+  where
+    kinds = T.intercalate " and " (map kindName (mapKindNub (map imKind entries)))
+    wanted = describeUse kind
+    notes = case kind of
+      UseType | any ((== KindEffect) . imKind) entries ->
+        [T.concat ["an effect goes in a row: write `{", x, "}`"]]
+      UseEffect ->
+        ["an operation is not an effect: use it as a value or in a handler clause"]
+      UseCtor -> ["a `#` pattern names a constructor"]
+      _ -> []
+
+describeUse :: UseKind -> Text
+describeUse = \case
+  UseValue -> "a value"
+  UseCtor -> "a constructor"
+  UseType -> "a type"
+  UseEffect -> "an effect"
+  UseRow -> "a row"
+  UseOp -> "an operation"
+
+nativeOrigin :: ImportOrigin -> Bool
+nativeOrigin = \case
+  FromNative _ -> True
+  FromModule _ -> False
+
+qualError :: Span -> Text -> [Text] -> Either LoadError a
+qualError sp msg notes = Left $ LoadError sp msg notes
 
 -- | The names a module declares: every top-level name and its kind.  The
 --   constructors of an enum are values of the module's scope, so they travel
@@ -357,7 +741,12 @@ constructorsOf enums origin name = case origin of
 nativeTable :: Text -> Either LoadError Table
 nativeTable m
   | T.null m = Right $ tableFromList
-      [ (bName b, Imported (FromNative "") (bName b) (nativeKind b)) | b <- builtins ]
+      -- The whole scope is every native module at once, but each name keeps
+      -- the module that declares it: that is what lets a qualified spelling
+      -- check that the module it writes really offers the name, and it makes
+      -- `@native` and `@native M` one declaration of `x`, not two.
+      [ (bName b, Imported (FromNative (bModule b)) (bName b) (nativeKind b))
+      | b <- builtins ]
   | null names =
       Left $ LoadError noSpan (T.concat ["there is no native module `", m, "`"])
         [ "native modules: " <> T.intercalate ", " moduleNames ]

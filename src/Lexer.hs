@@ -195,6 +195,9 @@ token = choice [
     sym "#" TSharp,
     sym "(" TParenL,        sym ")" TParenR,
     sym ":=" TRebind,
+    -- `::` is one token: it separates a module from a name and never appears
+    -- inside a name, because a name ends before a colon.
+    sym "::" TColonColon,
     sym ":" TColon,
     sym ";" TSemi,
     sym "," TComma,
@@ -262,6 +265,7 @@ data Token =
   TDollar
   | TAt
   | TColon
+  | TColonColon
   | TComma
   | TSemi
   | TEllipsis
@@ -300,6 +304,7 @@ instance Pretty Token where
     TDollar   -> "$"
     TAt       -> "@"
     TColon    -> ":"
+    TColonColon -> "::"
     TComma    -> ","
     TSemi     -> ";"
     TEllipsis -> "..."

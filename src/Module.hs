@@ -20,10 +20,12 @@ module Module (
   , ImportUnit(..)
   , Imported(..)
   , ImportOrigin(..)
+  , QualifiedAlias(..)
   , Table
   , tableFromList
   , tableEntries
   , mergeTables
+  , qualifiedAliases
   , Unit(..)
   , Program(..)
   , DeclKind(..)
@@ -90,7 +92,37 @@ data ModuleHeader = ModuleHeader {
   , mhPublished :: Table
   , mhExports   :: Maybe [ExportDecl]
   , mhSpan      :: Span
+    -- | The qualified names this file writes, and the declarations they name.
+    --
+    --   @M::x@ is an alias for a declaration of @M@: the loader fills this
+    --   table after the imports settle, and the checker and the interpreter
+    --   give each spelling a binding of its own.  It is keyed by the spelling
+    --   the file writes, like 'mhResolved', and it is empty until the loader
+    --   has resolved the module.
+  , mhQualified :: Map Text [QualifiedAlias]
   } deriving (Eq, Show, Generic)
+
+-- | What a qualified spelling stands for.
+--
+--   'qaLocal' is the spelling the declaration has in this file (an import may
+--   rename it), 'qaOrigin' and 'qaName' say where it is declared.  A
+--   constructor also names its enumeration, and an operation names the effect
+--   that provides it: both are resolved through a declaration rather than a
+--   top-level name.
+data QualifiedAlias = QualifiedAlias {
+    qaLocal  :: Text
+  , qaKind   :: DeclKind
+  , qaOrigin :: ImportOrigin
+  , qaName   :: Text
+  , qaEnum   :: Maybe Text
+  , qaOp     :: Maybe Text
+  } deriving (Eq, Ord, Show, Generic)
+
+-- | The qualified spellings a module header carries, if any.  A module that
+--   the loader has not resolved yet has none.
+qualifiedAliases :: ModuleHeader -> [(Text, QualifiedAlias)]
+qualifiedAliases header =
+  [ (q, a) | (q, as) <- Map.toList (mhQualified header), a <- as ]
 
 -- | What a name stands for: where it is declared, what it is called there, and
 --   what kind of declaration it is.
@@ -158,7 +190,7 @@ namespaceOf = \case
 instance Sexp ModuleHeader where sexp = show
 
 instance Pretty ModuleHeader where
-  pretty (ModuleHeader n imports _ _ exports _) = T.intercalate "\n" (T.concat [
+  pretty (ModuleHeader n imports _ _ exports _ _) = T.intercalate "\n" (T.concat [
         "module ", n,
         maybe "" (\ds -> T.concat [" [", T.unwords (map pretty ds), "]"]) exports
       ] : map pretty imports)
@@ -166,13 +198,14 @@ instance Pretty ModuleHeader where
 -- | A header as the parser produces it: nothing is resolved yet, so both tables
 --   are empty and the loader fills them in.
 parsedHeader :: Text -> [ImportDecl] -> Maybe [ExportDecl] -> Span -> ModuleHeader
-parsedHeader n imports = ModuleHeader n imports Map.empty Map.empty
+parsedHeader n imports exports sp =
+  ModuleHeader n imports Map.empty Map.empty exports sp Map.empty
 
 -- | Does this header export everything it declares, rather than a list?
 headerExportsAll :: ModuleHeader -> Bool
 headerExportsAll = \case
-  ModuleHeader _ _ _ _ Nothing _ -> True
-  ModuleHeader _ _ _ _ (Just _) _ -> False
+  ModuleHeader _ _ _ _ Nothing _ _ -> True
+  ModuleHeader _ _ _ _ (Just _) _ _ -> False
 
 -- | One name in an export or import list.
 --

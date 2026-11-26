@@ -1,6 +1,6 @@
 # Roadmap: the 0.2 line
 
-State as of 24 November 2026. Horizon: 0.2.3.1 to 0.2.9.9. The working task
+State as of 26 November 2026. Horizon: 0.2.3.2 to 0.2.9.9. The working task
 list and implementation details live in `TODO.md`; this file records only
 release themes, ordering and exit criteria.
 
@@ -61,7 +61,7 @@ release themes, ordering and exit criteria.
 | Release | Theme | Content | Criterion |
 |---|---|---|---|
 | 0.2.3.0 | Correctness | P0: soundness of `Cell`, completeness of `freeze`, property tests | P0 closed (released) |
-| 0.2.3.1 | Names | `Name::Name` for types, effects, rows, values and enums; import/export/native; diagnostics; `Pretty` and dumps | qualified names work everywhere |
+| 0.2.3.1 | Names | `Name::Name` for types, effects, rows, values and enums; import/export/native; diagnostics; `Pretty` and dumps | qualified names work everywhere (released) |
 | 0.2.3.2 | Freeze | conformance suite v1; syntax freeze; documentation of names | the 0.2 syntax is frozen |
 | 0.2.4.0 | Configuration | `marr.ilyn`: schema, layers, search, errors, unknown keys, `ConfigPatch` | no dead fields |
 | 0.2.4.1 | CLI | `run`/`check`/`dump`/`bench`, `--config`, exit codes, `System.args`, `runUntilPhase` | `marran run` honours the configuration |
@@ -96,16 +96,15 @@ than a static refusal -- a state-bearing record as an enum's type argument --
 because a type argument has no effect row; `rebindPath` refuses the write.
 Regressions are in `ExamplesSpec` and `FreezeSpec`.
 
-**0.2.3.1. `Name::Name`.** Qualified names in every namespace: types,
-effects, rows, values and enums (including constructors and effect
-operations). Decide and fix:
-
-- `M::x` requires `M` to be imported and `x` to be exported; qualification
-  is disambiguation, not a way around the module system;
-- it works for `@native` modules and for `M::T#[Int]`;
-- errors: the module is not imported, the name is not exported, a qualified
-  name conflicts with an unqualified one;
-- `Pretty`, `Sexp`, phase dumps and `Suggest` know about qualification.
+**0.2.3.1. `Name::Name`.** Released. Qualified names work in every namespace:
+types, type arguments, effects, rows, values, enumerations, constructors and
+effect operations.  `M` is the imported file's header name or its base name;
+the declaration must be exported and brought in by the import list.  Types,
+rows, effects and type arguments resolve to the local spelling of the import,
+constructors in patterns to their declared names, and values and constructors
+to real bindings of their own.  The whole native scope keeps each builtin's
+declaring module, so `Output::sayn` works and `Numbers::sayn` is refused.
+`QualifiedSpec` covers the resolutions, the diagnostics and the walk.
 
 **0.2.3.2. The freeze.** Conformance suite v1 (one test per language rule),
 syntax freeze, documentation of names. After this release no new keywords or

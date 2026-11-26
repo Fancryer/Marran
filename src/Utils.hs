@@ -13,7 +13,10 @@ module Utils (
   (|>),
   Zeroed(..),
   Pretty(..),
-  TextMap
+  TextMap,
+  splitQualified,
+  qualifyName,
+  isQualified
 ) where
 
 import qualified Data.Set as Set
@@ -73,6 +76,27 @@ class Pretty a where
   pretty = T.pack . show
 
 type TextMap a = Data.Map Data.Text a
+
+-- | Split a qualified name at its separator.
+--
+--   A name may not contain @::@: the lexer ends a name before a colon, so the
+--   first separator is the only one, and a name without one is unqualified.
+--   The module part is never empty.
+splitQualified :: Text -> Maybe (Text, Text)
+splitQualified t = case T.breakOn "::" t of
+  (m, rest)
+    | T.null m || T.null rest -> Nothing
+    | otherwise -> Just (m, T.drop 2 rest)
+
+-- | Write a qualified name.
+qualifyName :: Text -> Text -> Text
+qualifyName m n = T.concat [m, "::", n]
+
+-- | Is this spelling qualified?
+isQualified :: Text -> Bool
+isQualified t = case splitQualified t of
+  Just _ -> True
+  Nothing -> False
 
 instance Pretty a => Pretty (Maybe a) where
   pretty (Just a) = pretty a

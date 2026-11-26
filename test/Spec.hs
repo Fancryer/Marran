@@ -13,6 +13,7 @@ import ParserSpec (pSpec)
 import SuggestSpec (sSpec)
 import BuiltinSpec (bSpec)
 import ImportSpec (iSpec)
+import QualifiedSpec (qSpec)
 import BenchmarkSpec (benchSpec)
 
 main :: IO ()
@@ -29,4 +30,5 @@ main = hspec $ do
   describe "suggestions" sSpec
   describe "builtins" bSpec
   describe "imports" iSpec
+  describe "qualified names" qSpec
   describe "benchmark graphs" benchSpec

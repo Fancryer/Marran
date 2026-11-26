@@ -151,7 +151,7 @@ import Data.Text (Text)
 import Control.Lens (use)
 import ErrorContext (IrFrame (IrFrame), ErrorFrame (..))
 import Suggest (suggestionNote)
-import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), DeclKind(..), Unit(..), Program(..), tableEntries)
+import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), DeclKind(..), Unit(..), Program(..), tableEntries, QualifiedAlias(..), qualifiedAliases)
 import Span (Span)
 import Data.Set (Set)
 
@@ -565,15 +565,27 @@ moduleScope args tables header = do
         , local /= imName imp
         ]
   base <- Scope.nativeScope (`elem` natives) args
-  foldM (addImport renames base) base resolved
+  scoped <- foldM (addImport renames base) base resolved
+  -- A qualified spelling is a binding of its own, next to the name the import
+  -- brought it under.  Copying the binding rather than rebuilding it keeps a
+  -- type-directed native recognisable under either spelling.
+  foldM addAlias scoped (qualifiedAliases header)
   where
+    addAlias sc (qualified, alias) =
+      case Scope.findBindingWithRow False sc (qaLocal alias) of
+        Just (ValueBinding scheme expr mut row) ->
+          Scope.addBindingWithRow qualified scheme expr mut row sc
+        Nothing -> pure sc
+
     addImport renames base sc (local, imp) = case imOrigin imp of
       FromNative _
         -- A native name renamed by `as`: the scheme is the declared one, the
-        -- spelling in this file is the alias.
+        -- spelling in this file is the alias.  The expression is copied too,
+        -- because it is what marks a type-directed native.
         | local /= imName imp ->
-            case Scope.findBinding False base (imName imp) of
-              Just (scheme, _, _) -> Scope.addBinding local (renameScheme renames scheme) (XVar local) Val sc
+            case Scope.findBindingWithRow False base (imName imp) of
+              Just (ValueBinding scheme expr mut row) ->
+                Scope.addBindingWithRow local (renameScheme renames scheme) expr mut row sc
               Nothing -> pure sc
         | otherwise -> pure sc
       FromModule path -> case Map.lookup path tables of
@@ -872,7 +884,7 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
     -- builds.  The `with` path below constructs the node directly, so this
     -- branch only sees a bare use.
     | Just binding <- Scope.findBindingWithRow True scope v
-    , isTypeDirectedBinding v binding ->
+    , isTypeDirectedBinding binding ->
         throwTypeCheckError $ ApplicationError $ T.concat [
             "`", v, "` needs a type argument: write `", v, " with [T] ...`"
           ]
@@ -980,7 +992,7 @@ inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan ex
           _ -> []
     case (withExpr, binding, operations) of
       (XVar v, Just b, _)
-        | isTypeDirectedBinding v b ->
+        | isTypeDirectedBinding b ->
             inferWithTypeDirected scope v b ts es rs
       (XVar v, Just b, _)
         | not (null ts && null es && null rs) ->
@@ -1523,13 +1535,16 @@ inferLetPattern row scope = \case
 
             pure (accProps <> [TRecordProp m name t'], scope''')
 
--- | Does this binding name a type-directed native?  A user binding that
---   shadows the name keeps its ordinary meaning, so the declaration's
---   expression has to be the native signature too.
-isTypeDirectedBinding :: Text -> ValueBinding -> Bool
-isTypeDirectedBinding v (ValueBinding _ expr _ _) =
-  Builtins.isTypeDirected v && case expr of
-    NLambda (NativeLambdaSign n _ _ _) -> n == v
+-- | Is this binding a type-directed native?
+--
+--   The name it is bound under is not the test: an import may rename the native
+--   or reach it through a qualified spelling, and both spellings still denote
+--   the same builtin.  The binding's expression keeps the declared name, which
+--   is what the builtin table knows.
+isTypeDirectedBinding :: ValueBinding -> Bool
+isTypeDirectedBinding (ValueBinding _ expr _ _) =
+  case expr of
+    NLambda (NativeLambdaSign n _ _ _) -> Builtins.isTypeDirected n
     _ -> False
 
 -- | The first part of a type that a type-directed native cannot build.

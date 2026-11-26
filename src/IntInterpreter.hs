@@ -29,7 +29,7 @@ import Data.Scientific (Scientific, fromFloatDigits, normalize, scientific)
 import Control.Monad.Cont (ContT(..), callCC)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Span (Span, noSpan)
-import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), Unit(..), Program(..), moduleAt, tableEntries, DeclKind(..))
+import Module (Module(..), ModuleHeader(..), Imported(..), ImportOrigin(..), Unit(..), Program(..), moduleAt, tableEntries, DeclKind(..), QualifiedAlias(..), qualifiedAliases)
 import Utils (TextMap, Pretty (..))
 import Data.Foldable (find)
 import Data.List (intercalate, nub)
@@ -597,7 +597,7 @@ evalProgram prog root = do
       forM_ fresh $ \(_, eid, m) -> linkImports known eid m
       pure $ Map.union here envs
 
-    linkImports envs eid m =
+    linkImports envs eid m = do
       forM_ (tableEntries (mhResolved (modHeader m))) $ \(local, imp) ->
         -- Only a value is a binding: a type, an effect or a row of the same
         -- spelling lives in the checker's scope, not in the environment, and a
@@ -611,6 +611,17 @@ evalProgram prog root = do
           FromModule path -> case Map.lookup path envs of
             Nothing -> pure ()
             Just src -> copyFrom eid src local (imName imp)
+      -- A qualified spelling is a binding of its own, so a local variable of
+      -- the same unqualified name cannot shadow it.  The imports are bound by
+      -- now, and a constructor of the module itself is bound by 'evalModule'
+      -- before this runs.
+      forM_ (qualifiedAliases (modHeader m)) $ \(qualified, alias) ->
+        findBindingEnvMaybe eid (qaLocal alias) >>= \case
+          Just (_, mut, addr) -> do
+            _ <- modifyEnv eid $ \env ->
+              env {bindings = Map.insert qualified (mut, addr) env.bindings}
+            pure ()
+          Nothing -> pure ()
 
     copyFrom eid src local declared =
       findBindingEnvMaybe src declared >>= \case

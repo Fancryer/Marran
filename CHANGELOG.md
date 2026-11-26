@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## 0.2.3.1 - 2026-11-26
+
+Qualified names: `M::x` now works in every namespace a name can occupy --
+types, type arguments, effects, rows, values, constructors and effect
+operations -- and the loader resolves the spelling against the module the file
+actually imported.
+
+- The lexer reads `::` as one token, before the `:` of an annotation.  The
+  parser keeps a qualified name as the one string it was written as, in every
+  reference position: names, patterns, `val` paths, handler clauses, types,
+  type arguments, rows, effect constructors and `flatName`.  A declaration,
+  parameter or field is still a plain name.
+- The module part of `M::x` is either the name in the imported file's header
+  or the base name of its file (`Lib` and `lib` both name `lib.marr`).  The
+  declaration has to be exported by that module and brought in by the import
+  list: qualification is disambiguation, not a way around the module system.
+- Types, effects, rows and type arguments are rewritten to the local spelling
+  the import gave them, so `import lib [enum Colour as Shade]` makes
+  `Lib::Colour` mean `Shade` in a signature.  An operation keeps its own name
+  and is reachable only when its effect is imported; a constructor pattern is
+  rewritten to the declared constructor name, because the tag a value carries
+  is the one the enumeration declared.
+- A qualified value or constructor becomes a binding of its own
+  (`ModuleHeader.mhQualified`): a local `let` cannot shadow it, while a
+  top-level declaration that shadows the import makes the qualified use a
+  diagnostic.  `IntInterpreter` binds the alias to the same address as the
+  local name.
+- `import @native` is the whole native scope, and each builtin now keeps the
+  module that declares it as its origin.  `Output::sayn` and
+  `Conv::parse with [Int]` therefore resolve, `Numbers::sayn` is refused as a
+  name `Numbers` does not offer, and `import @native Output` leaves `Conv`
+  unreachable.  The same change makes `@native` and `@native M` one
+  declaration of a name rather than two.
+- A type-directed native is recognised by the name its binding declares, not
+  by the spelling the file writes, so a renamed or qualified `parse` still
+  takes its type argument at the call site.
+- Diagnostics say which module is missing, list the imports the file actually
+  wrote, name a declaration that is private ("declared in `Lib` but not
+  exported"), distinguish a name the import list did not bring, report a
+  shadowed import, and suggest a module or a qualified name one edit away.
+- `src/Qualified.hs` is the single walk that reports every use with the
+  namespace its position implies and rewrites it on the way back; `QualifiedSpec`
+  covers both module spellings, native names, renamed imports, types and type
+  arguments, constructors and patterns, effects and operations in handlers,
+  row aliases, the diagnostics, `Pretty`/`Sexp` and the walk itself.
+
+Tests: 514 examples, 0 failures.
+
 ## 0.2.3.0 - 2026-11-24
 
 The two P0 items of the 0.2 line are closed: the `Cell` analysis no longer
