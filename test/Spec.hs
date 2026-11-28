@@ -15,6 +15,7 @@ import BuiltinSpec (bSpec)
 import ImportSpec (iSpec)
 import QualifiedSpec (qSpec)
 import BenchmarkSpec (benchSpec)
+import ConformanceSpec (conformanceSpec)
 
 main :: IO ()
 main = hspec $ do
@@ -32,3 +33,4 @@ main = hspec $ do
   describe "imports" iSpec
   describe "qualified names" qSpec
   describe "benchmark graphs" benchSpec
+  describe "conformance" conformanceSpec

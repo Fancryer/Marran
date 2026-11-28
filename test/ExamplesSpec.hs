@@ -615,14 +615,14 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> expectationFailure $ "the program must run: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe` ["Some 5", "None"]
 
-    it "accepts the `#[...]` spelling of the type argument" $ do
+    it "rejects the old `#[...]` spelling after `with`" $ do
       r <- runSourceWithInput "parse_sharp.marr" "" $ T.unlines
         [ "funct main () : {Output; Error} () ="
         , "  sayn (parse with #[Int] '7')"
         ]
       case r of
-        Left err -> expectationFailure $ "both spellings must work: " ++ err
-        Right out -> filter (not . isReport) (lines out) `shouldBe` ["7"]
+        Left err -> err `shouldSatisfy` ("E0013" `isInfixOf`)
+        Right _ -> expectationFailure "`with` must spell its type arguments as `[...]`"
 
     it "rejects text that is not a value of the requested type" $ do
       r <- runSourceWithInput "parse_bad_text.marr" "" $ T.unlines
@@ -1085,6 +1085,19 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
         Left err -> expectationFailure $ "printing an array must work: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe`
           ["[1, 2]", "[[a], [b, c]]", "[(1, 2), (3, 4)]", "#{val xs = [1]}"]
+
+    it "reads an exponent-only decimal and the string escapes" $ do
+      -- `1e3` is a float, not `1` applied to `e3`; a string may spell a
+      -- newline and a tab.
+      r <- runSourceWithInput "print_literals.marr" "" $ T.unlines
+        [ "funct main () : {Output} () ="
+        , "  sayn (to_int 1e3);"
+        , "  sayn (slen 'a\\nb');"
+        , "  sayn (slen 'a\\tb')"
+        ]
+      case r of
+        Left err -> expectationFailure $ "the literals must parse and run: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["1000", "3", "3"]
 
     it "prints a function by its name, not by its address" $ do
       -- A function used to print as `!closure[&00000000]!`: every function was
@@ -1685,6 +1698,40 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
       case r of
         Left err -> expectationFailure $ "`as` must bind the subject: " ++ err
         Right out -> filter (not . isReport) (lines out) `shouldBe` ["one", "other"]
+
+    it "matches a pair with a tuple pattern" $ do
+      r <- runSourceWithInput "match_tuple.marr" "" $ T.unlines
+        [ "funct left_of (p (Int, Int)) : Int ="
+        , "  match (p) to"
+        , "    | (a, b) => a"
+        , ""
+        , "funct right_of (p (Int, Int)) : Int ="
+        , "  match (p) to"
+        , "    | a, b => b"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (left_of (1, 2));"
+        , "  sayn (right_of (1, 2))"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a tuple pattern must match a pair: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["1", "2"]
+
+    it "nests a `<-|` chain to the left" $ do
+      r <- runSourceWithInput "match_ends_chain.marr" "" $ T.unlines
+        [ "funct middle (s String) : String ="
+        , "  match (s) to"
+        , "    | 'a' <-| x <-| 'c' => x"
+        , "    | _ => 'none'"
+        , ""
+        , "funct main () : {Output} () ="
+        , "  sayn (middle 'abc');"
+        , "  sayn (middle 'axc');"
+        , "  sayn (middle 'ab')"
+        ]
+      case r of
+        Left err -> expectationFailure $ "a `<-|` chain must type-check: " ++ err
+        Right out -> filter (not . isReport) (lines out) `shouldBe` ["b", "x", "none"]
 
     it "compares against a value the program already has with `val`" $ do
       r <- runSourceWithInput "match_val.marr" "" $ T.unlines

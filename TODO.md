@@ -452,7 +452,8 @@ interpreter as a value»), а не «not implemented», и `val f = +; f 1 2`
       sayn (id with [Int] 1)        // 1
       sayn (parse with [Int] '42')  // 42
       ```
-      `with [T]` и `with #[T]` — одно и то же; аргумент привязан к имени
+      `with` пишет типовые аргументы как `[T]`; `#[T]` после `with` больше
+      не принимается. Аргумент привязан к имени
       (`parse with [Int] s` = `(parse with [Int]) s`). Для не-имён остался
       путь через `TForall`. Вместе с этим закрыт `Conv@parse`: тип строится по
       `TypeRep` (Int, Float, Boolean, String, `()`, массивы, пары, записи,

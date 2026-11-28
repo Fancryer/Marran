@@ -59,7 +59,6 @@ import Text.Megaparsec(
     optional,
     some,
     sepBy1,
-    sepBy,
     (<|>),
     satisfy,
     between,
@@ -697,32 +696,13 @@ withAlias p n = MkPattern (patSpan p) (PAs p n)
 -- | A pattern without a trailing @as@.  Nested positions use the full
 --   'pattern', so @(a as x)@ still binds both names.
 patternNoAs :: Parser Pattern
-patternNoAs = patternStarts <|> patternTuple <|> patternSuffix
+patternNoAs = patternTuple
 
--- | @front |-> rest@ is right-associative and @rest <-| back@ is
---   left-associative, as the grammar says: a chain of prefixes reads left to
---   right, and each prefix narrows what the next one sees.
-patternStarts :: Parser Pattern
-patternStarts = do
-  l <- patternSuffix
-  try (do
-        symbolOp "|->"
-        r <- patternStarts
-        pure $ MkPattern (mergeSpan (patSpan l) (patSpan r)) (PStarts l r))
-    <|> try (do
-        symbolOp "<-|"
-        r <- patternSuffix
-        pure $ MkPattern (mergeSpan (patSpan l) (patSpan r)) (PEnds l r))
-    <|> pure l
-
-symbolOp :: Text -> Parser ()
-symbolOp op = tok $ \case
-  TName n | n == op -> Just ()
-  _ -> Nothing
-
+-- | @a, b@ is a tuple pattern.  A comma is looser than the split arrows, so
+--   @a, b <-| c@ is a pair whose second component ends with @c@.
 patternTuple :: Parser Pattern
 patternTuple = do
-  l <- patternSuffix
+  l <- patternStarts
   m <- optional (commasym *> patternNoAs)
   case m of
     Nothing -> pure l
@@ -734,6 +714,29 @@ patternTuple = do
     flattenTuple p = case patNode p of
       PTuple ps -> ps
       _ -> [p]
+
+-- | @front |-> rest@ is right-associative and @rest <-| back@ is
+--   left-associative, as the grammar says: a chain of prefixes reads left to
+--   right, and each prefix narrows what the next one sees.
+patternStarts :: Parser Pattern
+patternStarts = do
+  l <- patternSuffix
+  starts l <|> ends l <|> pure l
+  where
+    starts l = do
+      symbol TStartsArrow
+      r <- patternStarts
+      pure $ MkPattern (mergeSpan (patSpan l) (patSpan r)) (PStarts l r)
+    ends l = do
+      symbol TEndsArrow
+      r <- patternSuffix
+      more (MkPattern (mergeSpan (patSpan l) (patSpan r)) (PEnds l r))
+    more p =
+      (do
+        symbol TEndsArrow
+        r <- patternSuffix
+        more (MkPattern (mergeSpan (patSpan p) (patSpan r)) (PEnds p r)))
+      <|> pure p
 
 -- | The suffixes of a pattern: a cast to a narrower type.
 patternSuffix :: Parser Pattern
@@ -840,7 +843,7 @@ pairType = do
 
 arrowEffRow :: Parser EffRow
 arrowEffRow =
-  try (braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> meta))
+  try (braces $ ERSugar <$> sepByTrailing effRowEntry semisym <*> optional (pipesym *> meta))
   <|> try (do
     n <- qualifiedName
     -- `T#[...]` applies a row alias.  The bracket itself says so, which is the
@@ -928,7 +931,7 @@ noBareApplication n = do
 
 recordType :: Parser RecordTyp
 recordType = sharpBraces $
-  RecordTyp <$> sepBy1 recordTProp (optional semisym) <* optional semisym
+  RecordTyp <$> sepBy1Trailing recordTProp semisym
 
 forallType :: Parser Typ
 forallType = do
@@ -962,7 +965,7 @@ effDef = do
   keyword KWEffect
   n <- name
   ts <- fromMaybe mempty <$> optional typeParams
-  ops <- sepBy effectOp semisym
+  ops <- sepByTrailing effectOp semisym
   keyword KWEnd
   pure $ \sp -> EffectDef sp n ts ops
 
@@ -1040,7 +1043,7 @@ effRow =
       case apps of
         Just ts -> pure $ ERAlias n (Just ts)
         Nothing -> noBareApplication n >> pure (ERAlias n Nothing),
-    braces $ ERSugar <$> sepBy effRowEntry semisym <*> optional (pipesym *> meta)
+    braces $ ERSugar <$> sepByTrailing effRowEntry semisym <*> optional (pipesym *> meta)
   ]
 
 effRowEntry :: Parser EffRowEntry
@@ -1115,7 +1118,7 @@ atomLetPattern = choice [
 
 recordLetPattern :: Parser AtomLetPattern
 recordLetPattern = sharpBraces $
-  ALPRecord <$> sepBy1 atomLetPatternRecordProp semisym <* optional semisym
+  ALPRecord <$> sepBy1Trailing atomLetPatternRecordProp semisym
 
 atomLetPatternRecordProp :: Parser AtomLetPatternRecordProp
 atomLetPatternRecordProp = do
@@ -1133,16 +1136,14 @@ functArg = parens $ do
   pure $ fromMaybe NilArg arg
 
 typeApps :: Parser TypeApps
-typeApps = TypeApps <$> sharpBrackets (sepBy typeArg semisym <* optional semisym)
+typeApps = TypeApps <$> sharpBrackets (sepByTrailing typeArg semisym)
 
--- | The type arguments of @with@.  An ordinary call spells them as @#[...]@,
---   like every other type application, but the canonical form after `with` is
---   a plain @[...]@: @parse with [Int] s@.  Both are accepted so that the
---   existing spelling keeps working.
+-- | The type arguments of @with@ are a plain @[...]@: @parse with [Int] s@.
+--   An ordinary type application keeps its @#[...]@ spelling.
 withTypeApps :: Parser TypeApps
-withTypeApps = TypeApps <$> (sharpBrackets args <|> brackets args)
+withTypeApps = TypeApps <$> brackets args
   where
-    args = sepBy typeArg semisym <* optional semisym
+    args = sepByTrailing typeArg semisym
 
 typeArg :: Parser TypeArg
 typeArg = makeExprParser typeArgAtom table
@@ -1169,7 +1170,7 @@ typeArgAtom =
 
 recordTypeArg :: Parser RecordTypeArg
 recordTypeArg = sharpBraces $
-  RecordTypeArg <$> sepBy1 recordTypeArgProp (optional semisym) <* optional semisym
+  RecordTypeArg <$> sepBy1Trailing recordTypeArgProp semisym
 
 recordTypeArgProp :: Parser RecordTypeArgProp
 recordTypeArgProp = do
@@ -1181,7 +1182,7 @@ recordTypeArgProp = do
 effApps :: Parser EffApps
 effApps = do
   symbol TBraceL
-  es <- sepBy effArg semisym
+  es <- sepByTrailing effArg semisym
   rs <- fromMaybe [] <$> optional (pipesym *> some effRow)
   symbol TBraceR
   pure $ EffApps es rs
@@ -1484,6 +1485,30 @@ handlerClause = do
   symbol TMatchArrow
   HandlerClause n args <$> block
 
+-- | @p { sep p } [ sep ]@: a separated list whose last separator may be left
+--   without an element after it.  The separator and the next element are tried
+--   together, so a failed element backtracks to before its separator and the
+--   optional one consumes exactly that trailing separator.
+sepByTrailing :: Parser a -> Parser () -> Parser [a]
+sepByTrailing p sep = do
+  first <- optional p
+  case first of
+    Nothing -> pure []
+    Just x -> (x :) <$> rest
+  where
+    rest = do
+      xs <- many (try (sep *> p))
+      _ <- optional sep
+      pure xs
+
+-- | 'sepByTrailing' with at least one element.
+sepBy1Trailing :: Parser a -> Parser () -> Parser [a]
+sepBy1Trailing p sep = do
+  x <- p
+  xs <- many (try (sep *> p))
+  _ <- optional sep
+  pure (x : xs)
+
 sepBy2 :: MonadPlus m => m a -> m sep -> m [a]
 sepBy2 p sep = do
   a <- p
@@ -1537,10 +1562,10 @@ number = try (NFloat <$> floatLiteral) <|> NInt <$> intLiteral
 
 array :: Parser ArrayLiteral
 array = brackets $
-  ArrayLiteral <$> sepBy arrayEntry commasym <* optional commasym
+  ArrayLiteral <$> sepByTrailing arrayEntry commasym
 
 arrayEntry :: Parser ArrayEntry
-arrayEntry = try (AEBlock <$> block <* semisym) <|> (AEExp <$> Parser.exp)
+arrayEntry = AEExp <$> Parser.exp
 
 lambda :: Parser LambdaLiteral
 lambda = do
@@ -1576,4 +1601,4 @@ lambdaParams =
 
 record :: Parser RecordLiteral
 record = sharpBraces $
-  RecordLiteral <$> optional (Parser.exp <* pipesym) <*> sepBy1 bindDef semisym <* optional semisym
+  RecordLiteral <$> optional (Parser.exp <* pipesym) <*> sepBy1Trailing bindDef semisym

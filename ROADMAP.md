@@ -107,7 +107,9 @@ declaring module, so `Output::sayn` works and `Numbers::sayn` is refused.
 `QualifiedSpec` covers the resolutions, the diagnostics and the walk.
 
 **0.2.3.2. The freeze.** Conformance suite v1 (one test per language rule),
-syntax freeze, documentation of names. After this release no new keywords or
+syntax freeze, documentation of names. The future tokens `pattern`, `demands`,
+`ensures`, `unwinds`, `${` and `<-` are hard reserved here: a program that uses
+them as a name no longer parses. After this release no other new keywords or
 forms are added until 0.3.0.
 
 ## 0.2.4 — configuration and artifacts
@@ -259,9 +261,40 @@ plan.
   the main extension mechanism.
 - **0.3.1 — graphics on FFI**, if `gfx` did not ship in 0.2.9.5. It is also
   the test of FFI on a real task.
+- **0.3.2 — Contracts (DbC).** `demands` (a pure `Bool` checked before the
+  body), `ensures` (a pure `Bool` checked after the body, with the result
+  bound) and `unwinds` (an abortive `Error` handler that returns the
+  function's result). Desugared to `assert`/`try`: no new runtime, and the
+  typing is the existing `assert`/`try` discipline plus a purity check on the
+  contract blocks. A failed check raises `Error`, which `unwinds` may catch;
+  without `unwinds` the check charges `Error` in the signature, as `assert`
+  does. These are runtime checks, not proofs. `old`, `decreases`, `invariant`,
+  `variant` and `modifies` are deliberately out of scope: they belong to
+  mutation contracts, loops and a future verifier.
+  Criterion: a function states a pre- and postcondition and recovers from a
+  failed check with `unwinds`.
 - **0.3.x — concurrency**, if it slipped; formal semantics; a VM prototype;
   performance.
-- **0.4.0–0.5.0 — the compiler.** `TypedIR` → ANF → CPS → bytecode VM →
+- **0.4 — first-class patterns.** Patterns become runtime values: creatable
+  anywhere, passable, storable in variables and data. A pattern has the type
+  `Pattern[I, E, R, ρ]` and the erased public interface
+  `View[I, R, ρ] = I -> {ρ} Maybe R`. The stages:
+  1. named predicates: `pattern ... = ...` as a value, with statically
+     checked exhaustiveness and a mandatory syntactic catch-all `| _ =>`;
+  2. an explicit environment `=> { ... }` as a strict projection; arity
+     above two nests pairs;
+  3. `then` and `View`; `R = Nothing` when there is no `then`;
+  4. `<-`: match the named pattern, run its `then`, then match the left
+     pattern against the result;
+  5. dispatch over lists of `View`, with each pattern's private `E` hidden
+     in its closure, so no existentials are needed;
+  6. parsers and residual input built on `<-`.
+
+  The prerequisite is shared with the deferred freeze case: `TypeArg` must
+  express effect rows, otherwise the pattern type cannot be written. A pure
+  `then` can ship first, with the effect row in the type but not yet
+  inferred.
+- **0.5.0–0.6.0 — the compiler.** `TypedIR` → ANF → CPS → bytecode VM →
   native backend. The interpreter remains the reference; `imm` is a
   `freeze(env)` primitive or a fallback to the interpreter; differential
   tests are mandatory.
@@ -280,13 +313,21 @@ plan.
   cache is the mandatory fallback.
 - **Guide size**: pages and examples are checked by tests, or the guide will
   be stale before it is published.
+- **Contracts are runtime checks**, not proofs. The guide and the reference
+  must say so, or `ensures` will read as a static guarantee and surprise
+  users when `contracts: off` removes the check.
+- **First-class patterns** rest on `TypeArg` gaining effect rows. If that
+  lands late, the pattern work slips inside 0.4 rather than pulling the
+  compiler earlier.
 - **One person**: 0.2.9.9 is roughly 15–18 months. If it has to be faster,
   the first candidates to move to 0.3.x are 0.2.9.3 and 0.2.9.5.
 
 ## Exit criteria for the 0.2 line
 
 - [ ] P0 is closed (0.2.3.0) and re-checked in 0.2.9.9.
-- [ ] The syntax is frozen from 0.2.3.2; the conformance suite is green.
+- [x] The syntax is frozen from 0.2.3.2; the conformance suite is green.
+- [ ] The future tokens `pattern`, `demands`, `ensures`, `unwinds`, `${` and
+      `<-` are hard reserved at the freeze.
 - [ ] stdlib groups 1–6 and 7a are ready; 7b is ready or explicitly moved.
 - [ ] The guide and the reference manual are in English, with examples
       checked in CI.

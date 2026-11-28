@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## 0.2.3.2 - 2026-11-28
+
+Syntax freeze for the 0.2 line.  The surface is frozen: only semantics, errors,
+warnings and the internal AST may change before `0.3.0`.
+
+- `pattern`, `demands`, `ensures`, `unwinds`, `${` and `<-` are hard reserved
+  tokens.  A program that uses one as a name no longer parses; there is no soft
+  migration, because no program depends on the old spelling.
+- Tuple patterns parse and match pairs.  `a, b` and `(a, b)` are the same
+  pattern, and a tuple is irrefutable when both of its components are.
+- A `<-|` chain nests to the left: `a <-| b <-| c` is `(a <-| b) <-| c`.
+  `|->` remains right-associative, and a comma is looser than either arrow.
+- `1e3`, `1e+3` and `1E3` are floats; a decimal point is no longer required for
+  an exponent.
+- Strings escape `\n`, `\t` and `\r`, as well as `\\` and `\'`.
+- Record type and type-argument fields require a `;` between fields.  A
+  trailing separator is accepted wherever a separated list already allowed it:
+  record types, record literals, arrays, effect operations, type applications
+  and effect rows.
+- `with` spells its type arguments as a plain `[...]`; `#[...]` is only the
+  ordinary type application.
+- The unused raw array-block entry is gone; a block entry is a parenthesised
+  block.
+- `docs/syntax.md` records the frozen grammar, the reserved tokens and the
+  accepted quirks; `docs/names.md` records naming, namespaces and qualification.
+- Conformance suite v1 (`SYN-001` to `SYN-030`) checks every frozen rule with a
+  full module that must parse and one that must not, and
+  `test/conformance/manifest.tsv` keeps the rule list in step.  CI runs the
+  suite and checks that both documents are present.
+
+Tests: 554 examples, 0 failures.
+
 ## 0.2.3.1 - 2026-11-26
 
 Qualified names: `M::x` now works in every namespace a name can occupy --

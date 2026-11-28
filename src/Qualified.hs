@@ -263,9 +263,7 @@ mapQualified f chunk = runWriter (goChunk chunk)
         LRecord <$> (RecordLiteral <$> traverse goExp base <*> mapM (goBind sp) binds)
 
     goEntry :: ArrayEntry -> Writer [QualUse] ArrayEntry
-    goEntry = \case
-      AEExp e -> AEExp <$> goExp e
-      AEBlock b -> AEBlock <$> goBlock b
+    goEntry (AEExp e) = AEExp <$> goExp e
 
     goBind :: Span -> BindDef -> Writer [QualUse] BindDef
     goBind sp (BindDef q p e) = BindDef q <$> goParam sp p <*> goExp e

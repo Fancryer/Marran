@@ -129,9 +129,9 @@ data TypeRepProp = TypeRepProp {
 --   when a value is built, and the shape of a value is finite -- so the map is
 --   what lets a field of an enum name another enum after elaboration.
 data TypeRep = TypeRep {
-    trShape :: TypeShape
-  , trEnums :: Map Text EnumDef
-  } deriving (Eq, Ord, Show)
+  trShape :: TypeShape,
+  trEnums :: Map Text EnumDef
+} deriving (Eq, Ord, Show)
 
 instance Pretty TypeRep where
   pretty (TypeRep s _) = prettyShape s

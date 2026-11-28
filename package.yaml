@@ -1,5 +1,5 @@
 name:                Marran
-version:             0.2.3.1
+version:             0.2.3.2
 github:              "Fancryer/Marran"
 license:             BSD-3-Clause
 author:              "Alice Eve Liddell"
@@ -10,6 +10,9 @@ extra-source-files:
 - README.md
 - CHANGELOG.md
 - CITATION.cff
+- docs/syntax.md
+- docs/names.md
+- test/conformance/manifest.tsv
 
 # Metadata used when publishing your package
 # synopsis:            Short description of your package
@@ -88,6 +91,7 @@ tests:
       ImportSpec
       QualifiedSpec
       BenchmarkSpec
+      ConformanceSpec
     ghc-options:
     - -threaded
     - -rtsopts

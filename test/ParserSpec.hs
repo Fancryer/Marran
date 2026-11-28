@@ -74,11 +74,34 @@ pSpec = do
       lexemes "!= 1 2" `shouldBe` Right [TName "!=", TInt 1, TInt 2]
       lexemes "a = 1" `shouldBe` Right [TName "a", TAssign, TInt 1]
 
+    it "reads an exponent-only decimal as a float" $ do
+      -- `1e3` is a float, not the integer `1` applied to the name `e3`.
+      lexemes "1e3" `shouldBe` Right [TFloat 1000]
+      lexemes "1.5e2" `shouldBe` Right [TFloat 150]
+
+    it "reads the string escapes" $ do
+      -- A string may spell a newline, a tab and a carriage return.
+      lexemes "'a\\nb\\tc\\rd'" `shouldBe` Right [TString "a\nb\tc\rd"]
+
     it "reads `as` as a keyword" $ do
       -- `as` renames in exports, imports and patterns; it is not a name that a
       -- program may bind or apply.
       lexemes "as" `shouldBe` Right [TKW KWAs]
       lexemes "`as" `shouldBe` Right [TTVar "as"]
+
+    it "reads the split-pattern arrows as tokens of their own" $ do
+      -- `|->` and `<-|` are not names: a pattern parser must see them as one
+      -- token each.  In particular, `<-|` wins over `<-` so it cannot become
+      -- `TRevArrow` followed by `TPipe`.
+      lexemes "a |-> b" `shouldBe` Right [TName "a", TStartsArrow, TName "b"]
+      lexemes "a <-| b" `shouldBe` Right [TName "a", TEndsArrow, TName "b"]
+      lexemes "a <- b" `shouldBe` Right [TName "a", TRevArrow, TName "b"]
+
+    it "reserves the future keywords and `${`" $ do
+      -- The freeze announces these spellings now; a program may no longer use
+      -- them as names.  The lexer, not a warning in the parser, enforces it.
+      lexemes "pattern demands ensures unwinds ${" `shouldBe` Right
+        [TKW KWPattern, TKW KWDemands, TKW KWEnsures, TKW KWUnwinds, TDollarBraceL]
 
   describe "annotations" $ do
     it "parses `e : T` around the whole expression" $ do
@@ -119,10 +142,11 @@ pSpec = do
           pure ()
         Right other -> expectationFailure $ "unexpected shape: " ++ show other
 
-    it "also accepts the `#[...]` spelling" $ do
+    it "does not accept the `#[...]` spelling after `with`" $ do
+      -- `with` spells its type arguments as a plain `[...]`; `#[...]` is for
+      -- an ordinary application.
       case parseFromTextNamed "demo.marr" exp_ "loop with #[Int] 5" of
-        Left e -> expectationFailure e
-        Right (EApply (EWith (EName "loop") (TypeApps [TAFlat "Int"]) (EffApps [] [])) _) -> pure ()
+        Left _ -> pure ()
         Right other -> expectationFailure $ "unexpected shape: " ++ show other
 
     it "reads a parenthesised pair type inside the brackets" $ do
@@ -134,6 +158,24 @@ pSpec = do
         Right (EApply (EWith _ (TypeApps [TAParen (TAPair (TAFlat "Int") (TAFlat "String"))]) _) _) ->
           pure ()
         Right other -> expectationFailure $ "unexpected shape: " ++ show other
+
+  describe "record types" $ do
+    it "requires a semicolon between fields" $ do
+      -- A trailing semicolon is optional, but two fields cannot be separated
+      -- by whitespace alone.
+      ls <- parseFailure "type T = #{val a : Int val b : String}"
+      take 1 ls `shouldBe` ["error[E0013]: unexpected `val`"]
+
+    it "allows a trailing separator in a list" $ do
+      -- A trailing `;` or `,` closes the list without another element.
+      case parseFromTextNamed "demo.marr" chunk . withModuleHeader $ T.unlines
+        [ "type P = #{val x : Int; var y : String;}"
+        , "type Box[T] = T"
+        , "funct main () : Box#[Int;] ="
+        , "  (val xs = [1, 2,]; val r = #{val a = 1;}; ())"
+        ] of
+        Left e -> expectationFailure e
+        Right _ -> pure ()
 
   describe "match and patterns" $ do
     it "parses the clauses of a match, each with its own block" $ do
@@ -165,7 +207,10 @@ pSpec = do
         [ "match (s) to"
         , "  | 'ab' |-> rest => rest"
         , "  | rest <-| 'yz' => rest"
+        , "  | 'a' <-| x <-| 'c' => x"
         , "  | #Some x => x"
+        , "  | (a, b) => a"
+        , "  | c, d => c"
         , "  | _ => ''"
         ] of
         Left e -> expectationFailure e
@@ -275,6 +320,6 @@ pSpec = do
         , "  sayn 'unterminated"
         ]
       take 2 ls `shouldBe`
-        [ "error[E0013]: unexpected end of input; expected `'`, `\\'`, `\\\\`"
+        [ "error[E0013]: unexpected end of input; expected `'`, `\\'`, `\\\\`, `\\n`, or 2 more"
         , " --> demo.marr:3:1"
         ]

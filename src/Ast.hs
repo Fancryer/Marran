@@ -842,11 +842,11 @@ instance Sexp ArrayLiteral
 instance Pretty ArrayLiteral where
   pretty (ArrayLiteral ar) = T.concat ["[", T.intercalate ", " (map pretty ar), "]"]
 
-data ArrayEntry = AEExp Exp | AEBlock Block deriving (Eq, Show, Generic)
+data ArrayEntry = AEExp Exp deriving (Eq, Show, Generic)
 instance Sexp ArrayEntry
 
 instance Pretty ArrayEntry where
-  pretty = \case AEExp e -> pretty e; AEBlock b -> pretty b
+  pretty (AEExp e) = pretty e
 
 data LambdaLiteral =
   LambdaLiteral (Maybe TypeParams) (Maybe EffParams) (Maybe LambdaHead) Block

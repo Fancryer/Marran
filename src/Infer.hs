@@ -1461,6 +1461,7 @@ matchIsExhaustive scope subject rows =
     irrefutable (MkTPattern _ node) = case node of
       TPName {} -> True
       TPWildcard -> True
+      TPTuple ps -> all irrefutable ps
       TPAs p _ _ -> irrefutable p
       TPCast p _ -> irrefutable p
       _ -> False

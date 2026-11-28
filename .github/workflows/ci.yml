@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["0.2.2-beta", "main"]
+    branches: ["0.2.2-beta", "0.2.3-beta", "main"]
   pull_request:
-    branches: ["0.2.2-beta", "main"]
+    branches: ["0.2.2-beta", "0.2.3-beta", "main"]
   workflow_dispatch:
 
 jobs:
@@ -43,3 +43,10 @@ jobs:
 
       - name: Test
         run: stack test --no-terminal
+
+      - name: Frozen documents
+        shell: bash
+        run: test -s docs/syntax.md && test -s docs/names.md
+
+      - name: Conformance suite
+        run: stack test --no-terminal --test-arguments "--match conformance"

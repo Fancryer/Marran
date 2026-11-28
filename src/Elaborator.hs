@@ -507,9 +507,7 @@ elaborateNode renv tenv env = \case
       Ast.ANil -> pure Types.Nil
       Ast.ABoolean b -> pure $ Types.Boolean b
     Ast.LArray (Ast.ArrayLiteral es) ->
-      Types.Array <$> traverse (\case
-        Ast.AEExp e -> elaborateExpr renv tenv env e
-        Ast.AEBlock b -> Types.Paren <$> elaborateBlock renv tenv env b) es
+      Types.Array <$> traverse (\(Ast.AEExp e) -> elaborateExpr renv tenv env e) es
     Ast.LLambda l' -> elaborateLambdaLiteral renv tenv env l'
     Ast.LRecord (Ast.RecordLiteral e props) -> do
       e' <- mapM (elaborateExpr renv tenv env) e

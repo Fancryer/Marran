@@ -111,15 +111,21 @@ hexIntLiteral = lexeme $ char '0' *> oneOf ['x', 'X'] *> (parseHexInt <$> hexInt
 floatLiteral :: Lexer Scientific
 floatLiteral = lexeme $ do
   a <- intDigitPart
-  _ <- char '.'
-  b <- intDigitPart
-  e <- optional exponentPart
+  choice [
+    do
+      _ <- char '.'
+      b <- intDigitPart
+      e <- optional exponentPart
 
-  let mantissa = parseDecInt $ a <> b
-      scale    = negate $ length $ stripUnderscore b
-      base     = scientific mantissa scale
+      let mantissa = parseDecInt $ a <> b
+          scale    = negate $ length $ stripUnderscore b
+          base     = scientific mantissa scale
 
-  pure $ maybe base (\ex -> base * (10 ^^ parseExponent ex)) e
+      pure $ maybe base (\ex -> base * (10 ^^ parseExponent ex)) e,
+    do
+      e <- exponentPart
+      pure $ scientific (parseDecInt a) 0 * (10 ^^ parseExponent e)
+    ]
 
 hexFloatLiteral :: Lexer Scientific
 hexFloatLiteral = lexeme $ do
@@ -186,10 +192,11 @@ token :: Lexer Token
 token = choice [
     try infixName,
     tvar,
-    sym "$" TDollar,
     sym "@" TAt,
     sym "#[" TSharpSquareL, sym "[" TSquareL, sym "]" TSquareR,
     sym "#{" TSharpBraceL,  sym "{" TBraceL,  sym "}" TBraceR,
+    sym "${" TDollarBraceL,
+    sym "$" TDollar,
     -- A constructor pattern writes `#Some x`.  The two long forms above are
     -- tried first, so `#[` and `#{` never reach this.
     sym "#" TSharp,
@@ -213,6 +220,11 @@ token = choice [
     sym "=" TAssign,
     sym "_" TUnderscore,
     sym "->" TArrow,
+    -- The split-pattern arrows are tokens of their own, and they are tried
+    -- before `<-` so that `<-|` never becomes `<-` followed by `|`.
+    sym "|->" TStartsArrow,
+    sym "<-|" TEndsArrow,
+    sym "<-" TRevArrow,
     kw "as" KWAs,
     kw "effect" KWEffect,
     kw "else" KWElse,
@@ -239,6 +251,10 @@ token = choice [
     kw "val" KWVal,
     kw "var" KWVar,
     kw "with" KWWith,
+    kw "pattern" KWPattern,
+    kw "demands" KWDemands,
+    kw "ensures" KWEnsures,
+    kw "unwinds" KWUnwinds,
     THexFloat <$> try hexFloatLiteral,
     TFloat <$> try floatLiteral,
     THexInt <$> try hexIntLiteral,
@@ -250,6 +266,9 @@ token = choice [
 stringChar :: Lexer Char
 stringChar =
   choice [
+    string "\\n" $> '\n',
+    string "\\t" $> '\t',
+    string "\\r" $> '\r',
     string "\\\\" $> '\\',
     string "\\'" $> '\'',
     satisfy (/= '\'')
@@ -273,7 +292,7 @@ data Token =
   | TParenL       | TParenR
   | TBraceL       | TBraceR
   | TSquareL      | TSquareR
-  | TSharpBraceL  | TSharpSquareL
+  | TSharpBraceL  | TSharpSquareL | TDollarBraceL
   | TSharp
 
   | TAssign
@@ -282,6 +301,9 @@ data Token =
 
   | TUnderscore
   | TArrow
+  | TStartsArrow
+  | TEndsArrow
+  | TRevArrow
   | TMatchArrow
   | THRPArrow
 
@@ -317,6 +339,7 @@ instance Pretty Token where
     TSquareR      -> "]"
     TSharpBraceL  -> "#{"
     TSharpSquareL -> "#["
+    TDollarBraceL -> "${"
     TSharp        -> "#"
 
     TAssign -> "="
@@ -325,6 +348,9 @@ instance Pretty Token where
 
     TUnderscore -> "_"
     TArrow      -> "->"
+    TStartsArrow -> "|->"
+    TEndsArrow  -> "<-|"
+    TRevArrow   -> "<-"
     TMatchArrow -> "=>"
     THRPArrow   -> "==>"
 
@@ -343,9 +369,11 @@ instance Pretty Token where
 
 data Keyword =
   KWAs
+  | KWDemands
   | KWEffect
   | KWElse
   | KWEnd
+  | KWEnsures
   | KWEnum
   | KWFalse
   | KWForall
@@ -358,6 +386,7 @@ data Keyword =
   | KWMatch
   | KWModule
   | KWImport
+  | KWPattern
   | KWResume
   | KWRow
   | KWThen
@@ -365,6 +394,7 @@ data Keyword =
   | KWTrue
   | KWType
   | KWUnder
+  | KWUnwinds
   | KWVal
   | KWVar
   | KWWith
@@ -398,3 +428,7 @@ instance Pretty Keyword where
     KWVal     -> "val"
     KWVar     -> "var"
     KWWith    -> "with"
+    KWDemands -> "demands"
+    KWEnsures -> "ensures"
+    KWPattern -> "pattern"
+    KWUnwinds -> "unwinds"

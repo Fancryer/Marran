@@ -171,9 +171,7 @@ walkLiteral = \case
   LRecord (RecordLiteral anchor props) ->
     maybe [] walkExp anchor <> concatMap walkBindDef props
   where
-    entryNode = \case
-      AEExp e -> walkExp e
-      AEBlock b -> walkBlock b
+    entryNode (AEExp e) = walkExp e
 
 walkUnder :: Under -> [Bad]
 walkUnder (Under _ b clauses _ t) =

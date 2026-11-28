@@ -1,0 +1,31 @@
+id	title
+SYN-001	a file starts with a module header
+SYN-002	an export list is whitespace-separated
+SYN-003	an import directory has a bracketed unit list
+SYN-004	a type alias has an equals sign and a type
+SYN-005	an enum declares at least one case
+SYN-006	an enum field is parenthesised and qualified
+SYN-007	an effect ends with end
+SYN-008	an effect may declare no operations
+SYN-009	a row alias has an equals sign
+SYN-010	function arguments are separate parenthesised groups
+SYN-011	the colon before a parameter type is optional
+SYN-012	a result row precedes the result type
+SYN-013	a type application is written with a hash
+SYN-014	an array type is a bare bracket
+SYN-015	type parameters are whitespace-separated
+SYN-016	effect parameters are braced and whitespace-separated
+SYN-017	forall is followed by a double arrow
+SYN-018	a braced row names its tail with a pipe
+SYN-019	record type fields are semicolon-separated
+SYN-020	with spells type arguments in square brackets
+SYN-021	an array literal is comma-separated
+SYN-022	record literal fields are semicolon-separated
+SYN-023	a lambda head is parameters, an optional type and an equals sign
+SYN-024	a block binding needs a qualifier
+SYN-025	assignment uses a colon-equals
+SYN-026	only the documented comment forms are comments
+SYN-027	reserved keywords cannot be names
+SYN-028	reserved tokens cannot open an expression
+SYN-029	an exponent alone makes a float
+SYN-030	strings have escaped newline, tab and return
